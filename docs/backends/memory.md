@@ -8,7 +8,7 @@ npm install @dianemo/core   # nothing else
 import RequestHandler, { memoryBackend } from "@dianemo/core";
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY,
+  key: process.env.REQUEST_HANDLER_KEY!,
   backend: memoryBackend(),
 });
 ```
@@ -62,9 +62,9 @@ nothing can interleave with a synchronous loop.
 
 ## Expiry
 
-Keys expire lazily: a TTL is checked on read, and an unreferenced sweep runs on
-an unref'd timer so keys nobody reads again cannot pin memory forever. The
-sweep's timer is unref'd, so it never keeps a process alive on its own.
+Keys expire lazily: a TTL is checked on read, and a sweep once a minute removes
+expired keys nobody reads again, so they cannot pin memory forever. The sweep's
+timer is unref'd, so it never keeps a process alive on its own.
 
 ## Plugins
 

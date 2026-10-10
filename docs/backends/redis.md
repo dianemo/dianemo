@@ -9,10 +9,10 @@ import { Redis } from "ioredis";
 import RequestHandler from "@dianemo/core";
 import { redisBackend } from "@dianemo/backend-redis";
 
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL!);
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY,
+  key: process.env.REQUEST_HANDLER_KEY!,
   backend: redisBackend(redis),
 });
 ```
@@ -85,11 +85,12 @@ atomic script, taking a request from nine round-trips down to two, or one for a
   error, no log line, only the vendor's counters disagreeing with yours.
 
   **A TTL is not protection.** Nearly every key dianemo writes carries one — a
-  token bucket expires a day after its last use, an instance registration in
-  seconds — which makes them _candidates_ under `volatile-lru` and the other
-  `volatile-*` policies rather than exempt from them. Only the instance and
-  template registries are TTL-less. `noeviction` is the setting; there is no
-  safe middle ground.
+  token bucket expires a day after its last use, or once it could have refilled
+  from empty if that takes longer; an instance registration in seconds — which
+  makes them _candidates_ under `volatile-lru` and the other `volatile-*`
+  policies rather than exempt from them. Only the instance and template
+  registries, and the template credentials and settings filed beside them, are
+  TTL-less. `noeviction` is the setting; there is no safe middle ground.
 
 - **A shared Redis is fine for collisions, not for memory.** Keys are prefixed,
   so dianemo can live alongside a cache or a queue in the same instance and

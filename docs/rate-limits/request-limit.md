@@ -77,8 +77,12 @@ progress toward the next refill is never silently discarded.
 That detail matters to the caller more than it looks. When a request cannot be
 admitted, the backend returns a `waitTime` that the client **sleeps on
 directly** — so an over-estimate is not a rounding error, it is a stall of
-exactly that length. A bucket 9.9 seconds into a 10-second interval must report
-a 100 ms wait, not a 10-second one, and the conformance suite asserts it.
+exactly that length. A bucket 9 seconds into a 10-second interval must report
+about a 1-second wait, not a 10-second one, and the conformance suite asserts it.
+
+A bucket's key is kept until the bucket could have refilled from empty, because
+a key that expired reads as a full bucket. See
+[limits slower than a day](multiple-limits.md#limits-slower-than-a-day).
 
 ## Cost larger than the budget
 
@@ -89,7 +93,9 @@ forever.
 ## Per-grant isolation
 
 When a client carries several credentials, each grant can meter its own bucket,
-so one tenant exhausting their quota does not stall the others. Grant-scoped
+so one tenant exhausting their quota does not stall the others. That takes an
+`oauth2` client with `grantRateLimitBehavior: "isolated"`; under the default,
+`"shared"`, every grant spends the client's one bucket. Grant-scoped
 requests deliberately skip the uncontended fast path: that path checks a single
 client-level bucket and freeze state, which would be the wrong pair of keys.
 

@@ -19,7 +19,8 @@ The vendor counts several credentials against **one** quota:
 If each credential has its own independent quota, do **not** use this — give
 each client its own [`requestLimit`](request-limit.md). If the credentials
 belong to different tenants of the same client and each has its own quota, use
-per-grant isolation instead.
+per-grant isolation instead — [grants](../concepts.md#grants) on an `oauth2`
+client with `grantRateLimitBehavior: "isolated"`.
 
 A client that needs the shared budget **and** a limit of its own is not
 supported: this type has no queue of its own, and a client with local budgets

@@ -15,10 +15,10 @@ easiest way to introduce a bug that only shows up under load on someone else's
 infrastructure.
 
 **The backend's clock owns everything the fleet compares.** Freeze deadlines,
-token-bucket `lastUpdate`, queue arrival timestamps — anything two replicas
-reason about together comes from `backend.now()` (Redis `TIME`, or
-`Date.now()` in the memory backend, which is the same clock by definition
-because there is only one process).
+token-bucket `lastUpdate`, concurrency-slot ages — anything two replicas reason
+about together comes from `backend.now()` (Redis `TIME`, or `Date.now()` in the
+memory backend, which is the same clock by definition because there is only one
+process). Queue arrival timestamps are the one exception, below.
 
 The rule that follows: **when you compute a delay from a fleet-wide deadline,
 both ends of the subtraction must come from the same clock.**
@@ -231,15 +231,16 @@ left to release it, because the request is done, its queue entry is gone and its
 `requestDone` is already consumed. The capacity sits claimed until its TTL,
 shrinking the effective cap, and on a small cap taking it to zero.
 
-`processRequests` re-reads the entry after claiming to catch this. **That narrows
-the window; it does not close it.** A completion landing between the read and the
+Closing it means claiming and confirming in one atomic operation. A client whose
+one budget is a concurrency limit does exactly that: `acquireQueuedConcurrency`
+claims only while the request's metadata still reads `inProgress`, in the same
+script or synchronous pass. The multi-limit claim has no such twin, and the
+method is optional on `DianemoBackend`, so `processRequests` also re-reads the
+entry after any claim that holds a slot. For those cases **that narrows the
+window; it does not close it.** A completion landing between the read and the
 notification still strands the claim until the slot TTL, and orphan cleanup
-cannot help because there is no entry left for it to see.
-
-Closing it properly would mean claiming and confirming in one atomic operation,
-which is impossible while the claim and the queue entry are separate keys written
-by different callers. If you are tempted to "fix" the residue, that is the actual
-prerequisite.
+cannot help because there is no entry left for it to see. A status-checked
+`acquireMultiLimit` is the actual prerequisite for removing the re-read.
 
 The related asymmetry: **a read that failed is not evidence the request is
 gone.** Treating an unreadable entry as still queued keeps the claim, which is
@@ -336,15 +337,16 @@ is named `default`. A bare limit object is refused there with a
 
 That is what collapses the client types. There is no class per limit type —
 the only thing that would vary between them is which backend call claims the
-budget, which is a branch, not a class. `MeteredClient` covers every client that meters against budgets of its own, one
-of them or several, and keeps the single-key backend calls as a fast path for the
-one-budget case: same decision, one round trip instead of an encoded spec list.
+budget, which is a branch, not a class. `MeteredClient` covers every client that
+meters against budgets of its own, one of them or several, and keeps the
+single-key backend calls as a fast path for the one-budget case: same decision,
+one round trip instead of an encoded spec list.
 
 `SharedLimitClient` survives as the one genuine exception. It owns no budget and
 no queue — it is constructed with the owner's name — so it is a different thing
 rather than a different budget, and it may not be combined with other limits.
 
-Two things follow that are easy to get wrong:
+Three things follow that are easy to get wrong:
 
 - **Derive, do not cache, anything read off `rateLimit`.** `sole` and `metered`
   are getters. A cached copy is a second reading that a write can leave behind,
@@ -355,6 +357,14 @@ Two things follow that are easy to get wrong:
   `claimsReleasableCapacity()`, and a claim it finds stale is handed back
   through `refundUnusedAdmission`. The solo-concurrency path uses
   `acquireQueuedConcurrency`, so its status check and claim are one operation.
+- **A request releases what it claimed, not what the client now declares.** Each
+  claim records its keys as `claimedKeys` on the request's metadata, and
+  completion, refund and abandonment act on those. An override or
+  `rateLimitChange` landing mid-flight can rename or drop a limit; releasing by
+  the current names would leave the old slot held until its TTL, or refund a
+  bucket that never gave out the tokens. A slot ledger the current limits no
+  longer name is still released; a bucket they no longer name keeps the spend,
+  since losing a token is the safe direction.
 
 ## Several budgets are claimed in one operation, or not at all
 
@@ -369,12 +379,15 @@ before committing to any: the memory backend in a single synchronous pass, Redis
 in a single Lua script that runs `planMultiLimit` to completion before
 `commitMultiLimit` writes anything.
 
-Three consequences worth knowing before touching that code:
+Four consequences worth knowing before touching that code:
 
 - **`acquireMultiLimit`, `releaseMultiLimit` and `tryAdmitMultiLimit` are
   optional on `DianemoBackend`**, so a backend written against an earlier version
   still satisfies the interface — but a client declaring several limits refuses
-  to construct without them, rather than degrading to one budget at a time.
+  to construct without the first two, rather than degrading to one budget at a
+  time, and a `rateLimitChange` or broadcast update that would need them is
+  ignored with an error log. Without `tryAdmitMultiLimit` only the fast path is
+  lost.
 - **They are the only scripts registered without a fixed key count**, because the
   key list comes from a client's configuration. `ctx.runVariadic` passes the count
   as the call's first argument, which shifts every other position by one; the
@@ -382,6 +395,10 @@ Three consequences worth knowing before touching that code:
   to the ARGV contract and to addressing `KEYS` dynamically. Every key is still
   declared in `KEYS` — routing them through `ARGV` would work on a single node
   and hide the problem from anything that routes by key.
+- **The spec list travels as JSON, so a non-finite number goes as a string.**
+  `JSON.stringify` writes `NaN` and `Infinity` as `null`, which `cjson` decodes
+  to a value every guard lets past; as a string, `tonumber` reads it back and
+  the Lua refuses what the memory backend refuses.
 - **Refill credit is persisted even on refusal.** The intervals really did elapse,
   and the single-budget paths write it back too, so a plan that is thrown away
   still commits what it read.
@@ -393,16 +410,22 @@ response is proof that the bucket's picture of the vendor was wrong, and with on
 bucket that says which one. `noLimit` and `concurrencyLimit` entries beside it do
 not change that, since neither is a bucket.
 
-A client with several `requestLimit`s does not, and the difference is deliberate. The
-response does not say which limit was breached, so zeroing every bucket would
-destroy a per-day quota over a per-second refusal. Zeroing only the shortest adds
-nothing the freeze does not already do, since the freeze is floored at that same
-interval. So the freeze window is the whole stand-down: floored at the
-**shortest** refill interval in the array, lengthened by each further 429 through
-the same retry multiplier, and probed one request at a time.
+A client with several `requestLimit`s does not, and the difference is
+deliberate. The response does not say which limit was breached, so zeroing every
+bucket would destroy a per-day quota over a per-second refusal. Zeroing only the
+shortest adds nothing the freeze does not already do, since the freeze is
+floored at that same interval. So the freeze window is the whole stand-down:
+floored at the **shortest** refill interval in the array, lengthened by each
+further 429 through the same retry multiplier, and probed one request at a time.
 
 Flooring at the shortest rather than the longest is the other half of the same
 argument — a per-day interval would pause the fleet until tomorrow.
+
+The release path has to agree. A refund is refused while a bucket's freeze
+stands, because the freeze emptied that bucket — true only of the lone
+`requestLimit` case. A claim handed back because a freeze landed mid-claim is
+therefore refunded to every bucket of a client with several `requestLimit`s,
+with the freeze key dropped from each, rather than lost.
 
 ## One queue per budget, so one arbiter orders it
 
@@ -435,6 +458,13 @@ no `tokens` field is full — `finiteNumber(..., maxTokens)` in
 backend — and absent freeze state is no freeze. That is the only sane reading
 for a client's first request: nothing has been written yet, and the alternative
 is that a new client stalls until something seeds its keys.
+
+The same reading decides how long a bucket's key must live. An expired bucket
+reads as full, so a key that lapses before the bucket could have refilled from
+empty hands back budget that was spent — a weekly cap restored after a day of
+quiet. Both backends size the key's TTL as the longer of the usual day and
+`ceil(maxTokens / tokensToAdd) * interval`: `bucketTtl` in the memory backend,
+and its twin fragment in `lua/fragments.ts`.
 
 The cost is that **a key that was lost is indistinguishable from one that never
 existed**. A bucket evicted mid-interval reads as a fresh full budget and the

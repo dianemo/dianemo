@@ -213,17 +213,29 @@ build time on purpose — the key is stored beside the credentials, so one accep
 now would be read back by every replica and every restart, leaving a client on
 the template default with its record saying otherwise.
 
-Three more things worth knowing:
+Operator [overrides](concepts.md#rate-limit-overrides) go beside the key, under
+`rateLimitOverrides`, and are checked at the same boundary: an override that is
+not a list or cannot be built, or an object mixing `rateLimitOption` with bare
+sub-client paths, is refused with a `ConfigurationError` before anything is
+stored.
+
+Four more things worth knowing:
 
 - **A plan may hold several limits.**
   [A per-second and a per-day cap](rate-limits/multiple-limits.md) is exactly the
   shape a paid tier tends to take.
 - **Plans are validated at registration.** A plan whose budget can never hand out
-  a token, or a `defaultRateLimitOption` naming a plan that is not declared,
-  fails the deploy that introduced it rather than the first tenant who picks it.
+  a token, a plan written as a single limit rather than a list, two unnamed
+  limits in one plan, or a `defaultRateLimitOption` naming a plan that is not
+  declared, fails the deploy that introduced it rather than the first tenant who
+  picks it.
 - **Renaming a plan does not strand its tenants.** A stored key the template no
   longer declares is dropped with a warning, and the client is built from the
   limits its builder declares — not from `defaultRateLimitOption`.
+- **One tenant cannot take the others down.** A tenant whose stored settings no
+  longer build is logged and skipped — at startup, and when the template is
+  registered after `start()` — and the tenants after it are built as usual.
+  Re-adding it with `addTemplateClient` replaces the stored settings.
 
 `handler.getRateLimitOptions("acme")` lists the keys, for a host rendering a
 picker.
@@ -274,9 +286,11 @@ await handler.registerClientTemplate(
   leave that endpoint running unlimited while the plan still claimed to cover it.
 - **The builder can still read the plan.** `ctx.rateLimits` is the whole resolved
   map and `ctx.rateLimit` its `""` entry, for a builder that wants to decide
-  whether a sub-client should exist at all. `ctx.rateLimitOption` is there for
-  everything a tier changes that is *not* a rate limit — a different base URL for
-  enterprise, an endpoint an entry tier does not get.
+  whether a sub-client should exist at all. Each build gets its own copy, so a
+  builder adjusting it for one tenant changes nothing for the others.
+  `ctx.rateLimitOption` is there for everything a tier changes that is *not* a
+  rate limit — a different base URL for enterprise, an endpoint an entry tier
+  does not get.
 
 Operator-side [rate-limit overrides](concepts.md#rate-limit-overrides) are a
 separate mechanism and need no permission from the template. Plans are the

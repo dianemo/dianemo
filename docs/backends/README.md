@@ -77,6 +77,8 @@ simply being synchronous in memory.
 
 Implement the interface, then run the conformance suite against it. The
 multi-limit methods (`acquireMultiLimit`, `releaseMultiLimit`,
-`tryAdmitMultiLimit`) are optional and outside that suite: without them a client
-declaring [several limits](../rate-limits/multiple-limits.md) refuses to start,
-and `test/clientTypes/multiLimit.test.ts` is what exercises them.
+`tryAdmitMultiLimit`) are optional and outside that suite, and
+`test/clientTypes/multiLimit.test.ts` is what exercises them. Without the first
+two, a client declaring [several limits](../rate-limits/multiple-limits.md) is
+refused with a `ConfigurationError` when it is built; without
+`tryAdmitMultiLimit` it is built, but every request takes the queued path.

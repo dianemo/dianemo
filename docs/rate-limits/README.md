@@ -48,9 +48,10 @@ await handler.handleRequest({
 export can legitimately count as ten calls. `priority` exists so a backfill can
 be admitted behind interactive traffic instead of starving it.
 
-Both feed one packed sorted-set score: priority first, then retry count, then
-arrival time. A retried request sorts ahead of a fresh one at equal priority, so
-work already part-done finishes rather than being crowded out.
+`priority` feeds one packed sorted-set score: priority first, then retry count,
+then arrival time; `cost` is not part of it. A retried request sorts ahead of a
+fresh one at equal priority, so work already part-done finishes rather than
+being crowded out.
 
 Priority is strict: it does not age waiting work upward. Sustained
 higher-priority traffic can starve lower-priority traffic, and a costly head on
@@ -65,13 +66,18 @@ Whatever the strategy, all clients get the same surrounding machinery:
 - **The uncontended fast path.** When nothing is queued and the budget covers
   the request, admission is decided by a single atomic operation and the queue
   is skipped entirely. See [backends](../backends/README.md).
-- **Freeze and thaw.** A hard rate-limit response freezes the client. Recovery
-  is probed by exactly one request across the whole fleet, rather than every
-  replica retrying into a closed door.
+- **Freeze and thaw.** A 429 freezes the client fleet-wide, and so does a 5xx
+  or a dropped connection. After a 429, recovery is probed by one request at a
+  time across the whole fleet, rather than every replica retrying into a closed
+  door, and the freeze clears after `thawRequestCount` (default 3) successful
+  probes. A freeze armed by a 5xx or a dropped connection has no probes and
+  simply lapses.
 - **Leader election.** One process drains each client's queue; the rest enqueue
   and await.
-- **Per-grant isolation.** A client with multiple credentials can meter each one
-  separately, so one tenant hitting their ceiling does not stall the others.
+- **Per-grant isolation.** An `oauth2` client with
+  `grantRateLimitBehavior: "isolated"` meters each grant separately, so one
+  tenant hitting their ceiling does not stall the others. See
+  [grants](../concepts.md#grants).
 
 ### `retry429s: false` disarms the freeze
 
@@ -90,15 +96,17 @@ says nothing about whether the rest of the fleet should keep hammering an
 upstream that has just refused us, so it is not permitted to produce a
 zero-length freeze — which the arming gate would read as no freeze at all.
 
-The freeze duration is floored at **1000ms** for the types that derive it from
-the configured back-off, `concurrencyLimit` and `noLimit`. `requestLimit` floors
-its freeze at the refill interval instead, since a freeze empties the bucket and
+For the freeze, a zero back-off is replaced by **1000ms**; a positive one is
+used as it is. That is the whole rule for the types that derive the freeze from
+the configured back-off, `concurrencyLimit` and `noLimit`. `requestLimit` also
+floors its freeze at the refill interval, since a freeze empties the bucket and
 is not over until the bucket can refill; a `sharedLimit` child floors it at its
-parent's, and a client with [several limits](multiple-limits.md) at the shortest
-of its own. The same floor catches a `retryBackoffBaseTime` that is negative or
-`NaN` — a `rateLimitChange` reading a header the vendor omitted is the usual
-source, and a negative would otherwise put `frozenUntil` in the past and leave
-the client in permanent single-probe thaw.
+parent's shortest refill interval, and a client with
+[several limits](multiple-limits.md) at the shortest of its own. The same
+replacement catches a `retryBackoffBaseTime` that is negative or `NaN` — an
+unset `Number(process.env.…)` is the usual source, and a negative would
+otherwise put `frozenUntil` in the past and leave the client in permanent
+single-probe thaw.
 
 So `retryBackoffBaseTime: 0` on a `noLimit` client gives you a request that
 retries immediately and a fleet that still stands down for a second. The

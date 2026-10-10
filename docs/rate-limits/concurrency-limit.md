@@ -138,27 +138,30 @@ The waiting version looks equivalent and is not: only one request can wait at a
 time, so it blocks every request behind it and the client admits roughly one
 request per poll interval no matter how many slots are free.
 
-The cap itself is the entire contract, so the conformance suite drains a backlog
-of 120 requests through a 5-slot client while watching occupancy, and asserts
-the peak never exceeds 5 and every slot is released afterwards. A limiter that
+The cap itself is the entire contract, so `test/handler.integration.test.ts`
+drains a backlog of 120 requests through a 5-slot client while watching
+occupancy and asserts the peak never exceeds 5, and a companion test asserts
+every slot is released once the work is done. A limiter that
 drains promptly but occasionally admits 6 is worse than useless, because the
 breach is invisible until the vendor reacts.
 
 ## Interaction with freeze
 
-A hard rate-limit response still freezes the client, and a frozen client admits
-nothing regardless of free slots. Thaw probing works exactly as it does for the
-other types.
+A 429, a 5xx or a dropped connection still freezes the client, and a frozen
+client admits nothing regardless of free slots. Thaw probing works exactly as it
+does for the other types.
 
 The freeze duration comes from `retryBackoffBaseTime`, and this type does not
 floor that value for the retry itself — so `retryBackoffBaseTime: 0` means the
 failing request tries again with no local delay. It does **not** mean no freeze:
-the freeze is floored at **1000ms**, because a zero-length one reads as no freeze
-at all downstream and the rest of the fleet would keep sending into an upstream
-that has just refused us. Occupancy is not the constraint being expressed here —
+for the freeze, a zero back-off is replaced by **1000ms**, because a zero-length
+one reads as no freeze at all downstream and the rest of the fleet would keep
+sending into an upstream that has just refused us. Occupancy is not the
+constraint being expressed here —
 "how soon may _this_ request retry" and "how long should _everyone_ stand down"
 are separate questions, and only the first is yours to set to zero.
 
-A `retryBackoffBaseTime` that is negative or `NaN` hits the same floor. See
+A `retryBackoffBaseTime` that is negative or `NaN` is replaced the same way. A
+positive one is used as it is, however short. See
 [choosing a rate limit](README.md) for the general rule and for the one setting
 that does disarm the freeze.

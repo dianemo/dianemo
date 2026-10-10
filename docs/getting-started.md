@@ -24,10 +24,10 @@ import { Redis } from "ioredis";
 import RequestHandler from "@dianemo/core";
 import { redisBackend } from "@dianemo/backend-redis";
 
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL!);
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY, // 32 chars; encrypts credentials at rest
+  key: process.env.REQUEST_HANDLER_KEY!, // 32+ chars; encrypts credentials at rest
   backend: redisBackend(redis),
   logger: console, // optional; silent by default
 });
@@ -92,8 +92,8 @@ than it looks.
 await handler.addTemplateClient("acme", {
   instanceId: "production",
   baseUrl: "https://api.acme.com",
-  clientId: process.env.ACME_CLIENT_ID,
-  clientSecret: process.env.ACME_CLIENT_SECRET,
+  clientId: process.env.ACME_CLIENT_ID!,
+  clientSecret: process.env.ACME_CLIENT_SECRET!,
 });
 ```
 
@@ -106,6 +106,12 @@ placeholder for "no organisation", which is the common case, and
 `buildClientName` from `@dianemo/core` is what assembles one — it rejects a
 segment containing `:` or whitespace, either of which would let two tenants
 resolve to one client and one credential entry.
+
+A third argument puts this instance on one of the plans the template offers
+(`rateLimitOption`) or overrides its limits (`rateLimitOverrides`); see
+[rate-limit overrides](concepts.md#rate-limit-overrides). Both are checked
+before anything is stored, so a plan the template does not declare, or an
+override that cannot be built, is a `ConfigurationError` from this call.
 
 ## 4. Making requests
 
@@ -153,27 +159,35 @@ Worth knowing before you debug it.
   cannot let a late request overtake an earlier one.
 - **One process drains each client's queue.** The rest enqueue and await, so
   recovery is not a thundering herd.
-- **A hard rate-limit response freezes the client**, and recovery is probed by
-  exactly one request across the whole fleet rather than every replica retrying
-  into a closed door.
+- **A 429 freezes the client**, and recovery is probed by one request at a time
+  across the whole fleet rather than every replica retrying into a closed door.
+  A 5xx, or a connection reset or timeout, freezes it too, and that freeze
+  simply lapses — it needs no probe.
 
 ## 6. Errors
 
 ```ts
-import { RequestError, getOriginalStatus } from "@dianemo/core";
+import { RequestHandlerError } from "@dianemo/core";
+import { isAxiosError } from "axios";
 
 try {
   await handler.handleRequest({ ... });
 } catch (err) {
-  if (err instanceof RequestError) {
-    console.error(err.code, getOriginalStatus(err));
+  if (err instanceof RequestHandlerError) {
+    console.error(err.code, err.statusCode); // dianemo's own: no client, timeout…
+  } else if (isAxiosError(err)) {
+    console.error(err.response?.status); // the vendor's answer
   }
 }
 ```
 
-Every error carries `statusCode` and `code`, so a host that does not import
-dianemo's classes can still duck-type them. Retries with backoff are automatic;
-what surfaces is what remained after them.
+Retries with backoff are automatic; what surfaces is what remained after them.
+A failed upstream call surfaces as axios's own error, from the last attempt.
+Everything dianemo raises itself extends `RequestHandlerError` and carries
+`statusCode` and `code`, so a host that does not import dianemo's classes can
+still duck-type them. `RequestError` and `getOriginalStatus` belong to plugins:
+a plugin's request functions wrap failures in a `RequestError` — see
+[writing a plugin](writing-plugins.md).
 
 ## 7. Plugins, when you have more than one integration
 
@@ -203,7 +217,7 @@ share it.
 - [ ] Redis runs `maxmemory-policy noeviction` — an evicted key reads as a full
       budget and the fleet overspends silently
       ([why](backends/redis.md#operational-notes))
-- [ ] `REQUEST_HANDLER_KEY` is a real 32-character secret, not a literal
+- [ ] `REQUEST_HANDLER_KEY` is a real secret of 32+ characters, not a literal
 - [ ] Rate limits reflect published vendor limits, at the finest sensible interval
 - [ ] `cost` set on endpoints the vendor prices higher
 - [ ] Bulk work runs at a lower `priority` than interactive traffic

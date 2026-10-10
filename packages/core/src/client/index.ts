@@ -36,12 +36,22 @@ const MIN_FREEZE_BASE_MS = 1000;
  */
 const MAX_DRAIN_DELAY_MS = 60_000;
 
+/**
+ * How many health ticks a worker keeps re-announcing a completion it owns that
+ * no controller has acknowledged. Bounds the traffic and the memory while no
+ * controller exists at all; long past any election gap.
+ */
+const MAX_COMPLETION_FORWARDS = 30;
+
 interface PendingRequestDone {
   data: RequestDoneData;
   queueHandled: boolean;
   ownTypeHandled: boolean;
   freezeHandled: boolean;
   thawHandled: boolean;
+  /** When the owner next re-announces it, if still unacknowledged. */
+  forwardDueAt: number;
+  forwards: number;
 }
 
 abstract class BaseClient {
@@ -368,9 +378,13 @@ abstract class BaseClient {
     const updatedData: ClientTypes.RateLimitUpdatedData = {
       clientName: this.name,
       // Normalised here rather than at each receiver, so every listener and every
-      // `handleRateLimitUpdated` sees the one shape. Against the current limits,
-      // so an update that leaves a name out keeps that limit's budget.
-      rateLimit: normalizeRateLimit(data, this.rateLimit),
+      // `handleRateLimitUpdated` sees the one shape. Against the budget owner's
+      // current limits, so an update that leaves a name out keeps that limit's
+      // budget — a `sharedLimit` child's own list names no budget at all.
+      rateLimit: normalizeRateLimit(
+        data,
+        this.getParentRateLimit?.() ?? this.rateLimit
+      ),
       source,
       publisherInstanceId: this.instanceId,
     };
@@ -631,10 +645,14 @@ abstract class BaseClient {
    * Leaving it to time out told the caller the controller was slow, a minute
    * later, when the real answer — its cost no longer fits the budget — was known
    * immediately and is a different class of error.
+   *
+   * A waiter on another client of this replica is reached through the
+   * handler-wide emitter: a `sharedLimit` child registers its waiters on itself,
+   * while the budget owner is the one draining the queue.
    */
   public failWaitingRequest(requestId: string, error: Error): boolean {
     const cancel = this.waitingRequests.get(requestId);
-    if (!cancel) return false;
+    if (!cancel) return this.emitter.emit(`requestFailed:${requestId}`, error);
     this.waitingRequests.delete(requestId);
     cancel(error);
     return true;
@@ -657,7 +675,7 @@ abstract class BaseClient {
     }
     previous.pendingRequestDone.clear();
     for (const completionId of previous.completedRequestIds) {
-      this.completedRequestIds.add(completionId);
+      this.rememberCompleted(completionId);
     }
     previous.completedRequestIds.clear();
   }
@@ -944,7 +962,8 @@ abstract class BaseClient {
 
   /**
    * Records a completion on every replica that observes it. Only the current
-   * controller applies cleanup; workers retain the record across election gaps.
+   * controller applies cleanup; the request's owner re-announces it until a
+   * controller acknowledges it. See docs/design-notes.md#completion-hand-off.
    */
   public async finalizeOwnedRequest(data: RequestDoneData): Promise<void> {
     if (this.replacementClient) {
@@ -963,16 +982,61 @@ abstract class BaseClient {
         return;
       }
     }
-    const completionId = `${data.requestId}:${data.retries}:${data.responseStatus}`;
-    if (this.completedRequestIds.has(completionId)) return;
+    const completionId = completionIdOf(data);
+    if (this.completedRequestIds.has(completionId)) {
+      // A re-announcement of something already applied: the owner missed the
+      // acknowledgement, and will keep re-announcing until it gets one.
+      if (this.role === "controller") await this.acknowledgeCompletion(data);
+      return;
+    }
     this.storePendingRequestDone(data);
     if (this.role === "controller") {
       await this.flushPendingRequestDone(completionId);
     }
   }
 
+  /**
+   * The controller's word to a completion's owner that it has been applied,
+   * which is what stops the owner re-announcing it. Never sent to itself.
+   */
+  private async acknowledgeCompletion(data: RequestDoneData): Promise<void> {
+    if (data.ownerId === this.instanceId) return;
+    await this.backend
+      .publish(
+        `${this.handlerNamespace}:requestDoneApplied:${data.ownerId}`,
+        JSON.stringify({
+          clientName: data.clientName,
+          completionId: completionIdOf(data),
+        })
+      )
+      .catch((error: unknown) => {
+        this.logger.debug(
+          { error },
+          `Client ${this.name} | could not acknowledge a completion; its owner will re-announce it`
+        );
+      });
+  }
+
+  /** A controller has applied this completion, so the owner stops announcing it. */
+  public handleRequestDoneApplied(completionId: string): void {
+    if (this.replacementClient) {
+      this.replacementClient.handleRequestDoneApplied(completionId);
+      return;
+    }
+    this.pendingRequestDone.delete(completionId);
+    this.rememberCompleted(completionId);
+  }
+
+  private rememberCompleted(completionId: string): void {
+    this.completedRequestIds.add(completionId);
+    if (this.completedRequestIds.size > 10_000) {
+      const oldest = this.completedRequestIds.values().next().value;
+      if (oldest) this.completedRequestIds.delete(oldest);
+    }
+  }
+
   private storePendingRequestDone(data: RequestDoneData): void {
-    const completionId = `${data.requestId}:${data.retries}:${data.responseStatus}`;
+    const completionId = completionIdOf(data);
     if (this.completedRequestIds.has(completionId)) return;
     if (!this.pendingRequestDone.has(completionId)) {
       this.pendingRequestDone.set(completionId, {
@@ -981,6 +1045,10 @@ abstract class BaseClient {
         ownTypeHandled: false,
         freezeHandled: false,
         thawHandled: false,
+        // A full tick's grace, so the acknowledgement of the original
+        // announcement normally arrives before any re-announcement is due.
+        forwardDueAt: Date.now() + this.healthCheckIntervalMs,
+        forwards: 0,
       });
       // New work gets its own retry budget: the cap in
       // `scheduleCompletionForward` is meant to bound one burst's spin while a
@@ -992,6 +1060,7 @@ abstract class BaseClient {
   private scheduleCompletionForward(): void {
     if (this.completionForwardTimer || this.completionForwardAttempts >= 50)
       return;
+    if (this.admissionHalted) return;
     this.completionForwardAttempts++;
     this.completionForwardTimer = setTimeout(() => {
       this.completionForwardTimer = undefined;
@@ -1019,16 +1088,29 @@ abstract class BaseClient {
       return;
     }
 
+    const now = Date.now();
     for (const [completionId, pending] of this.pendingRequestDone) {
-      if (pending.data.ownerId === this.instanceId) {
-        await this.backend.publish(
-          `${this.handlerNamespace}:requestDone`,
-          JSON.stringify(pending.data)
-        );
+      // Only the owner re-announces. A copy retained here for anyone else is
+      // dropped: that owner is still announcing it until it is acknowledged.
+      if (pending.data.ownerId !== this.instanceId) {
+        this.pendingRequestDone.delete(completionId);
+        continue;
       }
-      // Role reconciliation above established that another replica is the
-      // controller, which now owns the retained copy.
-      this.pendingRequestDone.delete(completionId);
+      if (now < pending.forwardDueAt) continue;
+      if (pending.forwards >= MAX_COMPLETION_FORWARDS) {
+        this.logger.warn(
+          `Client ${this.name} | no controller acknowledged completion ${completionId} after ${pending.forwards} announcements; giving up on it`
+        );
+        this.pendingRequestDone.delete(completionId);
+        this.rememberCompleted(completionId);
+        continue;
+      }
+      pending.forwards++;
+      pending.forwardDueAt = now + this.healthCheckIntervalMs;
+      await this.backend.publish(
+        `${this.handlerNamespace}:requestDone`,
+        JSON.stringify(pending.data)
+      );
     }
   }
 
@@ -1051,11 +1133,8 @@ abstract class BaseClient {
         try {
           await this.handleRequestDone(pending);
           this.pendingRequestDone.delete(completionId);
-          this.completedRequestIds.add(completionId);
-          if (this.completedRequestIds.size > 10_000) {
-            const oldest = this.completedRequestIds.values().next().value;
-            if (oldest) this.completedRequestIds.delete(oldest);
-          }
+          this.rememberCompleted(completionId);
+          await this.acknowledgeCompletion(pending.data);
         } catch (error) {
           this.logger.error(
             { error },
@@ -1116,19 +1195,24 @@ abstract class BaseClient {
       // through. This timer routinely outlives the handler that scheduled it, so
       // the rejection guard keeps an unheld promise from surfacing in the host
       // process, and the retained handle lets shutdown cancel a pending freeze.
-      const timer = setTimeout(() => {
-        this.freezeTimers.delete(timer);
-        void (async () => {
-          if (data.grantId) await this.removeFrozenGrantId(data.grantId);
-          await this.processRequests();
-        })().catch((error) => {
-          this.logger.error(
-            { error },
-            `Client ${this.name} | post-freeze processing failed`
-          );
-        });
-      }, waitFor);
-      this.freezeTimers.add(timer);
+      // A halted client books none: it admits nothing, shutdown has already
+      // cleared the timers this would join, and the next controller sweeps the
+      // frozen-grant mark.
+      if (!this.admissionHalted) {
+        const timer = setTimeout(() => {
+          this.freezeTimers.delete(timer);
+          void (async () => {
+            if (data.grantId) await this.removeFrozenGrantId(data.grantId);
+            await this.processRequests();
+          })().catch((error) => {
+            this.logger.error(
+              { error },
+              `Client ${this.name} | post-freeze processing failed`
+            );
+          });
+        }, waitFor);
+        this.freezeTimers.add(timer);
+      }
       pending.freezeHandled = true;
     } else if (!(data.freezeClient && freezeFor)) {
       pending.freezeHandled = true;
@@ -1171,7 +1255,7 @@ abstract class BaseClient {
       await this.backend.updateThawProgress(
         this.getFreezeStateKey(data.grantId),
         data.responseStatus === "success",
-        `${data.requestId}:${data.retries}:${data.responseStatus}`
+        completionIdOf(data)
       );
 
       // Clearing the frozen mark releases the single-probe claim, whether the
@@ -1226,8 +1310,11 @@ abstract class BaseClient {
 
     // Arm first so no request or abort refund can enter between emptying a
     // token bucket and publishing the freeze. Admission consults this key, and
-    // shipped backends also refuse refunds while it is live.
-    await this.handleFreezeOwnTypeRequests(data.grantId);
+    // shipped backends also refuse refunds while it is live. Only a 429 says
+    // the budget was wrong; a 5xx or a dropped socket leaves it as it is.
+    if (data.isRateLimited) {
+      await this.handleFreezeOwnTypeRequests(data.grantId);
+    }
 
     if (data.grantId) await this.addFrozenGrantId(data.grantId);
 
@@ -1367,8 +1454,9 @@ abstract class BaseClient {
   }
 
   /**
-   * Claims this request as the grant's single thaw probe, returning "exists" if
-   * another already holds the claim.
+   * Claims this request as the single thaw probe for its freeze — the grant's
+   * with isolation, the client's without — returning "exists" if another
+   * already holds the claim.
    *
    * Marking the grant frozen, checking for an existing probe and staking the
    * claim have to be one atomic step, or two controllers racing each other
@@ -1378,12 +1466,31 @@ abstract class BaseClient {
     grantId: string | undefined,
     requestId: string
   ): Promise<"started" | "exists"> {
+    let probeGrant = grantId;
+    if (!this.usesGrantIsolation()) {
+      // Every grant shares the one freeze here, but the backend matches a probe
+      // by the entry's own `grantId`, so a grant-scoped probe is invisible to the
+      // atomic claim below. This scan covers it within one controller; two
+      // controllers at once can still race it.
+      const queued = await this.backend.getAllRequests(
+        this.getQueueKey(),
+        this.getMetadataKeyPrefix()
+      );
+      const probing = queued.some(
+        (entry) =>
+          entry.requestId !== requestId &&
+          entry.status === "inProgress" &&
+          entry.isThawRequest
+      );
+      if (probing) return "exists";
+      probeGrant = undefined;
+    }
     return this.backend.tryStartThawRequest(
       this.getFrozenGrantsKey(),
       this.getQueueKey(),
       this.getMetadataKeyPrefix(),
       requestId,
-      grantId ?? ""
+      probeGrant ?? ""
     );
   }
 
@@ -1512,6 +1619,11 @@ abstract class BaseClient {
       `Set grant tokens for client ${this.name}, grant ${grantId}`
     );
   }
+}
+
+/** One attempt's outcome: a retry and the attempt after it are different. */
+function completionIdOf(data: RequestDoneData): string {
+  return `${data.requestId}:${data.retries}:${data.responseStatus}`;
 }
 
 /**

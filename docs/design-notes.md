@@ -427,6 +427,34 @@ stands, because the freeze emptied that bucket — true only of the lone
 therefore refunded to every bucket of a client with several `requestLimit`s,
 with the freeze key dropped from each, rather than lost.
 
+Only a 429 empties even the lone bucket; a 5xx or a dropped socket says the
+upstream is unwell, not that the budget was wrong. A refund refused under such
+a freeze loses its token, which is the safe direction.
+
+## Completion hand-off
+
+A request's `requestDone` is announced by the replica that owns it, and only the
+controller applies it — removes the entry, releases slots, arms freezes, counts
+thaw progress. Pub/sub is at-most-once and controllers die, so the owner keeps
+each completion it announced until a controller says it has applied it:
+
+- The controller, after applying a completion owned by another replica, sends
+  `requestDoneApplied:<ownerId>` back to that owner, and sends it again for any
+  re-announcement of something it has already applied.
+- The owner re-announces an unacknowledged completion on its health tick, no
+  sooner than one full interval after it first stored it, so in the ordinary
+  case the acknowledgement lands first and the public channel carries the
+  completion once. It gives up after `MAX_COMPLETION_FORWARDS` ticks with no
+  controller at all.
+- An acknowledged completion is remembered in `completedRequestIds`, on workers
+  as on the controller, so a late echo of a re-announcement is not stored again.
+  Without that the owner's own echo re-armed it, and `requestDone` — which
+  consumers meter — carried one completion on every tick, forever.
+- A non-owner keeps its copy only until its next tick. It matters when that
+  replica is promoted first, and the owner's re-announcement covers the rest —
+  which is also what carries a completion past a controller that died with it
+  unapplied.
+
 ## One queue per budget, so one arbiter orders it
 
 A `sharedLimit` client is constructed with the owner's name. Its queue, bucket,

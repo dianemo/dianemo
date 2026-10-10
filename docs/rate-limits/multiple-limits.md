@@ -199,7 +199,12 @@ is what swaps one for another.
 A limit returned without a name keeps the name of the one limit of its type it
 replaces, so `() => [{ type: "requestLimit", ...fromHeaders }]` retunes a client's
 `per_hour` budget rather than starting a fresh `default` one. Operator overrides
-are named the same way against the limits they replace.
+and `rateLimitUpdated` broadcasts are named the same way against the limits they
+replace, and a `sharedLimit` client's `rateLimitChange` against its owner's.
+
+That inheritance is for a list's **one** unnamed limit. A list leaving two
+unnamed is refused, on its first application and on every repeat, exactly as
+it would be in the original declaration — name them.
 
 An update whose entries are unusable is refused and logged, keeping the last
 workable configuration rather than wedging the client. So is one the backend

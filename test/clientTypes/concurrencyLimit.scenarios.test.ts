@@ -1607,5 +1607,59 @@ describe.each(harnesses(11))(
 
       expect(realCycles).toBe(ITERATIONS);
     }, 180_000);
+
+    it("does not carry an attempt's claimed keys into the retry that follows it", async () => {
+      let calls = 0;
+      up.route("/conflict-once", async (res) => {
+        calls++;
+        await sleep(150);
+        res.writeHead(calls === 1 ? 409 : 200, {
+          "content-type": "application/json",
+        });
+        res.end("{}");
+      });
+      await withClient(
+        harness,
+        spec(1, {
+          retryOptions: {
+            maxRetries: 1,
+            retryBackoffBaseTime: 100,
+            retryStatusCodes: [409],
+          },
+          requestOptions: {
+            defaults: { baseURL: up.baseURL },
+            cleanupTimeout: 500,
+          },
+        }),
+        async (handler, backend, clientName) => {
+          const seen = spyRequestDone(backend) as Array<{
+            requestId: string;
+            responseStatus: string;
+            claimedKeys?: string[];
+          }>;
+          const retried = settle(send(handler, clientName, "/conflict-once"));
+          await sleep(50);
+          // Takes the slot the moment the first attempt releases it, so the
+          // retry waits in the queue until its admission budget runs out.
+          const holder = settle(send(handler, clientName, "/hold"));
+          const outcome = await retried;
+          expect(outcome.ok).toBe(false);
+
+          const attempts = seen.filter(
+            (done) => done.requestId === seen[0].requestId
+          );
+          expect(attempts[0].responseStatus).toBe("retry");
+          expect(attempts[0].claimedKeys).toEqual([SLOTS]);
+          // The abandoned retry claimed nothing, so it must not report the
+          // first attempt's claim as its own.
+          const abandoned = attempts[attempts.length - 1];
+          expect(abandoned.responseStatus).toBe("failure");
+          expect(abandoned.claimedKeys).toBeUndefined();
+
+          up.releaseHeld();
+          expect((await holder).ok).toBe(true);
+        }
+      );
+    }, 30_000);
   }
 );

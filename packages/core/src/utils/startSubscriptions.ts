@@ -22,6 +22,7 @@ async function startSubscriptions(this: RequestHandler) {
       `${this.namespace}:requestAdded`,
       `${this.namespace}:requestReady:${this.id}`,
       `${this.namespace}:requestDone`,
+      `${this.namespace}:requestDoneApplied:${this.id}`,
       `${this.namespace}:rateLimitUpdated`,
     ],
     (channel: string, message: string) => {
@@ -88,6 +89,9 @@ async function handleMessage(
       break;
     case `${this.namespace}:requestDone`:
       await handleRequestDone.bind(this)(message);
+      break;
+    case `${this.namespace}:requestDoneApplied:${this.id}`:
+      handleRequestDoneApplied.bind(this)(message);
       break;
     case `${this.namespace}:rateLimitUpdated`:
       handleRateLimitUpdated.bind(this)(message);
@@ -249,10 +253,30 @@ async function handleRequestDone(this: RequestHandler, message: string) {
     );
     return;
   }
-  // Every replica records the notification. Workers retain it across an
-  // election gap; the active controller performs single-flight cleanup.
+  // Every replica records the notification. The active controller performs
+  // single-flight cleanup; the owner re-announces it until that is acknowledged.
   const doneClient = this.clients.get(doneData.clientName);
   if (doneClient) await doneClient.finalizeOwnedRequest(doneData);
+}
+
+/** A controller has applied a completion this replica owns. */
+function handleRequestDoneApplied(this: RequestHandler, message: string) {
+  let data: { clientName: string; completionId: string };
+  try {
+    data = JSON.parse(message);
+  } catch (error) {
+    this.logger.error(
+      {
+        error,
+        message: preview(message),
+      },
+      "Failed to parse JSON in handleRequestDoneApplied"
+    );
+    return;
+  }
+  this.clients
+    .get(data.clientName)
+    ?.handleRequestDoneApplied(data.completionId);
 }
 
 async function handleRateLimitUpdated(this: RequestHandler, message: string) {

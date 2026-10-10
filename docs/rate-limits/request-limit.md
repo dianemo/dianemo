@@ -107,9 +107,13 @@ the fleet. See [choosing a rate limit](README.md) for the shared machinery. A
 client declaring [several `requestLimit`s](multiple-limits.md) does not empty its
 buckets.
 
-**Two durations, not one**, and this is the type where the difference shows. The
-freeze empties the bucket, so it is floored at `interval` — a freeze that lapsed
-sooner would reopen admission onto zero tokens, which buys nothing. The failing
+A 5xx or a dropped connection freezes the client too, but leaves the bucket as
+it is: that is upstream trouble, not proof the budget was wrong.
+
+**Two durations, not one**, and this is the type where the difference shows. A
+429's freeze empties the bucket, so every freeze is floored at `interval` — a
+freeze that lapsed sooner would reopen admission onto zero tokens, which buys
+nothing. The failing
 request's own retry back-off is **not** floored, except after a 429: a 5xx or a
 dropped socket is upstream trouble rather than a budget problem, the bucket is
 untouched by it, and flooring that back-off would stop the fleet for a full window

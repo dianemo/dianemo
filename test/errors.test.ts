@@ -7,6 +7,7 @@ import {
   NoResponseError,
   NotOAuth2ClientError,
   RequestError,
+  RequestCostExceedsBudgetError,
   RequestHandlerError,
   RequestTimeoutError,
   getOriginalResponseData,
@@ -48,6 +49,17 @@ describe("RequestHandlerError subclasses", () => {
     expect(new ClientNotFoundError("fedex:_:production").message).toContain(
       "fedex:_:production"
     );
+  });
+
+  it("describes a cost ceiling without assuming it is a token count", () => {
+    // The ceiling is the tightest of maxTokens and maxConcurrency, so a
+    // concurrency-only client reports it too.
+    const err = new RequestCostExceedsBudgetError("search:_:a", 3, 2);
+    expect(err.code).toBe("request_cost_exceeds_budget");
+    expect(err.message).toContain("(3)");
+    expect(err.message).toContain("(2)");
+    expect(err.message).toContain("maxConcurrency");
+    expect(err.message).not.toMatch(/maximum tokens/);
   });
 });
 

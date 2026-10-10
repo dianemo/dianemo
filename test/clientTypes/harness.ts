@@ -273,6 +273,8 @@ export interface ClientSpec {
   rateLimit: Record<string, unknown>[];
   /** For a suite asserting what one attempt did, rather than what four did. */
   retryOptions?: Record<string, unknown>;
+  /** For a suite whose behaviour turns on the health tick, at test speed. */
+  healthCheckIntervalMs?: number;
 }
 
 /**
@@ -298,6 +300,9 @@ export async function withHandler(
           rateLimit: spec.rateLimit,
           requestOptions: { defaults: { baseURL } },
           ...(spec.retryOptions ? { retryOptions: spec.retryOptions } : {}),
+          ...(spec.healthCheckIntervalMs
+            ? { healthCheckIntervalMs: spec.healthCheckIntervalMs }
+            : {}),
         },
       ]) as never
     );
@@ -443,6 +448,9 @@ export async function withReplicas(
                 concurrencySlotTtl: options.concurrencySlotTtl,
                 defaults: { baseURL: options.baseURL },
               },
+              ...(spec.healthCheckIntervalMs
+                ? { healthCheckIntervalMs: spec.healthCheckIntervalMs }
+                : {}),
             },
           ]) as never
         );

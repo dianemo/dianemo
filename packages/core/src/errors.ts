@@ -105,11 +105,11 @@ export class GrantRefreshTokenMissingError extends RequestHandlerError {
  * waiting could ever admit it.
  */
 export class RequestCostExceedsBudgetError extends RequestHandlerError {
-  constructor(clientName: string, cost: number, maxTokens: number) {
+  constructor(clientName: string, cost: number, ceiling: number) {
     super(
       400,
       "request_cost_exceeds_budget",
-      `Request cost (${cost}) exceeds the maximum tokens (${maxTokens}) for client ${clientName}`
+      `Request cost (${cost}) exceeds the maximum client ${clientName} can ever admit (${ceiling}), its smallest maxTokens or maxConcurrency`
     );
   }
 }

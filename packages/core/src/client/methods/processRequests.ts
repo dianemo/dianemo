@@ -70,6 +70,11 @@ async function processRequests(this: BaseClient) {
     // Without this the loop would re-select the same skipped head and spin.
     const skippedRequestIds = new Set<string>();
 
+    // Grants are scheduled apart only when they are metered apart. On a shared
+    // budget a grant-scoped head is just a head: skipping it would let cheaper,
+    // lower-priority work spend the budget it is waiting for.
+    const isolated = this.usesGrantIsolation();
+
     while (true) {
       const frozenGrantIds = await this.getFrozenGrantIds();
       const request = await this.getNextRequest(
@@ -115,7 +120,7 @@ async function processRequests(this: BaseClient) {
         // recovering on the health tick.
         await this.scheduleDrainForFreeze(res.frozenUntil, grantId);
 
-        if (grantId) {
+        if (grantId && isolated) {
           blockedGrantIds.add(grantId);
           continue;
         }
@@ -124,7 +129,7 @@ async function processRequests(this: BaseClient) {
         // own bucket, so breaking here would stall every tenant behind a
         // client-level head. Skip it and keep scanning instead; anything else on the
         // client-level budget declines in turn and is skipped too.
-        if (this.usesGrantIsolation()) {
+        if (isolated) {
           skippedRequestIds.add(requestId);
           continue;
         }
@@ -160,14 +165,14 @@ async function processRequests(this: BaseClient) {
           // lock and stall every other grant and every cheaper or
           // higher-priority request behind this one.
           this.scheduleDrain(turn.waitTime ?? 0);
-          if (grantId) {
+          if (grantId && isolated) {
             blockedGrantIds.add(grantId);
             continue;
           }
           // Same reasoning as the `canProcess` branch above, repeated because that
           // branch only fires for a freeze: a token bucket discovers it has no
           // tokens here, one step later.
-          if (this.usesGrantIsolation()) {
+          if (isolated) {
             skippedRequestIds.add(requestId);
             continue;
           }

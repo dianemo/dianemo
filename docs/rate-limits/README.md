@@ -99,8 +99,8 @@ zero-length freeze — which the arming gate would read as no freeze at all.
 For the freeze, a zero back-off is replaced by **1000ms**; a positive one is
 used as it is. That is the whole rule for the types that derive the freeze from
 the configured back-off, `concurrencyLimit` and `noLimit`. `requestLimit` also
-floors its freeze at the refill interval, since a freeze empties the bucket and
-is not over until the bucket can refill; a `sharedLimit` child floors it at its
+floors its freeze at the refill interval, since a 429 empties the bucket and
+the freeze is not over until the bucket can refill; a `sharedLimit` child floors it at its
 parent's shortest refill interval, and a client with
 [several limits](multiple-limits.md) at the shortest of its own. The same
 replacement catches a `retryBackoffBaseTime` that is negative or `NaN` — an

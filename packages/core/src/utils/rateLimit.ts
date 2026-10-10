@@ -37,21 +37,28 @@ export const DEFAULT_RATE_LIMIT_NAME = "default";
  * took the default are a duplicate, and reporting that is the whole reason the
  * default is a real name and not a blank.
  *
- * With `previous`, the list `config` replaces, an unnamed limit keeps the name
- * of the one limit of its type there, provided nothing else in `config` claims
- * that name; otherwise it is the default. A name is the budget's key, so
- * taking the default instead would start a full bucket and forget what the old
- * one had spent — and `() => [{ type, ...fromHeaders }]` is the natural way to
- * write a `rateLimitChange` for a client with one limit.
+ * With `previous`, the list `config` replaces, a list's one unnamed limit
+ * keeps the name of the one limit of its type there, provided nothing else in
+ * `config` claims that name; otherwise it is the default. A name is the
+ * budget's key, so taking the default instead would start a full bucket and
+ * forget what the old one had spent — and `() => [{ type, ...fromHeaders }]` is
+ * the natural way to write a `rateLimitChange` for a client with one limit.
+ *
+ * A list with several unnamed limits inherits nothing: each is the default, so
+ * `assertUsableRateLimits` refuses it whatever `previous` holds. Inheriting
+ * for one of them would make the same update accepted against one list and
+ * refused against the list it produced.
  */
 export function normalizeRateLimit(
   config: readonly DeclaredRateLimit[],
   previous?: readonly NamedRateLimitData[]
 ): NamedRateLimitData[] {
   const taken = new Set(config.flatMap((limit) => limit.name ?? []));
+  const unnamed = config.filter((limit) => limit.name === undefined).length;
+  const inheritFrom = unnamed === 1 ? previous : undefined;
   return config.map((limit) => ({
     ...limit,
-    name: limit.name ?? inheritedName(limit.type, previous, taken),
+    name: limit.name ?? inheritedName(limit.type, inheritFrom, taken),
   })) as NamedRateLimitData[];
 }
 
@@ -63,7 +70,6 @@ function inheritedName(
   const sameType = previous?.filter((limit) => limit.type === type) ?? [];
   const name = sameType.length === 1 ? sameType[0].name : undefined;
   if (name === undefined || taken.has(name)) return DEFAULT_RATE_LIMIT_NAME;
-  taken.add(name);
   return name;
 }
 

@@ -271,13 +271,15 @@ async function withDeadline<T>(
 
 async function waitForRequestReady(this: BaseClient, request: Request) {
   const timeoutMs = this.requestOptions.cleanupTimeout || 60000;
-  const metadata = request.getMetadata();
 
-  // A retry re-enters on the same Request object and `fastPath` describes how
-  // *this* attempt was admitted, so it must be cleared first. A stale `true` makes
-  // `handleRequestDone` skip the queue removal, stranding an entry that keeps the
-  // queue non-empty — which disables the fast path for good.
+  // A retry re-enters on the same Request object, and `fastPath` and
+  // `claimedKeys` describe how *this* attempt was admitted, so both are cleared
+  // first. A stale `fastPath` makes `handleRequestDone` skip the queue removal,
+  // stranding an entry that disables the fast path for good; stale keys make an
+  // abandonment release the previous attempt's claims.
   request.fastPath = false;
+  request.claimedKeys = undefined;
+  const metadata = request.getMetadata();
 
   // Checked before the fast path, not after: the fast path spends, and a caller who
   // has already given up must not be charged a token or a slot for a request axios
@@ -331,7 +333,15 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
       clearTimeout(timeout);
       signal?.removeEventListener?.("abort", onAbort);
       this.emitter.off(`requestReady:${request.id}`, onReady);
+      this.emitter.off(`requestFailed:${request.id}`, onFailed);
       reject(error);
+    };
+
+    // What `failWaitingRequest` reaches when the client failing this request is
+    // not the one it was queued through — a `sharedLimit` budget's owner.
+    const onFailed = (error: Error) => {
+      this.unregisterWaitingRequest(request.id);
+      cancel(error);
     };
 
     // Aborting while queued releases the place rather than holding it until the
@@ -340,6 +350,7 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
       clearTimeout(timeout);
       this.unregisterWaitingRequest(request.id);
       this.emitter.off(`requestReady:${request.id}`, onReady);
+      this.emitter.off(`requestFailed:${request.id}`, onFailed);
       // Not awaited: an abort must return control promptly, and awaiting would
       // block up to ABANDONMENT_PUBLISH_TIMEOUT_MS on a wedged backend for a caller
       // who has stopped waiting. A request aborted while queued holds no slot, so
@@ -361,6 +372,7 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
       this.unregisterWaitingRequest(request.id);
       signal?.removeEventListener?.("abort", onAbort);
       this.emitter.off(`requestReady:${request.id}`, onReady);
+      this.emitter.off(`requestFailed:${request.id}`, onFailed);
       // Same reasoning as the abort branch for the trailing catch: the logger
       // inside `publishAbandoned`'s own catch is consumer code, and a throw there
       // would leave this floating promise rejected with nothing attached.
@@ -377,6 +389,7 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
     const onReady = (ready: RequestMetadata) => {
       clearTimeout(timeout);
       signal?.removeEventListener?.("abort", onAbort);
+      this.emitter.off(`requestFailed:${request.id}`, onFailed);
       this.unregisterWaitingRequest(request.id);
       request.isThawRequest = ready.isThawRequest;
       request.claimedKeys = ready.claimedKeys;
@@ -389,6 +402,7 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
     // depend on that check for a signal to get abort handling at all.
     signal?.addEventListener?.("abort", onAbort, { once: true });
     this.emitter.once(`requestReady:${request.id}`, onReady);
+    this.emitter.once(`requestFailed:${request.id}`, onFailed);
     this.registerWaitingRequest(request.id, cancel);
   });
 

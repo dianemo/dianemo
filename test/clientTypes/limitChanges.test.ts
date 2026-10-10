@@ -130,4 +130,145 @@ describe.each(harnesses(9))("limits changing mid-flight — $name", (harness) =>
       await stop();
     }
   }, 20_000);
+
+  it("refuses a rateLimitChange returning two unnamed limits on its first application and every repeat", async () => {
+    upstream.setDelay(0);
+    const hourly = {
+      type: "requestLimit",
+      maxTokens: 50,
+      tokensToAdd: 50,
+      interval: 3_600_000,
+    };
+    const { handler, stop } = await rig([{ ...hourly, name: "x" }], {
+      rateLimitChange: () => [hourly, { ...hourly, maxTokens: 40 }],
+    });
+    const names = () =>
+      handler
+        .getLoadedClients()
+        .find((c) => c.name === "t:_:a")
+        ?.rateLimit.map((limit) => limit.name);
+    try {
+      await fire(handler);
+      await sleep(150);
+      expect(names()).toEqual(["x"]);
+      await fire(handler);
+      await sleep(150);
+      expect(names()).toEqual(["x"]);
+    } finally {
+      await stop();
+    }
+  }, 20_000);
+
+  it("names an operator's unnamed rateLimitUpdated against the receiving client's limits", async () => {
+    const hourly = {
+      type: "requestLimit",
+      maxTokens: 2,
+      tokensToAdd: 2,
+      interval: 3_600_000,
+    };
+    const { backend, cleanup } = await harness.create();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend,
+      keyPrefix: "lcop",
+    });
+    await handler.registerClientTemplate(
+      "t" as never,
+      ((creds: { instanceId: string }) => [
+        {
+          name: `t:_:${creds.instanceId}`,
+          rateLimit: [{ ...hourly, name: "per_hour" }],
+          requestOptions: {
+            defaults: { baseURL: upstream.baseURL },
+            cleanupTimeout: 1500,
+          },
+        },
+      ]) as never
+    );
+    await handler.start();
+    await handler.addTemplateClient("t" as never, { instanceId: "a" } as never);
+    try {
+      await fire(handler);
+      await backend.publish(
+        `${handler.getNamespace()}:rateLimitUpdated`,
+        JSON.stringify({
+          clientName: "t:_:a",
+          rateLimit: [hourly],
+          source: "operator",
+          publisherInstanceId: "operator",
+        })
+      );
+      await sleep(150);
+      const loaded = handler.getLoadedClients().find((c) => c.name === "t:_:a");
+      expect(loaded?.rateLimit.map((limit) => limit.name)).toEqual([
+        "per_hour",
+      ]);
+      // The budget kept its spend: one token left, not a fresh two.
+      const results = await Promise.allSettled([fire(handler), fire(handler)]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    } finally {
+      await handler.stop();
+      await cleanup();
+    }
+  }, 20_000);
+
+  it("keeps the owner's named budget when a sharedLimit child's rateLimitChange omits the name", async () => {
+    const hourly = {
+      type: "requestLimit",
+      maxTokens: 2,
+      tokensToAdd: 2,
+      interval: 3_600_000,
+    };
+    const { backend, cleanup } = await harness.create();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend,
+      keyPrefix: "lcsh",
+    });
+    await handler.registerClientTemplate(
+      "t" as never,
+      ((creds: { instanceId: string }) => [
+        {
+          name: `t:_:${creds.instanceId}`,
+          rateLimit: [{ ...hourly, name: "per_hour" }],
+          requestOptions: {
+            defaults: { baseURL: upstream.baseURL },
+            cleanupTimeout: 1500,
+          },
+        },
+        {
+          name: `kid:_:${creds.instanceId}`,
+          rateLimit: [
+            { type: "sharedLimit", clientName: `t:_:${creds.instanceId}` },
+          ],
+          rateLimitChange: () => [hourly],
+          requestOptions: {
+            defaults: { baseURL: upstream.baseURL },
+            cleanupTimeout: 1500,
+          },
+        },
+      ]) as never
+    );
+    await handler.start();
+    await handler.addTemplateClient("t" as never, { instanceId: "a" } as never);
+    try {
+      const results = await Promise.allSettled(
+        Array.from({ length: 4 }, async (_, i) => {
+          await sleep(i * 150);
+          return handler.handleRequest({
+            clientName: "kid:_:a",
+            requestName: "t",
+            method: "GET",
+            url: "/",
+          });
+        })
+      );
+      const owner = handler.getLoadedClients().find((c) => c.name === "t:_:a");
+      expect(owner?.rateLimit.map((limit) => limit.name)).toEqual(["per_hour"]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(2);
+    } finally {
+      await handler.stop();
+      await cleanup();
+    }
+  }, 20_000);
 });

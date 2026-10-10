@@ -224,8 +224,9 @@ bucket emptied, whatever `noLimit` or `concurrencyLimit` entries sit beside it.
 A client with
 [several `requestLimit`s](rate-limits/multiple-limits.md#freeze-does-not-empty-the-buckets)
 keeps its buckets and relies on the freeze window alone. A 5xx, or a connection
-reset or timeout, freezes the client as well, but needs no thaw probes: that
-freeze ends when its deadline lapses.
+reset or timeout, freezes the client as well, but leaves every bucket as it is
+and needs no thaw probes: the upstream was unwell, which says nothing about the
+budget, and that freeze ends when its deadline lapses.
 
 Recovery from a 429 is not "everyone retries at once". Once the deadline
 passes, one request at a time across the whole fleet is nominated as the **thaw
@@ -234,7 +235,9 @@ and the freeze clears when that many have. A failed probe does not consume thaw
 progress, and the next request becomes the next probe.
 
 With isolated grants, probing is per grant: one probe per grant rather than one
-per client, so recovering tenants do not wait behind each other.
+per client, so recovering tenants do not wait behind each other. Without
+isolation every grant shares the client's one freeze, so grant-scoped requests
+probe one at a time like everything else.
 
 ### Clearing a freeze by hand
 
@@ -301,7 +304,8 @@ work can therefore starve lower-priority work. Within one client-level budget,
 an expensive head that does not currently fit also waits ahead of cheaper work;
 the scheduler preserves order rather than using spare capacity out of turn.
 Grant-isolated clients are the exception: a blocked grant is skipped so it does
-not stall unrelated tenants.
+not stall unrelated tenants. A grant-scoped request on a shared client is not
+skipped — its grant has no budget of its own to wait on.
 
 `cost` is not part of the score — it decides what a request spends, not where it
 sits. Ordering within a priority band is by arrival to the millisecond, which

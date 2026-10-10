@@ -531,6 +531,9 @@ export default class RequestHandler {
       }
       this.heartbeatTimeouts.clear();
       for (const client of this.clients.values()) {
+        // Halted before the timers are cleared, so a 429 landing while requests
+        // are still upstream cannot book a freeze wake-up behind the clear.
+        client.haltAdmission();
         client.removeHealthCheckInterval();
         // Whatever did not drain in time fails with a reason, rather than an
         // opaque timeout long after the process meant to exit. These hold no slot —

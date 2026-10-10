@@ -1021,6 +1021,38 @@ describe.each(harnesses(12))("sharedLimit scenarios — $name", (harness) => {
     );
   }, 30_000);
 
+  it("fails a child's queued request promptly once the parent's budget shrinks below its cost", async () => {
+    await pair(
+      { interval: 60_000, tokensToAdd: 10, maxTokens: 10 },
+      async (handler, backend) => {
+        await fireAt(handler, PARENT, { url: "/drain", cost: 10 });
+        const started = Date.now();
+        const queued = fireAt(handler, CHILD, { url: "/big", cost: 8 }).then(
+          () => undefined,
+          (error: unknown) => error
+        );
+        await settle(100);
+        await backend.publish(
+          `${NS}:rateLimitUpdated`,
+          JSON.stringify({
+            clientName: PARENT,
+            rateLimit: [{ type: "requestLimit", ...bucket(60_000, 5) }],
+            source: "operator",
+            publisherInstanceId: "operator",
+          })
+        );
+
+        expect(await queued).toBeInstanceOf(RequestCostExceedsBudgetError);
+        // Well inside the 4s admission budget: the answer was known at once.
+        expect(Date.now() - started).toBeLessThan(2_000);
+        await settle(100);
+        const queue = await backend.getQueueStats(P.queue, P.meta);
+        expect(queue.pending + queue.inProgress).toBe(0);
+      },
+      { parent: { cleanupTimeout: 4_000 }, child: { cleanupTimeout: 4_000 } }
+    );
+  }, 30_000);
+
   it("admits a cost exactly equal to the parent's ceiling", async () => {
     await pair(
       { interval: 600_000, tokensToAdd: 5, maxTokens: 5 },

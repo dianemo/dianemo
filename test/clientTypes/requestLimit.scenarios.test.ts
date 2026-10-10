@@ -1541,8 +1541,8 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
         // A 5xx is still a fleet-wide statement about the upstream...
         expect(failure?.freezeClient).toBe(true);
         expect(failure?.isRateLimited).toBe(false);
-        // ...so the freeze it arms still outlasts a refill, because freezing is
-        // what emptied the bucket...
+        // ...so the freeze it arms still outlasts a refill, floored at the
+        // interval like every freeze on this type...
         expect(failure?.freezeTime).toBe(400);
         // ...but this request's own back-off is the 20ms that was configured.
         // Charging it a refill interval was the defect: the bucket had a full
@@ -1941,5 +1941,173 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
         );
       }
     );
+  }, 30_000);
+
+  it("leaves the bucket untouched when a 5xx freezes the client", async () => {
+    upstream.onlyOnce("/unavailable", 503);
+    await run(
+      {
+        rateLimit: { interval: 60_000, tokensToAdd: 5, maxTokens: 5 },
+        client: { retryOptions: { maxRetries: 0, retryBackoffBaseTime: 20 } },
+      },
+      async (ctx) => {
+        const failure = await sendCatching(ctx.handler, "/unavailable");
+        expect(failure?.response?.status).toBe(503);
+        const froze = await waitFor(async () => {
+          const state = await ctx.freeze();
+          return !!state && state.frozenUntil > Date.now();
+        }, 2_000);
+        expect(froze).toBe(true);
+        // Only the failed request's own token is spent: the upstream was down,
+        // which says nothing about how much budget is left.
+        expect((await ctx.bucket()).tokens).toBe(4);
+      }
+    );
+  }, 30_000);
+
+  it("does not let cheaper, lower-priority work overtake a grant-scoped head on a shared budget", async () => {
+    await run(
+      { rateLimit: { interval: 1_500, tokensToAdd: 5, maxTokens: 5 } },
+      async (ctx) => {
+        const order: string[] = [];
+        const fire = (url: string, extra: Record<string, unknown>) =>
+          send(ctx.handler, url, extra).then(() => order.push(url));
+        await Promise.all([1, 2, 3, 4].map(() => fire("/ord.warm", {})));
+        order.length = 0;
+
+        const expensive = fire("/ord.expensive", {
+          grantId: "g1",
+          cost: 5,
+          priority: 9,
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        const cheap = fire("/ord.cheap", { cost: 1, priority: 0 });
+        await Promise.all([expensive, cheap]);
+
+        expect(order).toEqual(["/ord.expensive", "/ord.cheap"]);
+      }
+    );
+  }, 30_000);
+});
+
+describe.each(harnesses(10))("requestLimit thaw probing — $name", (harness) => {
+  it("probes one request at a time on a shared client, whatever grants the queue holds", async () => {
+    let calls = 0;
+    let inFlight = 0;
+    let peak = 0;
+    const server = createServer(async (_req, res) => {
+      calls++;
+      if (calls === 1) {
+        res.writeHead(429);
+        res.end();
+        return;
+      }
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 300));
+      inFlight--;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("{}");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    try {
+      await withClient(
+        harness,
+        `http://127.0.0.1:${port}`,
+        {
+          rateLimit: { interval: 300, tokensToAdd: 10, maxTokens: 10 },
+          client: {
+            retryOptions: {
+              maxRetries: 0,
+              retryBackoffBaseTime: 300,
+              thawRequestCount: 10,
+            },
+            requestOptions: { cleanupTimeout: 10_000 },
+          },
+        },
+        async (ctx) => {
+          await sendCatching(ctx.handler, "/thaw.limited");
+          await new Promise((r) => setTimeout(r, 30));
+          const results = await Promise.all(
+            [1, 2, 3, 4, 5].map((i) =>
+              send(ctx.handler, "/thaw.probe", { grantId: `g${i}` })
+            )
+          );
+          expect(results.every((res) => res.status === 200)).toBe(true);
+          expect(peak).toBe(1);
+        },
+        "rlthaw"
+      );
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 30_000);
+});
+
+describe.each(harnesses(10))("requestLimit shutdown — $name", (harness) => {
+  it("leaves no freeze timer behind when a 429 lands while stop() waits on it", async () => {
+    const server = createServer(async (_req, res) => {
+      await new Promise((r) => setTimeout(r, 300));
+      res.writeHead(429);
+      res.end();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    const { backend, cleanup } = await harness.create();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend,
+      keyPrefix: "rlstop",
+    });
+    try {
+      await handler.registerClientTemplate(
+        "rl" as never,
+        (() => [
+          {
+            name: CLIENT,
+            rateLimit: [
+              {
+                type: "requestLimit",
+                maxTokens: 10,
+                tokensToAdd: 10,
+                interval: 4_000,
+              },
+            ],
+            retryOptions: { maxRetries: 0, retryBackoffBaseTime: 100 },
+            requestOptions: {
+              defaults: { baseURL: `http://127.0.0.1:${port}` },
+            },
+          },
+        ]) as never
+      );
+      handler.setDrainTimeout(200);
+      await handler.start();
+      await handler.addTemplateClient(
+        "rl" as never,
+        { instanceId: "a" } as never
+      );
+      const client = (
+        handler as unknown as {
+          clients: Map<string, { freezeTimers: Set<unknown> }>;
+        }
+      ).clients.get(CLIENT)!;
+
+      const inFlight = sendCatching(handler, "/stop.limited");
+      await new Promise((r) => setTimeout(r, 50));
+      await handler.stop();
+      await inFlight;
+      // The completion's cleanup runs after the caller is answered.
+      await new Promise((r) => setTimeout(r, 200));
+      expect(client.freezeTimers.size).toBe(0);
+    } finally {
+      await handler.stop().catch(() => undefined);
+      await cleanup();
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
   }, 30_000);
 });

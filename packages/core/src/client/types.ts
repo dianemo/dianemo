@@ -66,10 +66,12 @@ export interface BasicCredentials extends BaseCredentialsData {
  * full replacement list, or `undefined` to leave the limits as they are. A
  * returned limit without a `name` keeps the name of the one current limit of
  * its type, so it keeps that budget's balance; with several of a type, name
- * them. The result is broadcast to every replica, this one included, as a
- * `dynamic` update. Receivers log and ignore one that is unusable, and ignore
- * one that would change the client class (to or from a `sharedLimit`). A throw
- * is logged and never fails the request.
+ * them. Leave at most one unnamed: a list with two is refused, as it would be
+ * at construction. A `sharedLimit` child's result is named against its owner's
+ * limits, since those are what it replaces. The result is broadcast to every
+ * replica, this one included, as a `dynamic` update. Receivers log and ignore
+ * one that is unusable, and ignore one that would change the client class (to
+ * or from a `sharedLimit`). A throw is logged and never fails the request.
  *
  * ```ts
  * const rateLimitChange: RateLimitChange = (current, response) => {
@@ -225,8 +227,9 @@ export type RateLimitData =
  * `concurrencyLimit` — and is what makes reordering the list safe. It may be
  * omitted, where it is `"default"`, so a client with one limit never has to
  * invent one; a second unnamed limit is refused, since both would meter
- * against one bucket. In a `rateLimitChange` result or an override, an unnamed
- * limit instead keeps the name of the one limit of its type it replaces.
+ * against one bucket. In a `rateLimitChange` result or an override, a list's
+ * one unnamed limit instead keeps the name of the one limit of its type it
+ * replaces; a list with two unnamed limits is refused there too, every time.
  */
 export type DeclaredRateLimit<R extends RateLimitData = RateLimitData> = R & {
   name?: string;

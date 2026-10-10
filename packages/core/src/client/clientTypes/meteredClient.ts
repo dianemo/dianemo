@@ -89,9 +89,9 @@ class MeteredClient extends BaseClient {
       );
       return;
     }
-    // Names resolved on receipt, not just before publishing: an update may omit
-    // them exactly as a caller may.
-    const limits = normalizeRateLimit(data.rateLimit);
+    // Names resolved on receipt, not just before publishing: an operator's update
+    // may omit them exactly as a caller may, and keeps a budget the same way.
+    const limits = normalizeRateLimit(data.rateLimit, this.rateLimit);
     if (limits.some((limit) => limit.type === "sharedLimit")) return;
     try {
       assertUsableRateLimits(limits, this.name);
@@ -163,7 +163,6 @@ class MeteredClient extends BaseClient {
   }
 
   private getSlotKey(name: string, grantId?: string): string {
-    if (grantId && this.usesGrantIsolation()) this.knownGrantIds.add(grantId);
     return `${this.getConcurrencyKey(grantId)}:${name}`;
   }
 
@@ -591,12 +590,7 @@ class MeteredClient extends BaseClient {
    * name were re-added before they finished. The keys already expire, and
    * ordinary completion and slot TTL cleanup reclaim them safely.
    */
-  protected handleDestroy(): void {
-    this.knownGrantIds.clear();
-  }
-
-  /** Grants this client has claimed a slot for. Nothing reads it. */
-  private knownGrantIds = new Set<string>();
+  protected handleDestroy(): void {}
 }
 
 /** True unless the attempt recorded its claims and this key is not among them. */

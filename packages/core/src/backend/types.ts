@@ -10,6 +10,45 @@ export interface TokenBucketConfig {
   interval: number;
 }
 
+/**
+ * Asks a token-bucket claim to leave a mark a later settlement can find: what
+ * was claimed, and how far the bucket had got when it was. See
+ * docs/proposals/usage-based-limits.md#2-settlement.
+ */
+export interface ClaimMark {
+  /** Identifies the attempt; the mark lives at `claimMarkKey(bucketKey, id)`. */
+  id: string;
+  /** How long a settlement may arrive after the claim. */
+  ttlSeconds: number;
+}
+
+/** One bucket's share of a settlement. */
+export interface SettleSpec {
+  /** The bucket the attempt claimed from. */
+  key: string;
+  /** The `ClaimMark.id` the claim was made under. */
+  markId: string;
+  /** What the response says the attempt actually cost against this bucket. */
+  actual: number;
+  config: TokenBucketConfig;
+  /** How far below zero a debit may take the balance. */
+  maxDebt: number;
+}
+
+export interface SettleResult {
+  key: string;
+  /** False when no mark was found: expired, already settled, or never written. */
+  settled: boolean;
+  /**
+   * Change applied to the balance: positive for a debit, negative for a credit.
+   * Less than the difference from the claim when the bucket had already
+   * forgotten some of it — see the proposal.
+   */
+  applied: number;
+  /** Debit `maxDebt` would not let the balance absorb. */
+  unapplied: number;
+}
+
 /** A slot ledger as the backend meters it. */
 export interface ConcurrencyConfig {
   /** Total cost that may be in flight at once. */
@@ -82,7 +121,13 @@ export type MultiLimitSpec = {
    */
   cost: number;
 } & (
-  | { kind: "tokenBucket"; key: string; config: TokenBucketConfig }
+  | {
+      kind: "tokenBucket";
+      key: string;
+      config: TokenBucketConfig;
+      /** Leave a mark for settlement, written only if the whole claim admits. */
+      mark?: ClaimMark;
+    }
   | {
       kind: "concurrency";
       key: string;
@@ -316,7 +361,8 @@ export interface DianemoBackend {
     freezeKey: string,
     cost: number,
     config: TokenBucketConfig,
-    ttl?: number
+    ttl?: number,
+    mark?: ClaimMark
   ): Promise<boolean>;
 
   /**
@@ -354,7 +400,8 @@ export interface DianemoBackend {
   // ------------------------------------------------------------ token bucket
 
   /**
-   * Spends `cost` from the bucket at `key` if its balance covers it.
+   * Spends `cost` from the bucket at `key` if its balance covers it, and leaves
+   * `mark` beside the bucket when it does.
    *
    * Refills lazily first, crediting `tokensToAdd` per whole `interval` elapsed
    * up to `maxTokens`; a bucket with no stored state reads as full. The refill
@@ -367,7 +414,8 @@ export interface DianemoBackend {
   acquireTokens(
     key: string,
     cost: number,
-    config: TokenBucketConfig
+    config: TokenBucketConfig,
+    mark?: ClaimMark
   ): Promise<AcquireTokensResult>;
   /**
    * The balance as {@link DianemoBackend.acquireTokens} would see it now,
@@ -378,7 +426,10 @@ export interface DianemoBackend {
     key: string,
     config: TokenBucketConfig
   ): Promise<{ tokens: number; lastUpdate: number }>;
-  /** Writes the bucket full at `maxTokens`, its refill clock restarted now. */
+  /**
+   * Writes the bucket full at `maxTokens`, its refill clock restarted now. This
+   * ends every outstanding settlement.
+   */
   resetTokenBucket(key: string, maxTokens: number): Promise<void>;
   /**
    * Returns budget claimed for a request that was never dispatched, up to
@@ -400,6 +451,29 @@ export interface DianemoBackend {
     maxTokens: number,
     freezeKey?: string
   ): Promise<void>;
+
+  // -------------------------------------------------------------- settlement
+
+  /**
+   * Empties a bucket for a freeze: to zero, or left where it is if already in
+   * debt, so a freeze never forgives what settlement charged. Ends every
+   * outstanding settlement on the bucket, as a reset does.
+   *
+   * Optional so an earlier backend still satisfies the interface; without it a
+   * client writes `tokens: 0` directly, and settlement is unavailable.
+   */
+  emptyTokenBucket?(key: string, config: TokenBucketConfig): Promise<void>;
+  /**
+   * Corrects each claim to what its response reported, in one operation.
+   *
+   * Reads and deletes each claim's mark, so a retried settlement applies once.
+   * A debit is reduced by the refill the bucket has discarded at its ceiling
+   * since the claim; a credit is dropped once the bucket has filled since, and
+   * both are dropped across an `emptyTokenBucket` or `resetTokenBucket`. The
+   * arithmetic:
+   * docs/proposals/usage-based-limits.md#settling-late-against-a-bucket-that-has-moved-on.
+   */
+  settleTokens?(specs: SettleSpec[]): Promise<SettleResult[]>;
 
   // ------------------------------------------------------------ several budgets
 

@@ -8,6 +8,7 @@ import {
   usableConcurrencyFn,
   usableCostFn,
   usableRequestTtlFn,
+  writeMarkFn,
 } from "./fragments.js";
 
 /**
@@ -37,8 +38,8 @@ import {
  * intervals really did elapse. Slot reaping is likewise unconditional — an
  * expired slot is expired whoever asked.
  *
- * Requires: `KEYS`, `finiteNumber`, `bucketTtl`, `usableConcurrency`,
- * `usableCost` and `usableRequestTtl`.
+ * Requires: `KEYS`, `finiteNumber`, `bucketTtl`, `writeMark`,
+ * `usableConcurrency`, `usableCost` and `usableRequestTtl`.
  * Declares `planMultiLimit`, `commitMultiLimit` and `persistRefills`.
  */
 const planFn = `
@@ -71,6 +72,8 @@ local function planMultiLimit(specs, now, ttl)
 
       local tokens = finiteNumber(redis.call('HGET', key, 'tokens'), maxTokens)
       local lastUpdate = finiteNumber(redis.call('HGET', key, 'lastUpdate'), now)
+      local overflow = finiteNumber(redis.call('HGET', key, 'overflow'), 0)
+      local fills = finiteNumber(redis.call('HGET', key, 'fills'), 0)
 
 ${lazyRefill("      ")}
 
@@ -78,8 +81,13 @@ ${lazyRefill("      ")}
         key = key,
         tokens = tokens,
         lastUpdate = lastUpdate,
+        overflow = overflow,
+        fills = fills,
         cost = cost,
         ttl = bucketTtl(ttl, maxTokens, tokensToAdd, interval),
+        -- The mark's key position and lifetime, when the claim asked for one.
+        mk = spec.mk,
+        mt = tonumber(spec.mt),
       })
       if tokens < cost then
         local intervalsNeeded = math.ceil((cost - tokens) / tokensToAdd)
@@ -125,8 +133,12 @@ end
 
 local function commitMultiLimit(plan, now, ttl)
   for _, bucket in ipairs(plan.buckets) do
-    redis.call('HSET', bucket.key, 'tokens', bucket.tokens - bucket.cost, 'lastUpdate', bucket.lastUpdate)
+    redis.call('HSET', bucket.key, 'tokens', bucket.tokens - bucket.cost, 'lastUpdate', bucket.lastUpdate,
+      'overflow', bucket.overflow, 'fills', bucket.fills)
     redis.call('EXPIRE', bucket.key, bucket.ttl)
+    if bucket.mk ~= nil then
+      writeMark(KEYS[bucket.mk], bucket.mt, bucket.cost, bucket.overflow, bucket.fills, bucket.key)
+    end
   end
   for _, slot in ipairs(plan.slots) do
     redis.call('ZADD', slot.key, now, slot.slotId)
@@ -138,7 +150,8 @@ end
 
 local function persistRefills(plan)
   for _, bucket in ipairs(plan.buckets) do
-    redis.call('HSET', bucket.key, 'tokens', bucket.tokens, 'lastUpdate', bucket.lastUpdate)
+    redis.call('HSET', bucket.key, 'tokens', bucket.tokens, 'lastUpdate', bucket.lastUpdate,
+      'overflow', bucket.overflow, 'fills', bucket.fills)
     redis.call('EXPIRE', bucket.key, bucket.ttl)
   end
 end
@@ -153,6 +166,8 @@ ${redisNow()}
 ${finiteNumberFn()}
 
 ${bucketTtlFn()}
+
+${writeMarkFn()}
 
 ${usableConcurrencyFn()}
 
@@ -196,6 +211,8 @@ ${redisNow()}
 ${finiteNumberFn()}
 
 ${bucketTtlFn()}
+
+${writeMarkFn()}
 
 ${usableConcurrencyFn()}
 

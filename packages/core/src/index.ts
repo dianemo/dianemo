@@ -121,12 +121,14 @@ export {
   REDIS_MAX_TTL_SECONDS,
   REQUEST_TOMBSTONE_TTL_SECONDS,
 } from "./backend/ttl.js";
+export { claimMarkKey } from "./backend/settlement.js";
 export type {
   AcquireConcurrencyResult,
   AcquireMultiLimitResult,
   AcquireTokensResult,
   BatchOp,
   BatchOptions,
+  ClaimMark,
   ConcurrencyConfig,
   DianemoBackend,
   FreezeState,
@@ -134,6 +136,8 @@ export type {
   MultiLimitSpec,
   QueueStats,
   QueuedRequest,
+  SettleResult,
+  SettleSpec,
   TokenBucketConfig,
 } from "./backend/types.js";
 

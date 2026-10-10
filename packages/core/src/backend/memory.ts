@@ -1,3 +1,4 @@
+import { claimMarkKey, settleAmount } from "./settlement.js";
 import { EventEmitter } from "node:events";
 import {
   formatStoredCost,
@@ -19,6 +20,7 @@ import type {
   AcquireMultiLimitResult,
   AcquireTokensResult,
   BatchOp,
+  ClaimMark,
   ConcurrencyConfig,
   DianemoBackend,
   FreezeState,
@@ -26,6 +28,8 @@ import type {
   MultiLimitSpec,
   QueueStats,
   QueuedRequest,
+  SettleResult,
+  SettleSpec,
   TokenBucketConfig,
 } from "./types.js";
 import {
@@ -35,13 +39,26 @@ import {
   REQUEST_TOMBSTONE_TTL_SECONDS,
 } from "./ttl.js";
 
-/** A bucket's refilled balance, held until every budget in the claim admits. */
-interface PlannedBucket {
-  key: string;
+/**
+ * A bucket as `refill` leaves it. `overflow` and `fills` only ever grow: they
+ * are what settlement compares against a claim mark to tell how much of a claim
+ * the bucket has already forgotten. Twin of the Lua `lazyRefill`.
+ */
+interface BucketState {
   tokens: number;
   lastUpdate: number;
+  /** Refill discarded at the ceiling, in total. */
+  overflow: number;
+  /** How many times the balance has reached the ceiling. */
+  fills: number;
+}
+
+/** A bucket's refilled balance, held until every budget in the claim admits. */
+interface PlannedBucket extends BucketState {
+  key: string;
   cost: number;
   config: TokenBucketConfig;
+  mark?: ClaimMark;
 }
 
 interface PlannedSlot {
@@ -556,20 +573,20 @@ class MemoryBackend implements DianemoBackend {
     key: string,
     config: TokenBucketConfig,
     now: number
-  ): { tokens: number; lastUpdate: number } {
+  ): BucketState {
     // Through the shared parse, not `Number`: an empty, unparseable or
     // non-finite field reads as absent, as the Lua's `finiteNumber` reads it.
     let tokens = parseFiniteStored(this.hget(key, "tokens"), config.maxTokens);
     let lastUpdate = parseFiniteStored(this.hget(key, "lastUpdate"), now);
+    let overflow = parseFiniteStored(this.hget(key, "overflow"), 0);
+    let fills = parseFiniteStored(this.hget(key, "fills"), 0);
+    const belowCap = tokens < config.maxTokens;
 
     const elapsed = now - lastUpdate;
     if (elapsed > 0 && config.interval > 0) {
       const intervalsElapsed = Math.floor(elapsed / config.interval);
       if (intervalsElapsed > 0) {
-        tokens = Math.min(
-          tokens + intervalsElapsed * config.tokensToAdd,
-          config.maxTokens
-        );
+        tokens += intervalsElapsed * config.tokensToAdd;
         lastUpdate += intervalsElapsed * config.interval;
       }
     }
@@ -577,8 +594,14 @@ class MemoryBackend implements DianemoBackend {
     // underneath a stocked bucket, which is what `rateLimitChange` is for, and a
     // balance banked under the old ceiling would stay spendable for a whole interval
     // — a cut from 1000 to 10 releasing 1000 requests immediately.
-    tokens = Math.min(tokens, config.maxTokens);
-    return { tokens, lastUpdate };
+    if (tokens > config.maxTokens) {
+      overflow += tokens - config.maxTokens;
+      tokens = config.maxTokens;
+      fills++;
+    } else if (belowCap && tokens >= config.maxTokens) {
+      fills++;
+    }
+    return { tokens, lastUpdate, overflow, fills };
   }
 
   /**
@@ -587,8 +610,7 @@ class MemoryBackend implements DianemoBackend {
    */
   private writeBucket(
     key: string,
-    tokens: number,
-    lastUpdate: number,
+    state: BucketState,
     ttlSeconds: number,
     config?: TokenBucketConfig
   ) {
@@ -598,15 +620,41 @@ class MemoryBackend implements DianemoBackend {
       config ? bucketTtl(ttlSeconds, config) : ttlSeconds
     );
     const hash = this.hash(key);
-    hash.set("tokens", String(tokens));
-    hash.set("lastUpdate", String(lastUpdate));
+    hash.set("tokens", String(state.tokens));
+    hash.set("lastUpdate", String(state.lastUpdate));
+    hash.set("overflow", String(state.overflow));
+    hash.set("fills", String(state.fills));
     this.expire(key, ttl);
+  }
+
+  /**
+   * Records what a claim took and how far the bucket had got, for settlement.
+   * Written after the spend, so `overflow` and `fills` are the post-claim values
+   * the settlement compares against.
+   */
+  private writeMark(
+    key: string,
+    mark: ClaimMark,
+    cost: number,
+    state: BucketState
+  ) {
+    const markKey = claimMarkKey(key, mark.id);
+    const hash = this.hash(markKey);
+    hash.set("claimed", String(cost));
+    hash.set("overflow", String(state.overflow));
+    hash.set("fills", String(state.fills));
+    hash.set(
+      "generation",
+      String(parseFiniteStored(this.hget(key, "generation"), 0))
+    );
+    this.expire(markKey, mark.ttlSeconds);
   }
 
   async acquireTokens(
     key: string,
     cost: number,
-    config: TokenBucketConfig
+    config: TokenBucketConfig,
+    mark?: ClaimMark
   ): Promise<AcquireTokensResult> {
     const configError = unusableBudget(cost, config);
     if (configError) {
@@ -618,10 +666,12 @@ class MemoryBackend implements DianemoBackend {
       };
     }
     const now = Date.now();
-    const { tokens, lastUpdate } = this.refill(key, config, now);
+    const state = this.refill(key, config, now);
+    const { tokens, lastUpdate } = state;
 
     if (tokens >= cost) {
-      this.writeBucket(key, tokens - cost, lastUpdate, 86400, config);
+      this.writeBucket(key, { ...state, tokens: tokens - cost }, 86400, config);
+      if (mark) this.writeMark(key, mark, cost, state);
       return { acquired: true, remainingTokens: tokens - cost };
     }
 
@@ -634,7 +684,7 @@ class MemoryBackend implements DianemoBackend {
       0,
       intervalsNeeded * config.interval - (now - lastUpdate)
     );
-    this.writeBucket(key, tokens, lastUpdate, 86400, config);
+    this.writeBucket(key, state, 86400, config);
     return { acquired: false, waitTime, remainingTokens: tokens };
   }
 
@@ -642,11 +692,110 @@ class MemoryBackend implements DianemoBackend {
     key: string,
     config: TokenBucketConfig
   ): Promise<{ tokens: number; lastUpdate: number }> {
-    return this.refill(key, config, Date.now());
+    const { tokens, lastUpdate } = this.refill(key, config, Date.now());
+    return { tokens, lastUpdate };
   }
 
   async resetTokenBucket(key: string, maxTokens: number): Promise<void> {
-    this.writeBucket(key, maxTokens, Date.now(), 86400);
+    // The counters carry over — they only ever grow — and the generation moves
+    // on, which is what tells a settlement the balance it was owed against is
+    // gone.
+    this.writeBucket(
+      key,
+      {
+        tokens: maxTokens,
+        lastUpdate: Date.now(),
+        overflow: parseFiniteStored(this.hget(key, "overflow"), 0),
+        fills: parseFiniteStored(this.hget(key, "fills"), 0),
+      },
+      86400
+    );
+    this.bumpGeneration(key);
+  }
+
+  async emptyTokenBucket(
+    key: string,
+    config: TokenBucketConfig
+  ): Promise<void> {
+    // Not refilled first: a freeze empties what is there.
+    const tokens = parseFiniteStored(this.hget(key, "tokens"), 0);
+    this.writeBucket(
+      key,
+      {
+        tokens: Math.min(tokens, 0),
+        lastUpdate: Date.now(),
+        overflow: parseFiniteStored(this.hget(key, "overflow"), 0),
+        fills: parseFiniteStored(this.hget(key, "fills"), 0),
+      },
+      86400,
+      config
+    );
+    this.bumpGeneration(key);
+  }
+
+  private bumpGeneration(key: string) {
+    const hash = this.hash(key);
+    hash.set(
+      "generation",
+      String(parseFiniteStored(hash.get("generation"), 0) + 1)
+    );
+  }
+
+  async settleTokens(specs: SettleSpec[]): Promise<SettleResult[]> {
+    const now = Date.now();
+    const results: SettleResult[] = [];
+    for (const spec of specs) {
+      const unsettled = {
+        key: spec.key,
+        settled: false,
+        applied: 0,
+        unapplied: 0,
+      };
+      const markKey = claimMarkKey(spec.key, spec.markId);
+      const mark = this.live(markKey)?.hash;
+      // Checked before the mark is consumed, so a settlement the backend cannot
+      // act on leaves it for one that can. The Lua twin refuses the same.
+      if (
+        !mark ||
+        !Number.isFinite(spec.actual) ||
+        spec.actual < 0 ||
+        unusableBudget(0, spec.config)
+      ) {
+        results.push(unsettled);
+        continue;
+      }
+      this.store.delete(markKey);
+
+      // An expired bucket reads as full, which means it refilled entirely since
+      // the claim: nothing of the claim is left to correct.
+      if (this.hget(spec.key, "tokens") === undefined) {
+        results.push({ ...unsettled, settled: true });
+        continue;
+      }
+
+      const state = this.refill(spec.key, spec.config, now);
+      const { applied, unapplied } = settleAmount({
+        tokens: state.tokens,
+        maxTokens: spec.config.maxTokens,
+        maxDebt: spec.maxDebt,
+        actual: spec.actual,
+        claimed: parseFiniteStored(mark.get("claimed"), 0),
+        overflowNow: state.overflow,
+        overflowAtClaim: parseFiniteStored(mark.get("overflow"), 0),
+        fillsNow: state.fills,
+        fillsAtClaim: parseFiniteStored(mark.get("fills"), 0),
+        generationNow: parseFiniteStored(this.hget(spec.key, "generation"), 0),
+        generationAtClaim: parseFiniteStored(mark.get("generation"), 0),
+      });
+      this.writeBucket(
+        spec.key,
+        { ...state, tokens: state.tokens - applied },
+        86400,
+        spec.config
+      );
+      results.push({ key: spec.key, settled: true, applied, unapplied });
+    }
+    return results;
   }
 
   async refundTokens(
@@ -686,7 +835,8 @@ class MemoryBackend implements DianemoBackend {
     freezeKey: string,
     cost: number,
     config: TokenBucketConfig,
-    ttl = 86400
+    ttl = 86400,
+    mark?: ClaimMark
   ): Promise<boolean> {
     // Before anything else, as the Redis twin reads it before its script runs.
     const keyTtl = normalizeTtlSeconds(ttl);
@@ -697,12 +847,18 @@ class MemoryBackend implements DianemoBackend {
     const now = Date.now();
     if (this.freezeBlocksAdmission(freezeKey, now)) return false;
 
-    const { tokens, lastUpdate } = this.refill(bucketKey, config, now);
-    if (tokens < cost) {
-      this.writeBucket(bucketKey, tokens, lastUpdate, keyTtl, config);
+    const state = this.refill(bucketKey, config, now);
+    if (state.tokens < cost) {
+      this.writeBucket(bucketKey, state, keyTtl, config);
       return false;
     }
-    this.writeBucket(bucketKey, tokens - cost, lastUpdate, keyTtl, config);
+    this.writeBucket(
+      bucketKey,
+      { ...state, tokens: state.tokens - cost },
+      keyTtl,
+      config
+    );
+    if (mark) this.writeMark(bucketKey, mark, cost, state);
     return true;
   }
 
@@ -734,13 +890,7 @@ class MemoryBackend implements DianemoBackend {
       // Refill progress is persisted even on refusal, as the single-budget path
       // does: the credit is real whether or not this request gets to spend it.
       for (const bucket of planned.buckets) {
-        this.writeBucket(
-          bucket.key,
-          bucket.tokens,
-          bucket.lastUpdate,
-          86400,
-          bucket.config
-        );
+        this.writeBucket(bucket.key, bucket, 86400, bucket.config);
       }
       return {
         acquired: false,
@@ -749,13 +899,7 @@ class MemoryBackend implements DianemoBackend {
       };
     }
     for (const bucket of planned.buckets) {
-      this.writeBucket(
-        bucket.key,
-        bucket.tokens - bucket.cost,
-        bucket.lastUpdate,
-        86400,
-        bucket.config
-      );
+      this.commitBucket(bucket, 86400);
     }
     for (const slot of planned.slots) {
       this.claimSlot(slot.key, slot.slotId, slot.cost, now, 86400);
@@ -796,29 +940,28 @@ class MemoryBackend implements DianemoBackend {
     if (planned.error) return false;
     if (!planned.acquired) {
       for (const bucket of planned.buckets) {
-        this.writeBucket(
-          bucket.key,
-          bucket.tokens,
-          bucket.lastUpdate,
-          keyTtl,
-          bucket.config
-        );
+        this.writeBucket(bucket.key, bucket, keyTtl, bucket.config);
       }
       return false;
     }
     for (const bucket of planned.buckets) {
-      this.writeBucket(
-        bucket.key,
-        bucket.tokens - bucket.cost,
-        bucket.lastUpdate,
-        keyTtl,
-        bucket.config
-      );
+      this.commitBucket(bucket, keyTtl);
     }
     for (const slot of planned.slots) {
       this.claimSlot(slot.key, slot.slotId, slot.cost, now, keyTtl);
     }
     return true;
+  }
+
+  private commitBucket(bucket: PlannedBucket, ttl: number) {
+    this.writeBucket(
+      bucket.key,
+      { ...bucket, tokens: bucket.tokens - bucket.cost },
+      ttl,
+      bucket.config
+    );
+    if (bucket.mark)
+      this.writeMark(bucket.key, bucket.mark, bucket.cost, bucket);
   }
 
   /**
@@ -851,13 +994,14 @@ class MemoryBackend implements DianemoBackend {
       if (spec.kind === "tokenBucket") {
         const error = unusableBudget(cost, spec.config);
         if (error) return { acquired: false, error, buckets, slots };
-        const { tokens, lastUpdate } = this.refill(spec.key, spec.config, now);
+        const state = this.refill(spec.key, spec.config, now);
+        const { tokens, lastUpdate } = state;
         buckets.push({
+          ...state,
           key: spec.key,
-          tokens,
-          lastUpdate,
           cost,
           config: spec.config,
+          mark: spec.mark,
         });
         if (tokens >= cost) continue;
         const intervalsNeeded = Math.ceil(

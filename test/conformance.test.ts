@@ -270,6 +270,209 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
     });
   });
 
+  // ------------------------------------------------------------- settlement
+
+  describe("settlement", () => {
+    const KEY = "st:rateLimit";
+    // A refill interval long enough that nothing refills unless a test moves
+    // `lastUpdate` back on purpose.
+    const config = { maxTokens: 100, tokensToAdd: 100, interval: 60_000 };
+    const mark = (id = "a1") => ({ id, ttlSeconds: 900 });
+    const settle = (actual: number, maxDebt = 0, markId = "a1") =>
+      backend.settleTokens!([{ key: KEY, markId, actual, config, maxDebt }]);
+    const balance = async () =>
+      (await backend.getTokenBucketState(KEY, config)).tokens;
+    /** Moves the bucket's refill clock back by whole intervals. */
+    const age = async (intervals: number) => {
+      const state = await backend.getTokenBucketState(KEY, config);
+      await backend.hset(KEY, {
+        lastUpdate: state.lastUpdate - intervals * config.interval,
+      });
+    };
+
+    it("charges a debit for what the claim under-reserved", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      expect(await settle(30)).toEqual([
+        { key: KEY, settled: true, applied: 20, unapplied: 0 },
+      ]);
+      expect(await balance()).toBe(70);
+    });
+
+    it("hands back what the claim over-reserved", async () => {
+      await backend.acquireTokens(KEY, 50, config, mark());
+      expect((await settle(10))[0]).toMatchObject({ applied: -40 });
+      expect(await balance()).toBe(90);
+    });
+
+    it("applies once however many times it is asked", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      await settle(30);
+      expect((await settle(30))[0]).toMatchObject({
+        settled: false,
+        applied: 0,
+      });
+      expect(await balance()).toBe(70);
+    });
+
+    it("leaves no mark unless the claim asked for one", async () => {
+      await backend.acquireTokens(KEY, 10, config);
+      expect((await settle(30))[0].settled).toBe(false);
+      expect(await balance()).toBe(90);
+    });
+
+    it("leaves no mark for a claim that was refused", async () => {
+      await backend.acquireTokens(KEY, 100, config);
+      await backend.acquireTokens(KEY, 10, config, mark());
+      expect((await settle(0))[0].settled).toBe(false);
+    });
+
+    it("stops a debit at zero by default and reports the rest", async () => {
+      await backend.acquireTokens(KEY, 90, config, mark());
+      expect((await settle(200))[0]).toMatchObject({
+        applied: 10,
+        unapplied: 100,
+      });
+      expect(await balance()).toBe(0);
+    });
+
+    it("takes the balance into debt as far as maxDebt allows", async () => {
+      await backend.acquireTokens(KEY, 90, config, mark());
+      expect((await settle(200, 50))[0]).toMatchObject({
+        applied: 60,
+        unapplied: 50,
+      });
+      expect(await balance()).toBe(-50);
+    });
+
+    it("forgives a debit the bucket has already refilled past", async () => {
+      // Refill to the ceiling discards 95: had the extra 40 been charged at the
+      // claim, that discarded refill would have paid it off.
+      await backend.acquireTokens(KEY, 5, config, mark());
+      await age(1);
+      expect((await settle(45))[0]).toMatchObject({ applied: 0 });
+      expect(await balance()).toBe(100);
+    });
+
+    it("charges only the part of a debit the discarded refill did not cover", async () => {
+      // 60 claimed leaves 40; one interval adds 100, of which 40 is discarded.
+      // A debit of 50 is reduced by that 40 to 10.
+      await backend.acquireTokens(KEY, 60, config, mark());
+      await age(1);
+      expect((await settle(110))[0]).toMatchObject({ applied: 10 });
+      expect(await balance()).toBe(90);
+    });
+
+    it("charges a late debit in full when the bucket filled without discarding", async () => {
+      // Claiming the whole bucket and refilling one interval lands exactly on the
+      // ceiling, discarding nothing — so the debit still counts in full.
+      await backend.acquireTokens(KEY, 100, config, mark());
+      await age(1);
+      expect((await settle(130))[0]).toMatchObject({ applied: 30 });
+      expect(await balance()).toBe(70);
+    });
+
+    it("drops a credit once the bucket has filled since the claim", async () => {
+      await backend.acquireTokens(KEY, 60, config, mark());
+      await age(1);
+      await backend.acquireTokens(KEY, 50, config);
+      expect((await settle(0))[0]).toMatchObject({
+        settled: true,
+        applied: 0,
+      });
+      expect(await balance()).toBe(50);
+    });
+
+    it("applies nothing across a freeze emptying the bucket", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      await backend.emptyTokenBucket!(KEY, config);
+      expect((await settle(80))[0]).toMatchObject({
+        settled: true,
+        applied: 0,
+      });
+      expect(await balance()).toBe(0);
+    });
+
+    it("applies nothing across a reset", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      await backend.resetTokenBucket(KEY, config.maxTokens);
+      expect((await settle(0))[0].applied).toBe(0);
+      expect(await balance()).toBe(100);
+    });
+
+    it("applies nothing to a bucket that expired since the claim", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      await backend.del(KEY);
+      expect((await settle(80))[0]).toMatchObject({
+        settled: true,
+        applied: 0,
+      });
+    });
+
+    it("refuses an unusable actual without consuming the mark", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      expect((await settle(-1))[0].settled).toBe(false);
+      expect((await settle(NaN))[0].settled).toBe(false);
+      expect((await settle(30))[0]).toMatchObject({ applied: 20 });
+    });
+
+    it("keeps a balance already in debt when a freeze empties the bucket", async () => {
+      await backend.acquireTokens(KEY, 90, config, mark());
+      await settle(150, 100);
+      expect(await balance()).toBe(-50);
+      await backend.emptyTokenBucket!(KEY, config);
+      expect(await balance()).toBe(-50);
+    });
+
+    it("waits out a debt before admitting again", async () => {
+      await backend.acquireTokens(KEY, 100, config, mark());
+      await settle(150, 100);
+      const refused = await backend.acquireTokens(KEY, 1, config);
+      expect(refused.acquired).toBe(false);
+      // 51 tokens short, and one interval adds 100.
+      expect(refused.waitTime).toBeGreaterThan(0);
+      expect(refused.waitTime).toBeLessThanOrEqual(config.interval);
+    });
+
+    it("leaves a mark from the fast path", async () => {
+      expect(
+        await backend.tryAdmitImmediately(
+          "st:queue",
+          KEY,
+          "st:freeze",
+          10,
+          config,
+          86400,
+          mark()
+        )
+      ).toBe(true);
+      expect((await settle(30))[0]).toMatchObject({ applied: 20 });
+    });
+
+    it("leaves a mark from a multi-limit claim, on the bucket that asked", async () => {
+      const other = "st:other";
+      expect(
+        (
+          await backend.acquireMultiLimit!([
+            { kind: "tokenBucket", key: KEY, cost: 10, config, mark: mark() },
+            { kind: "tokenBucket", key: other, cost: 1, config },
+          ])
+        ).acquired
+      ).toBe(true);
+      const results = await backend.settleTokens!([
+        { key: KEY, markId: "a1", actual: 30, config, maxDebt: 0 },
+        { key: other, markId: "a1", actual: 5, config, maxDebt: 0 },
+      ]);
+      expect(results).toEqual([
+        { key: KEY, settled: true, applied: 20, unapplied: 0 },
+        { key: other, settled: false, applied: 0, unapplied: 0 },
+      ]);
+    });
+
+    it("settles nothing for an empty list", async () => {
+      expect(await backend.settleTokens!([])).toEqual([]);
+    });
+  });
+
   // ------------------------------------------------------- fast-path admission
 
   describe("fast-path admission", () => {

@@ -297,6 +297,14 @@ class RedisBackend implements DianemoBackend {
   refundTokens(...a: Parameters<NonNullable<DianemoBackend["refundTokens"]>>) {
     return this.ops.tokenBucket.refundTokens(...a);
   }
+  emptyTokenBucket(
+    ...a: Parameters<NonNullable<DianemoBackend["emptyTokenBucket"]>>
+  ) {
+    return this.ops.tokenBucket.emptyTokenBucket(...a);
+  }
+  settleTokens(...a: Parameters<NonNullable<DianemoBackend["settleTokens"]>>) {
+    return this.ops.tokenBucket.settleTokens(...a);
+  }
 
   // -------------------------------------------------------- several budgets
 

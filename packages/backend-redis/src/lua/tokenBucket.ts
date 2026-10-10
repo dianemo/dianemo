@@ -7,6 +7,7 @@ import {
   queueEmptyGate,
   redisNow,
   usableCostFn,
+  writeMarkFn,
 } from "./fragments.js";
 
 /**
@@ -19,18 +20,23 @@ import {
 
 export const tokenBucket = `
   local key = KEYS[1]
+  -- '' when the claim asks for no mark.
+  local markKey = KEYS[2]
   local cost = tonumber(ARGV[1])
   local maxTokens = tonumber(ARGV[2])
   local tokensToAdd = tonumber(ARGV[3])
   local interval = tonumber(ARGV[4])
   -- ARGV is positional; see ttlArgvWarning in fragments.ts for the trap.
   local ttl = tonumber(ARGV[5]) or 86400
+  local markTtl = tonumber(ARGV[6]) or 0
 
 ${redisNow()}
 
 ${finiteNumberFn()}
 ${usableCostFn()}
 ${exactFn()}
+
+${writeMarkFn()}
   -- 'not (x > 0)', not 'x <= 0': a nan compares false either way round, so the
   -- second form admits it and the division below yields a nan balance. The nil
   -- test first, because comparing nil raises.
@@ -62,13 +68,16 @@ ${bucketTtlFn()}
   -- the field.
   local tokens = finiteNumber(redis.call('HGET', key, 'tokens'), maxTokens)
   local lastUpdate = finiteNumber(redis.call('HGET', key, 'lastUpdate'), now)
+  local overflow = finiteNumber(redis.call('HGET', key, 'overflow'), 0)
+  local fills = finiteNumber(redis.call('HGET', key, 'fills'), 0)
 
 ${lazyRefill()}
 
   if tokens >= cost then
     tokens = tokens - cost
-    redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate)
+    redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
     redis.call('EXPIRE', key, ttl)
+    if markKey ~= '' then writeMark(markKey, markTtl, cost, overflow, fills, key) end
     return cjson.encode({ acquired = true, remainingTokens = exact(tokens) })
   else
     -- lastUpdate only advances in whole intervals, so (now - lastUpdate) is
@@ -80,7 +89,7 @@ ${lazyRefill()}
     if waitTime < 0 then waitTime = 0 end
 
     -- Refill progress is persisted even on refusal.
-    redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate)
+    redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
     redis.call('EXPIRE', key, ttl)
 
     return cjson.encode({ acquired = false, waitTime = exact(waitTime), remainingTokens = exact(tokens) })
@@ -137,6 +146,8 @@ export const resetTokenBucket = `
   local maxTokens = ARGV[1]
 ${redisNow()}
   redis.call('HSET', key, 'tokens', maxTokens, 'lastUpdate', now)
+  -- Ends every outstanding settlement: the balance it was owed against is gone.
+  redis.call('HINCRBY', key, 'generation', 1)
   redis.call('EXPIRE', key, 86400)
   return 1
 `;
@@ -152,17 +163,22 @@ export const tryAdmitImmediately = `
   local queueKey = KEYS[1]
   local bucketKey = KEYS[2]
   local freezeKey = KEYS[3]
+  -- '' when the claim asks for no mark.
+  local markKey = KEYS[4]
   local cost = tonumber(ARGV[1])
   local maxTokens = tonumber(ARGV[2])
   local tokensToAdd = tonumber(ARGV[3])
   local interval = tonumber(ARGV[4])
   -- ARGV is positional; see ttlArgvWarning in fragments.ts for the trap.
   local ttl = tonumber(ARGV[5]) or 86400
+  local markTtl = tonumber(ARGV[6]) or 0
 
 ${redisNow()}
 
 ${finiteNumberFn()}
 ${usableCostFn()}
+
+${writeMarkFn()}
   if tokensToAdd == nil or not (tokensToAdd > 0) then return 0 end
   if maxTokens == nil or not (maxTokens > 0) or maxTokens == math.huge then return 0 end
   if not usableCost(cost) then return 0 end
@@ -179,17 +195,141 @@ ${freezeGate()}
   -- otherwise left this script admitting every request unmetered.
   local tokens = finiteNumber(redis.call('HGET', bucketKey, 'tokens'), maxTokens)
   local lastUpdate = finiteNumber(redis.call('HGET', bucketKey, 'lastUpdate'), now)
+  local overflow = finiteNumber(redis.call('HGET', bucketKey, 'overflow'), 0)
+  local fills = finiteNumber(redis.call('HGET', bucketKey, 'fills'), 0)
 
 ${lazyRefill()}
 
   if tokens < cost then
-    redis.call('HSET', bucketKey, 'tokens', tokens, 'lastUpdate', lastUpdate)
+    redis.call('HSET', bucketKey, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
     redis.call('EXPIRE', bucketKey, ttl)
     return 0
   end
 
   tokens = tokens - cost
-  redis.call('HSET', bucketKey, 'tokens', tokens, 'lastUpdate', lastUpdate)
+  redis.call('HSET', bucketKey, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
   redis.call('EXPIRE', bucketKey, ttl)
+  if markKey ~= '' then writeMark(markKey, markTtl, cost, overflow, fills, bucketKey) end
   return 1
+`;
+
+/**
+ * Twin of the memory backend's `emptyTokenBucket`; the contract is on
+ * `DianemoBackend.emptyTokenBucket`.
+ */
+export const emptyTokenBucket = `
+  local key = KEYS[1]
+  local maxTokens = tonumber(ARGV[1])
+  local tokensToAdd = tonumber(ARGV[2])
+  local interval = tonumber(ARGV[3])
+  local ttl = tonumber(ARGV[4]) or 86400
+
+${redisNow()}
+
+${finiteNumberFn()}
+
+${bucketTtlFn()}
+
+  local tokens = finiteNumber(redis.call('HGET', key, 'tokens'), 0)
+  if tokens > 0 then tokens = 0 end
+  local generation = finiteNumber(redis.call('HGET', key, 'generation'), 0) + 1
+  redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', now, 'generation', generation)
+  if tokensToAdd ~= nil and tokensToAdd > 0 and maxTokens ~= nil and maxTokens > 0
+    and maxTokens ~= math.huge and interval ~= nil and interval == interval
+    and interval ~= math.huge then
+    ttl = bucketTtl(ttl, maxTokens, tokensToAdd, interval)
+  end
+  redis.call('EXPIRE', key, ttl)
+  return 1
+`;
+
+/**
+ * Corrects each claim to what its response reported, in one script. Twin of
+ * `settleAmount` in the core package's `backend/settlement.ts`, which the
+ * memory backend calls: the two must agree line for line.
+ *
+ * Variadic, like the multi-limit scripts: `ARGV[1]` is one JSON object per
+ * bucket, addressing the bucket (`k`) and its mark (`mk`) by `KEYS`
+ * position. Numbers that may be non-finite arrive as strings, as there.
+ */
+export const settleTokens = `
+  local entries = cjson.decode(ARGV[1])
+  local baseTtl = tonumber(ARGV[2]) or 86400
+
+${redisNow()}
+
+${finiteNumberFn()}
+
+${bucketTtlFn()}
+
+  local results = {}
+  for i, entry in ipairs(entries) do
+    local key = KEYS[entry.k]
+    local markKey = KEYS[entry.mk]
+    local actual = tonumber(entry.actual)
+    local maxTokens = tonumber(entry.maxTokens)
+    local tokensToAdd = tonumber(entry.tokensToAdd)
+    local interval = tonumber(entry.interval)
+    local maxDebt = tonumber(entry.maxDebt)
+    local result = { settled = false, applied = 0, unapplied = 0 }
+
+    local mark = redis.call('HMGET', markKey, 'claimed', 'overflow', 'fills', 'generation')
+    -- Checked before the mark is consumed, so a settlement this script cannot
+    -- act on leaves it for one that can.
+    local usable = mark[1] ~= false
+      and actual ~= nil and actual == actual and actual ~= math.huge and actual >= 0
+      and tokensToAdd ~= nil and tokensToAdd > 0
+      and maxTokens ~= nil and maxTokens > 0 and maxTokens ~= math.huge
+      and interval ~= nil and interval == interval and interval ~= math.huge and interval ~= -math.huge
+
+    if usable then
+      redis.call('DEL', markKey)
+      result.settled = true
+      -- An absent bucket refilled entirely since the claim: nothing to correct.
+      if redis.call('HEXISTS', key, 'tokens') == 1 then
+        local tokens = finiteNumber(redis.call('HGET', key, 'tokens'), maxTokens)
+        local lastUpdate = finiteNumber(redis.call('HGET', key, 'lastUpdate'), now)
+        local overflow = finiteNumber(redis.call('HGET', key, 'overflow'), 0)
+        local fills = finiteNumber(redis.call('HGET', key, 'fills'), 0)
+
+${lazyRefill("        ")}
+
+        local generation = finiteNumber(redis.call('HGET', key, 'generation'), 0)
+        local claimed = finiteNumber(mark[1], 0)
+        local overflowAtClaim = finiteNumber(mark[2], 0)
+        local fillsAtClaim = finiteNumber(mark[3], 0)
+        local generationAtClaim = finiteNumber(mark[4], 0)
+
+        local applied = 0
+        local unapplied = 0
+        if generation == generationAtClaim and overflow >= overflowAtClaim and fills >= fillsAtClaim then
+          local delta = actual - claimed
+          if delta > 0 then
+            local owed = delta - (overflow - overflowAtClaim)
+            if owed < 0 then owed = 0 end
+            local debt = 0
+            if maxDebt ~= nil and maxDebt == maxDebt and maxDebt ~= math.huge and maxDebt > 0 then
+              debt = maxDebt
+            end
+            local room = tokens + debt
+            if room < 0 then room = 0 end
+            applied = math.min(owed, room)
+            unapplied = owed - applied
+          elseif delta < 0 and fills == fillsAtClaim then
+            local headroom = maxTokens - tokens
+            if headroom < 0 then headroom = 0 end
+            applied = -math.min(-delta, headroom)
+          end
+        end
+
+        tokens = tokens - applied
+        redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
+        redis.call('EXPIRE', key, bucketTtl(baseTtl, maxTokens, tokensToAdd, interval))
+        result.applied = applied
+        result.unapplied = unapplied
+      end
+    end
+    results[i] = result
+  end
+  return cjson.encode(results)
 `;

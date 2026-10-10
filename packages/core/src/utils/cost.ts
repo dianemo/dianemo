@@ -159,6 +159,65 @@ export function costProblem(
   );
 }
 
+/**
+ * Why a `settle` result cannot be applied to these limits, or undefined.
+ *
+ * Looser than a cost on amounts — every entry may be 0, since a response can
+ * report that nothing was spent — and stricter on names: only token buckets are
+ * settled, so a keyed result names every `requestLimit` and no
+ * `concurrencyLimit`, whose slot is returned at completion whatever the
+ * response said.
+ */
+export function settledCostProblem(
+  settled: unknown,
+  limits: readonly MeteredLimit[]
+): string | undefined {
+  const usable = (amount: unknown) =>
+    typeof amount === "number" && Number.isFinite(amount) && amount >= 0;
+  if (typeof settled === "number") {
+    return usable(settled)
+      ? undefined
+      : `settle must return a finite number that is not negative. Received ${describe(settled)}.`;
+  }
+  if (!isPlainObject(settled)) {
+    return `settle must return a number, an object of numbers keyed by rate limit name, or undefined. Received ${describe(settled)}.`;
+  }
+  for (const [name, amount] of Object.entries(settled)) {
+    if (!usable(amount)) {
+      return `settle's amount for rate limit "${name}" must be a finite number that is not negative. Received ${describe(amount)}.`;
+    }
+  }
+  const buckets = limits
+    .filter((limit) => limit.type === "requestLimit")
+    .map((limit) => limit.name);
+  const slots = limits
+    .filter((limit) => limit.type === "concurrencyLimit")
+    .map((limit) => limit.name);
+  const named = Object.keys(settled);
+  const missing = buckets.filter((name) => !Object.hasOwn(settled, name));
+  const concurrency = named.filter((name) => slots.includes(name));
+  const unknown = named.filter(
+    (name) => !buckets.includes(name) && !slots.includes(name)
+  );
+  const problems = [
+    missing.length ? `omits ${quote(missing)}` : "",
+    concurrency.length
+      ? `names concurrency limit ${quote(concurrency)}, whose slot is returned at completion and is not settled`
+      : "",
+    unknown.length
+      ? `names ${quote(unknown)}, which the client does not declare`
+      : "",
+  ].filter(Boolean);
+  if (!problems.length) return undefined;
+  return `settle's result ${problems.join(" and ")}. It must name every requestLimit: ${
+    buckets.length ? quote(buckets) : "there are none"
+  }.`;
+}
+
+function quote(names: readonly string[]): string {
+  return names.map((name) => `"${name}"`).join(", ");
+}
+
 function ceilingOf(limit: MeteredLimit): number {
   return limit.type === "requestLimit" ? limit.maxTokens : limit.maxConcurrency;
 }

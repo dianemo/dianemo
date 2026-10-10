@@ -61,6 +61,7 @@ export function decodeRequest(
     timestamp: parseInt(metadata.timestamp, 10) || 0,
     grantId: metadata.grantId || undefined,
     isThawRequest: metadata.isThawRequest === "true",
+    ...(metadata.settles === "true" ? { settles: true } : {}),
     ownerId: metadata.ownerId || "",
   };
 }
@@ -79,6 +80,7 @@ export function encodeRequestFields(request: QueuedRequest): string[] {
     grantId: request.grantId || "",
     isThawRequest: request.isThawRequest ? "true" : "false",
     ownerId: request.ownerId,
+    ...(request.settles ? { settles: "true" } : {}),
   };
   const flat: string[] = [];
   for (const [k, v] of Object.entries(fields)) flat.push(k, v);

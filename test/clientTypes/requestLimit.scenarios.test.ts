@@ -152,7 +152,11 @@ interface ClientOptions {
   client?: Record<string, unknown>;
   /** Shutdown drain budget. Short by default: several tests leave work queued. */
   drainMs?: number;
-  /** Makes `hset` reject for matching keys, to model a backend hiccup. */
+  /**
+   * Makes `hset` and `emptyTokenBucket` reject for matching keys, to model a
+   * backend hiccup. Both, because a freeze empties its bucket through
+   * `emptyTokenBucket` and falls back to `hset` on a backend without it.
+   */
   failHsetOn?: (key: string) => boolean;
   /**
    * Runs `backend.now()` this far ahead of the process clock, which is what a
@@ -226,7 +230,10 @@ async function withClient(
           return bound(...args);
         };
       }
-      if (prop === "hset" && options.failHsetOn) {
+      if (
+        (prop === "hset" || prop === "emptyTokenBucket") &&
+        options.failHsetOn
+      ) {
         return async (...args: never[]) => {
           if (options.failHsetOn!(args[0] as unknown as string)) {
             throw new Error("backend unavailable (injected)");

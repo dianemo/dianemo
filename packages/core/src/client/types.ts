@@ -272,6 +272,17 @@ export interface RequestLimitClientOptions {
   tokensToAdd: number;
   /** Bucket ceiling, and so the largest `cost` this client can ever admit. */
   maxTokens: number;
+  /**
+   * How far below zero settlement may take the balance when a response reports
+   * more than the request reserved. A request is admitted only once the bucket
+   * has refilled past its debt, so the client waits for the vendor's budget to
+   * recover instead of meeting a 429. Settlement only — admission never spends
+   * below zero. See `RequestConfig.settle`.
+   *
+   * **Default value: 0**, so an under-reservation beyond the balance goes
+   * uncharged and is logged.
+   */
+  maxDebt?: number;
 }
 
 /**
@@ -313,6 +324,16 @@ export interface RequestLimitClientStats extends RequestLimitClientOptions {
 }
 
 export interface RequestOptions {
+  /**
+   * How long after admission a request's `settle` may still correct what it
+   * claimed, in milliseconds. A token bucket's window is never shorter than the
+   * time it takes to refill from empty, since until then the claim still shapes
+   * its balance.
+   *
+   * Default: 900000 milliseconds (15 minutes), long enough for a non-streamed
+   * response that takes ten minutes to generate.
+   */
+  settleWindow?: number;
   /**
    * When cleaning up requests, how long until the request is counted as timed-out.
    *

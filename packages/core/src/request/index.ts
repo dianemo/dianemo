@@ -153,6 +153,7 @@ export default class Request {
       retries: this.retries,
       grantId: this.config.grantId,
       isThawRequest: this.isThawRequest,
+      ...(this.config.settle ? { settles: true } : {}),
       fastPath: this.fastPath,
       claimedKeys: this.claimedKeys,
       ownerId: this.ownerId,

@@ -94,6 +94,7 @@ async function processRequests(this: BaseClient) {
         grantId: grantId,
         isThawRequest: request.isThawRequest,
         ownerId: request.ownerId,
+        settles: request.settles,
       };
 
       const res = await this.canProcessNextRequest(requestMetadata);

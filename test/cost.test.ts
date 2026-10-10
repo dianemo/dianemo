@@ -1,3 +1,4 @@
+import { assertUsableRateLimits } from "../packages/core/src/utils/rateLimit.js";
 import type { NamedRateLimitData } from "../packages/core/src/client/types.js";
 import { describe, expect, it } from "vitest";
 import {
@@ -5,6 +6,7 @@ import {
   claimedAmount,
   costFor,
   costProblem,
+  settledCostProblem,
   unusableCostReason,
 } from "../packages/core/src/utils/cost.js";
 import {
@@ -151,5 +153,50 @@ describe("costFor and claimedAmount", () => {
   it("hands back nothing for a limit the claim did not name", () => {
     expect(claimedAmount({ rpm: 1 }, "otpm")).toBe(0);
     expect(claimedAmount({ rpm: 1 }, "rpm")).toBe(1);
+  });
+});
+
+describe("settledCostProblem", () => {
+  const limits = [rpm, otpm, slots] as Parameters<typeof settledCostProblem>[1];
+
+  it("accepts a result that names every requestLimit, zeros included", () => {
+    expect(settledCostProblem({ rpm: 1, otpm: 0 }, limits)).toBeUndefined();
+    expect(settledCostProblem({ rpm: 0, otpm: 0 }, limits)).toBeUndefined();
+    expect(settledCostProblem(0, limits)).toBeUndefined();
+  });
+
+  it("refuses a result that omits a requestLimit", () => {
+    expect(settledCostProblem({ otpm: 5 }, limits)).toMatch(/omits "rpm"/);
+  });
+
+  it("refuses a result that names a concurrency limit", () => {
+    expect(settledCostProblem({ rpm: 1, otpm: 5, slots: 1 }, limits)).toMatch(
+      /concurrency limit "slots", whose slot is returned at completion/
+    );
+  });
+
+  it("refuses a result naming a limit the client does not declare", () => {
+    expect(settledCostProblem({ rpm: 1, otpm: 5, tpm: 1 }, limits)).toMatch(
+      /names "tpm", which the client does not declare/
+    );
+  });
+
+  it.each([[-1], [NaN], [Infinity], ["5"], [null]])("refuses %j", (value) => {
+    expect(settledCostProblem(value, limits)).toBeDefined();
+    expect(settledCostProblem({ rpm: 1, otpm: value }, limits)).toBeDefined();
+  });
+});
+
+describe("maxDebt", () => {
+  it.each([[0], [500]])("accepts %s", (maxDebt) => {
+    expect(() =>
+      assertUsableRateLimits([{ ...otpm, maxDebt } as NamedRateLimitData], "c")
+    ).not.toThrow();
+  });
+
+  it.each([[-1], [NaN], [Infinity]])("refuses %s", (maxDebt) => {
+    expect(() =>
+      assertUsableRateLimits([{ ...otpm, maxDebt } as NamedRateLimitData], "c")
+    ).toThrow(/maxDebt must be a finite number that is not negative/);
   });
 });

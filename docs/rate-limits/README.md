@@ -63,6 +63,9 @@ output tokens — but at least one must be positive. A single limit declared
 without a name is called `default`, and a `sharedLimit` client names its
 owner's limits, since those are the budgets it spends.
 
+When the true cost is only known from the response — the tokens an AI model
+generated — reserve an estimate and [settle](settlement.md) it afterwards.
+
 `priority` feeds one packed sorted-set score: priority first, then retry count,
 then arrival time; `cost` is not part of it. A retried request sorts ahead of a
 fresh one at equal priority, so work already part-done finishes rather than

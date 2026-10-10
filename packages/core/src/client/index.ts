@@ -891,6 +891,19 @@ abstract class BaseClient {
   }
 
   /**
+   * Corrects what an attempt claimed to what its response reported, for a
+   * request that declares `settle`. Nothing here meters a bucket of its own; a
+   * `sharedLimit` client settles against its owner's, which made the claim.
+   */
+  public async settleAttempt(
+    request: RequestMetadata,
+    settled: RequestCost
+  ): Promise<void> {
+    const owner = this.getBudgetOwnerClient?.();
+    if (owner && owner !== this) await owner.settleAttempt(request, settled);
+  }
+
+  /**
    * Member id a request's capacity is recorded under. Each attempt claims and
    * releases its own, so a retry cannot release the slot its predecessor holds.
    */

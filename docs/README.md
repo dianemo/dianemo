@@ -35,6 +35,8 @@ that is easiest to configure.
 - [`sharedLimit`](rate-limits/shared-limit.md) — several credentials, one budget
 - [Several limits at once](rate-limits/multiple-limits.md) — per-second *and*
   per-day, or a rate *and* a concurrency ceiling
+- [Settling against the response](rate-limits/settlement.md) — a cost known
+  only afterwards, such as an AI API's tokens
 
 ## Backends
 

@@ -1286,6 +1286,7 @@ class MemoryBackend implements DianemoBackend {
       timestamp: parseInt(metadata.timestamp, 10) || 0,
       grantId: metadata.grantId || undefined,
       isThawRequest: metadata.isThawRequest === "true",
+      ...(metadata.settles === "true" ? { settles: true } : {}),
       ownerId: metadata.ownerId || "",
     };
   }
@@ -1329,6 +1330,7 @@ class MemoryBackend implements DianemoBackend {
     hash.set("timestamp", String(request.timestamp));
     hash.set("grantId", request.grantId || "");
     hash.set("isThawRequest", request.isThawRequest ? "true" : "false");
+    if (request.settles) hash.set("settles", "true");
     hash.set("ownerId", request.ownerId);
     this.expire(queueKey, normalizedTtl);
     this.expire(metadataKey, normalizedTtl);

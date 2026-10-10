@@ -76,6 +76,9 @@ Backend: cost moves onto each `MultiLimitSpec` as `spec.cost`, replacing the one
 
 ## 2. Settlement
 
+*Implemented; the user-facing account is
+[settling a request](../rate-limits/settlement.md).*
+
 ```ts
 handler.handleRequest({
   ...,

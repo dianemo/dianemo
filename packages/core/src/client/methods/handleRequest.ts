@@ -5,6 +5,7 @@ import authenticate from "./authenticate.js";
 import Request from "../../request/index.js";
 import type BaseClient from "../index.js";
 import type {
+  AttemptOutcome,
   RequestConfig,
   RequestCost,
   RequestDoneData,
@@ -19,6 +20,7 @@ import {
   sanitizeError,
 } from "../../utils/redact.js";
 import {
+  ConfigurationError,
   NoResponseError,
   RequestAbortedError,
   RequestTimeoutError,
@@ -64,6 +66,14 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
       // until it times out on whichever replica is the controller.
       const costProblem = this.getCostProblem(config.cost ?? 1);
       if (costProblem) throw costProblem;
+      // Refused here rather than discovered after the response, when the claim
+      // could no longer be corrected and the caller would never hear why.
+      if (config.settle && !this.backend.settleTokens) {
+        throw new ConfigurationError(
+          "backend_missing_settlement",
+          `Client ${this.name} was given a request that settles, which needs a backend implementing settleTokens.`
+        );
+      }
       span.setAttribute("dianemo.request_id", request.id);
       this.logger.debug(`Request ID: ${request.id} | Waiting...`);
       // Counted for the shutdown drain, which otherwise cannot see a fast-path
@@ -482,11 +492,40 @@ async function publishRequestDone(
   void this.finalizeOwnedRequest(data).catch(() => undefined);
 }
 
+/**
+ * Runs the request's `settle` for the attempt that just came back, and applies
+ * what it reports. Called before anything moves the retry count on, since the
+ * claim to correct is filed under this attempt's.
+ *
+ * Never throws: the vendor has already answered, and a broken `settle` or a
+ * backend hiccup must not fail a request that succeeded or turn a retryable
+ * failure into a terminal one. The claim then stands.
+ */
+async function runSettle(
+  this: BaseClient,
+  request: Request,
+  outcome: AttemptOutcome
+): Promise<void> {
+  const settle = request.config.settle;
+  if (!settle) return;
+  try {
+    const settled = await settle(outcome);
+    if (settled === undefined) return;
+    await this.settleAttempt(request.getMetadata(), settled);
+  } catch (error) {
+    this.logger.error(
+      { error },
+      `Request ID: ${request.id} | settlement failed; the attempt keeps what it claimed`
+    );
+  }
+}
+
 async function handleResponse(
   this: BaseClient,
   request: Request,
   res: AxiosResponse
 ) {
+  await runSettle.bind(this)(request, { response: res });
   await publishRequestDone.bind(this)(
     request,
     JSON.stringify(request.getRequestDoneData(undefined, res.status))
@@ -526,6 +565,12 @@ async function handleError(
   // code and the likeliest place a credential gets logged, and it runs from
   // `handleRetry` below — long before the throw at the end of this function.
   sanitizeError(res, this.getSensitiveHeaderNames());
+
+  // Before `handleRetry`, which moves the retry count on to the next attempt.
+  await runSettle.bind(this)(request, {
+    response: res.response,
+    error: res,
+  });
 
   const retryData = await handleRetry.bind(this)(request, res);
   handleLogError.bind(this)(request, res, retryData);

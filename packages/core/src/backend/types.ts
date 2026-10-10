@@ -188,6 +188,11 @@ export interface QueuedRequest {
   isThawRequest: boolean;
   /** Instance id of the replica that queued it, for orphan cleanup. */
   ownerId: string;
+  /**
+   * The request will settle its cost against its response, so whoever claims
+   * for it leaves a claim mark. Stored only when true.
+   */
+  settles?: boolean;
 }
 
 /** A client's or grant's freeze, as stored under its freeze key. */

@@ -1,4 +1,4 @@
-import type { AxiosRequestConfig, Method } from "axios";
+import type { AxiosRequestConfig, AxiosResponse, Method } from "axios";
 
 export type RequestStatus = "inQueue" | "inProgress";
 
@@ -12,6 +12,24 @@ export type RequestStatus = "inQueue" | "inProgress";
  * names its owner's limits, since those are the budgets it spends.
  */
 export type RequestCost = number | Readonly<Record<string, number>>;
+
+/** What one attempt came back with, as `settle` receives it. */
+export type AttemptOutcome =
+  | { response: AxiosResponse; error?: undefined }
+  | { response?: AxiosResponse; error: unknown };
+
+/**
+ * Reports what an attempt actually cost, once its response is in. Returns the
+ * same shape as `cost`, or `undefined` to let the claim stand — after a network
+ * error, say, where the vendor's charge is unknown.
+ *
+ * A keyed result must name every `requestLimit` the client declares and no
+ * `concurrencyLimit`: a slot is returned at completion whatever the response
+ * said. Entries may be 0.
+ */
+export type SettleFunction = (
+  outcome: AttemptOutcome
+) => RequestCost | undefined | Promise<RequestCost | undefined>;
 
 export interface RequestConfig<
   TRequestData = unknown,
@@ -40,6 +58,13 @@ export interface RequestConfig<
    * **Default value: 1**
    */
   cost?: RequestCost;
+  /**
+   * Corrects what this request spent to what its response reports — for a
+   * vendor that meters usage known only afterwards, such as the tokens an AI
+   * response generated. Runs once per attempt, on the replica that sent it. See
+   * {@link SettleFunction} and docs/rate-limits/settlement.md.
+   */
+  settle?: SettleFunction;
   /**
    * Set by the handler before any `requestInterceptor` runs, and unique per
    * `handleRequest` call: every retry of that call carries the same id. A value
@@ -81,6 +106,8 @@ export interface RequestMetadata {
   isThawRequest: boolean;
   /** Admitted without queueing; no queue entry exists for it. */
   fastPath?: boolean;
+  /** Declares `settle`, so its claim leaves a mark. See `QueuedRequest.settles`. */
+  settles?: boolean;
   /**
    * The budget keys this attempt claimed from, set by whoever claimed it.
    * Release and refund act on these rather than on the keys the client's

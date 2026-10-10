@@ -219,6 +219,12 @@ export function assertUsableBudget(
   if (!Number.isFinite(rateLimit.maxTokens) || rateLimit.maxTokens <= 0) {
     problems.push(`maxTokens must be greater than 0`);
   }
+  if (
+    rateLimit.maxDebt !== undefined &&
+    (!Number.isFinite(rateLimit.maxDebt) || rateLimit.maxDebt < 0)
+  ) {
+    problems.push(`maxDebt must be a finite number that is not negative`);
+  }
   if (!problems.length) return;
   throw new ConfigurationError(
     "invalid_rate_limit",
@@ -228,6 +234,9 @@ export function assertUsableBudget(
       maxTokens: rateLimit.maxTokens,
       tokensToAdd: rateLimit.tokensToAdd,
       interval: rateLimit.interval,
+      ...(rateLimit.maxDebt === undefined
+        ? {}
+        : { maxDebt: rateLimit.maxDebt }),
     })}.`
   );
 }

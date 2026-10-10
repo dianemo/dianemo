@@ -25,11 +25,12 @@ export async function newHandler({ backend, redis }, prefix) {
   return handler;
 }
 
-export async function registerClient(handler, name, baseURL, rateLimit) {
+/** `limit` is one rate limit, or none for `noLimit`. */
+export async function registerClient(handler, name, baseURL, limit) {
   await handler.registerClientTemplate(name, (creds) => [
     {
       name: `${name}:_:${creds.instanceId}`,
-      rateLimit: rateLimit ?? { type: "noLimit" },
+      rateLimit: [limit ?? { type: "noLimit" }],
       requestOptions: { defaults: { baseURL } },
     },
   ]);

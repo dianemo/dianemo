@@ -32,7 +32,7 @@ process.on("message", async (msg) => {
       await handler.registerClientTemplate(msg.template, (creds) => [
         {
           name: `${msg.template}:_:${creds.instanceId}`,
-          rateLimit: msg.rateLimit ?? { type: "noLimit" },
+          rateLimit: [msg.rateLimit ?? { type: "noLimit" }],
           requestOptions: { defaults: { baseURL: msg.baseURL } },
         },
       ]);

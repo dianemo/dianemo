@@ -2365,6 +2365,151 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       thawRequestCount: 2,
     });
   });
+
+  // ------------------------------------------------- one probe client-wide
+
+  describe("a client-wide probe claim", () => {
+    const enqueueInProgress = async (requestId: string, grantId: string) => {
+      await backend.addRequest(
+        "cw:q",
+        "cw:m",
+        queued(requestId, { grantId: grantId || undefined })
+      );
+      await backend.updateRequest("cw:q", "cw:m", requestId, {
+        status: "inProgress",
+      });
+    };
+    const claim = (requestId: string, grantId: string, anyGrant?: boolean) =>
+      backend.tryStartThawRequest(
+        "cw:g",
+        "cw:q",
+        "cw:m",
+        requestId,
+        grantId,
+        anyGrant === undefined ? undefined : { anyGrant }
+      );
+
+    it("refuses while another grant's probe is in progress", async () => {
+      await enqueueInProgress("p1", "g1");
+      expect(await claim("p1", "g1")).toBe("started");
+      await enqueueInProgress("p2", "g2");
+      expect(await claim("p2", "g2", true)).toBe("exists");
+      expect((await backend.getRequest("cw:m", "p2"))?.isThawRequest).toBe(
+        false
+      );
+    });
+
+    it("refuses while a client-level probe is in progress", async () => {
+      await enqueueInProgress("p1", "");
+      expect(await claim("p1", "")).toBe("started");
+      await enqueueInProgress("p2", "g2");
+      expect(await claim("p2", "g2", true)).toBe("exists");
+    });
+
+    it("starts when no probe is in progress", async () => {
+      await enqueueInProgress("p1", "g1");
+      await enqueueInProgress("p2", "g2");
+      expect(await claim("p2", "g2", true)).toBe("started");
+      expect(await backend.smembers("cw:g")).toEqual(["g2"]);
+    });
+
+    it("still claims per grant without the option", async () => {
+      await enqueueInProgress("p1", "g1");
+      await claim("p1", "g1");
+      await enqueueInProgress("p2", "g2");
+      expect(await claim("p2", "g2", false)).toBe("started");
+    });
+
+    it("reports another grant's probe as in progress only when asked to", async () => {
+      await enqueueInProgress("p1", "g1");
+      await claim("p1", "g1");
+      expect(
+        await backend.hasThawRequestInProgress("cw:q", "cw:m", "g2", {
+          anyGrant: true,
+        })
+      ).toBe(true);
+      expect(await backend.hasThawRequestInProgress("cw:q", "cw:m", "g2")).toBe(
+        false
+      );
+    });
+  });
+
+  // ------------------------------------------- refunds under a freeze
+
+  describe("a refund under a freeze", () => {
+    const bucket = { maxTokens: 10, tokensToAdd: 10, interval: 600_000 };
+    const spendOne = () => backend.acquireTokens("rf:b", 1, bucket);
+    const tokens = async () => (await backend.hgetall("rf:b")).tokens;
+    const later = async () => (await backend.now()) + 60_000;
+
+    it("is credited under a freeze that left the bucket alone", async () => {
+      await spendOne();
+      await backend.armFreeze("rf:fz", await later(), 0, {
+        emptiesBucket: false,
+      });
+      await backend.refundTokens!("rf:b", 1, 10, "rf:fz");
+      expect(await tokens()).toBe("10");
+    });
+
+    it("is refused under a freeze that emptied the bucket", async () => {
+      await spendOne();
+      await backend.armFreeze("rf:fz", await later(), 0);
+      await backend.refundTokens!("rf:b", 1, 10, "rf:fz");
+      expect(await tokens()).toBe("9");
+    });
+
+    it("stays refused when a freeze that leaves the bucket alone lands on one that emptied it", async () => {
+      await spendOne();
+      await backend.armFreeze("rf:fz", await later(), 3);
+      await backend.armFreeze("rf:fz", await later(), 0, {
+        emptiesBucket: false,
+      });
+      await backend.refundTokens!("rf:b", 1, 10, "rf:fz");
+      expect(await tokens()).toBe("9");
+    });
+
+    it("is credited when the freeze that emptied the bucket had lapsed before the next arm", async () => {
+      await spendOne();
+      await backend.setFreezeState("rf:fz", (await backend.now()) - 1_000, 3);
+      await backend.armFreeze("rf:fz", await later(), 0, {
+        emptiesBucket: false,
+      });
+      await backend.refundTokens!("rf:b", 1, 10, "rf:fz");
+      expect(await tokens()).toBe("10");
+    });
+
+    it("is credited through releaseMultiLimit under a freeze that left the bucket alone", async () => {
+      const specs: MultiLimitSpec[] = [
+        {
+          kind: "tokenBucket",
+          key: "rf:b",
+          config: bucket,
+          freezeKey: "rf:fz",
+        },
+      ];
+      await backend.acquireMultiLimit!(specs, 1);
+      await backend.armFreeze("rf:fz", await later(), 0, {
+        emptiesBucket: false,
+      });
+      await backend.releaseMultiLimit!(specs, 1);
+      expect(await tokens()).toBe("10");
+    });
+
+    it("is refused through releaseMultiLimit under a freeze that emptied the bucket", async () => {
+      const specs: MultiLimitSpec[] = [
+        {
+          kind: "tokenBucket",
+          key: "rf:b",
+          config: bucket,
+          freezeKey: "rf:fz",
+        },
+      ];
+      await backend.acquireMultiLimit!(specs, 1);
+      await backend.armFreeze("rf:fz", await later(), 2);
+      await backend.releaseMultiLimit!(specs, 1);
+      expect(await tokens()).toBe("9");
+    });
+  });
 });
 
 it("holds the Redis backend's ttl ceiling equal to the memory backend's", () => {

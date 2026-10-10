@@ -259,7 +259,14 @@ export interface DianemoBackend {
     config: TokenBucketConfig
   ): Promise<{ tokens: number; lastUpdate: number }>;
   resetTokenBucket(key: string, maxTokens: number): Promise<void>;
-  /** Returns budget claimed for a request that was never dispatched. */
+  /**
+   * Returns budget claimed for a request that was never dispatched.
+   *
+   * Refused while `freezeKey` holds a standing freeze that emptied the bucket —
+   * one armed without `emptiesBucket: false`, see {@link armFreeze}. A freeze
+   * that left the bucket alone refuses nothing, since the token was never taken
+   * from the budget the freeze is protecting.
+   */
   refundTokens?(
     key: string,
     cost: number,
@@ -290,9 +297,9 @@ export interface DianemoBackend {
    * Hands back what `acquireMultiLimit` claimed for a request that was never
    * dispatched. Token buckets are credited and concurrency slots released.
    *
-   * A spec's own `freezeKey` suppresses its refund while that freeze stands,
-   * matching {@link refundTokens} — a freeze empties buckets on purpose. Slots
-   * are released regardless.
+   * A spec's own `freezeKey` suppresses its refund while a freeze that emptied
+   * the bucket stands, matching {@link refundTokens}. Slots are released
+   * regardless.
    */
   releaseMultiLimit?(specs: MultiLimitSpec[], cost: number): Promise<void>;
   /**
@@ -436,12 +443,14 @@ export interface DianemoBackend {
    *
    * The wrong operation for arming a freeze — see {@link armFreeze}. It exists
    * for callers that mean "the state is now this", such as a fixture moving a
-   * freeze from live to lapsed.
+   * freeze from live to lapsed. `options.emptiesBucket` is written as given,
+   * defaulting to `true`, with no merge.
    */
   setFreezeState(
     key: string,
     frozenUntil: number,
-    thawRequestCount: number
+    thawRequestCount: number,
+    options?: { emptiesBucket?: boolean }
   ): Promise<void>;
   /**
    * Arms a freeze, keeping the longer deadline and larger probe budget, and returns
@@ -451,11 +460,20 @@ export interface DianemoBackend {
    * Must be atomic: a read-then-write lets two concurrent arms read the same old
    * value and the loser still win. Aliasing this to `setFreezeState` is wrong in a
    * way no behaviour test will show; run the conformance suite.
+   *
+   * `options.emptiesBucket` records whether this freeze emptied the budget it
+   * governs, which is what makes {@link refundTokens} refuse under it. Pass
+   * `false` for a freeze that leaves the bucket alone — a 5xx or a dropped
+   * connection — so a refund under it is not lost. Defaults to `true`, the
+   * reading every freeze had before the option existed. The merge keeps `true`
+   * if either side has it, but only from a stored freeze that still stands: a
+   * lapsed one's bucket has been refilling since.
    */
   armFreeze(
     key: string,
     frozenUntil: number,
-    thawRequestCount: number
+    thawRequestCount: number,
+    options?: { emptiesBucket?: boolean }
   ): Promise<FreezeState>;
   getFreezeState(key: string): Promise<FreezeState | null>;
   updateThawProgress(
@@ -478,10 +496,15 @@ export interface DianemoBackend {
     isThawRequest: boolean;
     frozenUntil?: number;
   }>;
+  /**
+   * Whether an in-progress thaw probe exists for `grantId` — or, with
+   * `options.anyGrant`, for any grant at all.
+   */
   hasThawRequestInProgress(
     queueKey: string,
     metadataKeyPrefix: string,
-    grantId: string
+    grantId: string,
+    options?: { anyGrant?: boolean }
   ): Promise<boolean>;
   /**
    * Nominates exactly one probe request per grant while frozen.
@@ -489,13 +512,19 @@ export interface DianemoBackend {
    * Returns `"started"` to the single winner and `"exists"` to everyone else.
    * A backend that lets two callers win turns a recovering vendor back into a
    * thundering herd, so this has to be genuinely exclusive.
+   *
+   * With `options.anyGrant`, any other in-progress probe refuses the claim
+   * whatever its `grantId`: one probe client-wide, for a client whose grants
+   * all share one freeze key. `grantId` is still recorded in the frozen-grants
+   * set as without it.
    */
   tryStartThawRequest(
     frozenGrantsKey: string,
     queueKey: string,
     metadataKeyPrefix: string,
     requestId: string,
-    grantId: string
+    grantId: string,
+    options?: { anyGrant?: boolean }
   ): Promise<"started" | "exists">;
   cleanupStaleFrozenGrants(
     frozenGrantsKey: string,

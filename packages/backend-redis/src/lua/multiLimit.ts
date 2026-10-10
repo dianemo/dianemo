@@ -227,10 +227,8 @@ ${planFn}
 /**
  * Hands back what `acquireMultiLimit` claimed.
  *
- * A token refund is refused while the freeze governing that bucket stands, for
- * the reason `refundTokens` gives: the freeze empties buckets on purpose, so
- * crediting one hands back budget the fleet has just been told not to spend. A
- * slot is released either way — nothing else will, and a held slot is not
+ * A token refund is refused while a freeze that emptied that bucket stands, for
+ * the reason `refundTokens` gives. A slot is released either way — nothing else will, and a held slot is not
  * budget the freeze meant to withhold.
  */
 export const releaseMultiLimit = `
@@ -249,8 +247,9 @@ ${finiteNumberFn()}
     else
       local frozen = false
       if spec.fk ~= nil then
-        local frozenUntil = finiteNumber(redis.call('HGET', KEYS[spec.fk], 'frozenUntil'), 0)
-        if frozenUntil > now then frozen = true end
+        -- The gate refundTokens applies, read identically.
+        local freeze = redis.call('HMGET', KEYS[spec.fk], 'frozenUntil', 'emptiesBucket')
+        if finiteNumber(freeze[1], 0) > now and freeze[2] ~= '0' then frozen = true end
       end
       if not frozen then
         -- An absent bucket stays absent: an absent bucket already reads as full,

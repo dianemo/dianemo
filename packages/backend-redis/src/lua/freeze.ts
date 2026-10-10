@@ -42,14 +42,24 @@ ${finiteNumberFn()}
   local frozenUntil = finiteNumber(ARGV[1], 0)
   local thawRequestCount = finiteNumber(ARGV[2], 0)
   local mode = ARGV[3]
+  local emptiesBucket = ARGV[4] ~= '0'
+
+  -- Sized against redis TIME, the same clock frozenUntil is written from.
+  -- On the caller's clock, a process running behind sized the key to expire
+  -- BEFORE the freeze it was holding.
+${redisNow()}
 
   if mode == 'max' then
-    local existing = redis.call('HMGET', key, 'frozenUntil', 'thawRequestCount')
+    local existing = redis.call('HMGET', key, 'frozenUntil', 'thawRequestCount', 'emptiesBucket')
     -- An unusable stored deadline is no freeze state to merge with, so the probe
     -- budget beside it is not consulted either — the reading freezeGate and
     -- readFreezeState give it, and the memory twin's.
     local existingUntil = finiteNumber(existing[1], nil)
     if existingUntil ~= nil then
+      -- Carried only from a freeze still standing: a lapsed one's bucket has
+      -- been refilling since. An absent field is a freeze from before the
+      -- field existed, and every one of those emptied its bucket.
+      if existingUntil > now and existing[3] ~= '0' then emptiesBucket = true end
       -- Never shortened, and never a lower probe budget. See armFreeze.
       if existingUntil > frozenUntil then frozenUntil = existingUntil end
       local existingThaw = finiteNumber(existing[2], 0)
@@ -66,11 +76,8 @@ ${finiteNumberFn()}
   -- and this is also what keeps the ttl below within EXPIRE's range.
   if frozenUntil > 9007199254740991 then frozenUntil = 9007199254740991 end
 
-  -- Sized against redis TIME, the same clock frozenUntil is written from.
-  -- On the caller's clock, a process running behind sized the key to expire
-  -- BEFORE the freeze it was holding. Derived above the writes because EXPIRE
-  -- is what rejects an out-of-range ttl, and it runs second.
-${redisNow()}
+  -- Derived above the writes because EXPIRE is what rejects an out-of-range
+  -- ttl, and it runs second.
   local ttl = math.ceil((frozenUntil - now) / 1000) + 60
   if ttl < 60 then ttl = 60 end
 
@@ -79,7 +86,8 @@ ${redisNow()}
   -- the moment either value grows a digit or gains a fraction.
   redis.call('HSET', key,
     'frozenUntil', string.format('%d', frozenUntil),
-    'thawRequestCount', string.format('%d', thawRequestCount))
+    'thawRequestCount', string.format('%d', thawRequestCount),
+    'emptiesBucket', emptiesBucket and '1' or '0')
   redis.call('EXPIRE', key, ttl)
 
   return { frozenUntil, thawRequestCount }
@@ -180,6 +188,8 @@ export const tryStartThawRequest = `
   local metadataKey = KEYS[4]
   local grantId = ARGV[1]
   local requestId = ARGV[2]
+  -- '1' matches a probe of any grant: one probe client-wide.
+  local anyGrant = ARGV[3] == '1'
 
   -- Step 1: Track the frozen grant. A client-level thaw (no grant) has no
   -- entry here — the frozen-grants set exists to let getNextRequest skip
@@ -208,7 +218,7 @@ export const tryStartThawRequest = `
       local isThawRequest = fields[3]
 
       -- Check if this is an in-progress thaw request for the same grant
-      if status == 'inProgress' and reqGrantId == grantId and isThawRequest == 'true' then
+      if status == 'inProgress' and (anyGrant or reqGrantId == grantId) and isThawRequest == 'true' then
         return 'exists'
       end
     end
@@ -236,6 +246,7 @@ export const hasThawRequestInProgress = `
   local queueKey = KEYS[1]
   local metadataKeyPrefix = KEYS[2]
   local targetGrantId = ARGV[1]
+  local anyGrant = ARGV[2] == '1'
 
   -- Get all request IDs from the queue
   local requestIds = redis.call('ZRANGE', queueKey, 0, -1)
@@ -251,7 +262,7 @@ export const hasThawRequestInProgress = `
     local grantId = fields[2] or ''
     local isThawRequest = fields[3]
 
-    if status == 'inProgress' and grantId == targetGrantId and isThawRequest == 'true' then
+    if status == 'inProgress' and (anyGrant or grantId == targetGrantId) and isThawRequest == 'true' then
       return 1
     end
   end

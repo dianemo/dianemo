@@ -439,9 +439,21 @@ stands, because the freeze emptied that bucket — true only of the lone
 therefore refunded to every bucket of a client with several `requestLimit`s,
 with the freeze key dropped from each, rather than lost.
 
-Only a 429 empties even the lone bucket; a 5xx or a dropped socket says the
-upstream is unwell, not that the budget was wrong. A refund refused under such
-a freeze loses its token, which is the safe direction.
+The same holds for the *kind* of freeze. Only a 429 empties a bucket; a 5xx or
+a dropped connection freezes without touching it, so a refund refused under one
+is a token lost for nothing. The freeze therefore records which it is, as an
+`emptiesBucket` field that `armFreeze` writes from its `emptiesBucket` option,
+and both backends' refund gates refuse only while a freeze with that field set
+stands. An absent field reads as set, which is what every freeze meant before
+the field existed.
+
+The probe budget looks like it already says this — a 429 arms with
+`thawRequestCount > 0` and a 5xx with 0 — and was rejected as the signal for two
+reasons. `retryOptions.thawRequestCount` may be configured to 0, giving a 429
+freeze that emptied the bucket and owes no probes. And the merge carries the
+field only from a freeze that still stands: a 5xx arm landing on a 429 freeze
+whose window has lapsed but whose probes are still owed would otherwise inherit
+"emptied" for a bucket that has been refilling since the window ended.
 
 ## Completion hand-off
 

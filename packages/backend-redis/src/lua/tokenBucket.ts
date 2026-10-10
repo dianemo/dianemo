@@ -84,9 +84,10 @@ ${lazyRefill()}
 `;
 
 /**
- * Refuses while a freeze is in force: the freeze empties the bucket on
- * purpose, so crediting a refund into it would hand back budget the fleet has
- * just been told not to spend. A missing bucket is left missing rather than
+ * Refuses while a freeze that emptied the bucket is in force: crediting a
+ * refund into it would hand back budget the fleet has just been told not to
+ * spend. A freeze armed with `emptiesBucket: false` left the bucket alone, so a
+ * refund under it is credited as usual. A missing bucket is left missing rather than
  * created — an absent bucket already reads as full.
  *
  * `lastUpdate` is deliberately untouched. It marks where refill accounting has
@@ -99,12 +100,14 @@ export const refundTokens = `
   local maxTokens = tonumber(ARGV[2])
 ${finiteNumberFn()}
 
-  -- finiteNumber for both reads, as the memory twin's parseFiniteStored: an
-  -- unusable deadline is no freeze, as every freeze gate reads it.
+  -- Refused only under a standing freeze that emptied the bucket; an absent
+  -- emptiesBucket is a freeze from before the field existed, and those all did.
+  -- finiteNumber, as the memory twin's parseFiniteStored: an unusable deadline
+  -- is no freeze, as every freeze gate reads it.
   if freezeKey ~= '' then
-    local frozenUntil = finiteNumber(redis.call('HGET', freezeKey, 'frozenUntil'), 0)
+    local freeze = redis.call('HMGET', freezeKey, 'frozenUntil', 'emptiesBucket')
 ${redisNow("    ")}
-    if frozenUntil > now then return 0 end
+    if finiteNumber(freeze[1], 0) > now and freeze[2] ~= '0' then return 0 end
   end
 
   -- The raw reply distinguishes an absent bucket, which must stay absent because an

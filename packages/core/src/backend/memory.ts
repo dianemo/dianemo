@@ -321,6 +321,19 @@ class MemoryBackend implements DianemoBackend {
     return parseFiniteStored(this.hget(freezeKey, "thawRequestCount"), 0) > 0;
   }
 
+  /**
+   * Whether a refund must be refused: a freeze stands and emptied the bucket.
+   * An absent `emptiesBucket` field reads as emptying, as every freeze did
+   * before the field existed. Twin of the refund gate in `lua/tokenBucket.ts`.
+   */
+  private freezeEmptiedBucket(freezeKey: string, now: number): boolean {
+    const frozenUntil = parseFiniteStored(
+      this.hget(freezeKey, "frozenUntil"),
+      0
+    );
+    return frozenUntil > now && this.hget(freezeKey, "emptiesBucket") !== "0";
+  }
+
   // ------------------------------------------------------------------ store
 
   async get(key: string): Promise<string | null> {
@@ -616,10 +629,7 @@ class MemoryBackend implements DianemoBackend {
     maxTokens: number,
     freezeKey?: string
   ): Promise<void> {
-    const frozenUntil = freezeKey
-      ? parseFiniteStored(this.hget(freezeKey, "frozenUntil"), 0)
-      : 0;
-    if (frozenUntil > Date.now()) return;
+    if (freezeKey && this.freezeEmptiedBucket(freezeKey, Date.now())) return;
     const hash = this.live(key)?.hash;
     if (!hash) return;
     // An absent field leaves the bucket alone: the Lua returns early rather than
@@ -1328,18 +1338,32 @@ class MemoryBackend implements DianemoBackend {
   async setFreezeState(
     key: string,
     frozenUntil: number,
-    thawRequestCount: number
+    thawRequestCount: number,
+    options: { emptiesBucket?: boolean } = {}
   ): Promise<void> {
-    this.writeFreezeState(key, frozenUntil, thawRequestCount, "set");
+    this.writeFreezeState(
+      key,
+      frozenUntil,
+      thawRequestCount,
+      "set",
+      options.emptiesBucket !== false
+    );
   }
 
   /** See the Redis twin: never shortens a standing freeze, and returns what won. */
   async armFreeze(
     key: string,
     frozenUntil: number,
-    thawRequestCount: number
+    thawRequestCount: number,
+    options: { emptiesBucket?: boolean } = {}
   ): Promise<FreezeState> {
-    return this.writeFreezeState(key, frozenUntil, thawRequestCount, "max");
+    return this.writeFreezeState(
+      key,
+      frozenUntil,
+      thawRequestCount,
+      "max",
+      options.emptiesBucket !== false
+    );
   }
 
   /**
@@ -1350,8 +1374,10 @@ class MemoryBackend implements DianemoBackend {
     key: string,
     frozenUntil: number,
     thawRequestCount: number,
-    mode: "set" | "max"
+    mode: "set" | "max",
+    emptiesBucket: boolean
   ): FreezeState {
+    const now = Date.now();
     // Sanitised before the merge: a NaN compares false against the standing value,
     // so the merge kept it and cancelled the probe budget a 429 was owed.
     if (!Number.isFinite(frozenUntil)) frozenUntil = 0;
@@ -1368,6 +1394,9 @@ class MemoryBackend implements DianemoBackend {
       // freeze gate gives it, and the Lua twin's.
       const existingUntil = usableDeadline(this.hget(key, "frozenUntil"));
       if (existingUntil !== undefined) {
+        if (existingUntil > now && this.hget(key, "emptiesBucket") !== "0") {
+          emptiesBucket = true;
+        }
         if (existingUntil > frozenUntil) frozenUntil = existingUntil;
         const existingThaw = parseFiniteStored(
           this.hget(key, "thawRequestCount"),
@@ -1387,11 +1416,12 @@ class MemoryBackend implements DianemoBackend {
     // Derived and validated before the fields are set, as `writeHash` validates
     // its own: `expire` raises, and would otherwise leave the freeze half-written.
     const ttl = normalizeTtlSeconds(
-      Math.max(Math.ceil((frozenUntil - Date.now()) / 1000) + 60, 60)
+      Math.max(Math.ceil((frozenUntil - now) / 1000) + 60, 60)
     );
     const hash = this.hash(key);
     hash.set("frozenUntil", String(frozenUntil));
     hash.set("thawRequestCount", String(thawRequestCount));
+    hash.set("emptiesBucket", emptiesBucket ? "1" : "0");
     this.expire(key, ttl);
     return { frozenUntil, thawRequestCount };
   }
@@ -1503,22 +1533,34 @@ class MemoryBackend implements DianemoBackend {
     };
   }
 
+  /**
+   * Whether the entry at `metadataKey` is an in-progress probe that a claim for
+   * `grantId` must yield to — any grant's, under `anyGrant`.
+   */
+  private isCompetingProbe(
+    metadataKey: string,
+    grantId: string,
+    anyGrant: boolean
+  ): boolean {
+    // Normalised as the Lua twin's `fields[2] or ''` does: a client-level probe
+    // carries no `grantId` field, so an absent one has to match its own kind.
+    const otherGrantId = this.hget(metadataKey, "grantId") ?? "";
+    return (
+      this.hget(metadataKey, "status") === "inProgress" &&
+      (anyGrant || otherGrantId === grantId) &&
+      this.hget(metadataKey, "isThawRequest") === "true"
+    );
+  }
+
   async hasThawRequestInProgress(
     queueKey: string,
     metadataKeyPrefix: string,
-    grantId: string
+    grantId: string,
+    options: { anyGrant?: boolean } = {}
   ): Promise<boolean> {
     for (const requestId of this.sorted(queueKey)) {
       const metadataKey = `${metadataKeyPrefix}:${requestId}`;
-      // Normalised exactly as `tryStartThawRequest` normalises it, and as the
-      // Lua twin's `fields[2] or ''` does: a client-level probe carries no
-      // `grantId` field, so an absent one has to match its own kind.
-      const otherGrantId = this.hget(metadataKey, "grantId") ?? "";
-      if (
-        this.hget(metadataKey, "status") === "inProgress" &&
-        otherGrantId === grantId &&
-        this.hget(metadataKey, "isThawRequest") === "true"
-      ) {
+      if (this.isCompetingProbe(metadataKey, grantId, !!options.anyGrant)) {
         return true;
       }
     }
@@ -1530,7 +1572,8 @@ class MemoryBackend implements DianemoBackend {
     queueKey: string,
     metadataKeyPrefix: string,
     requestId: string,
-    grantId: string
+    grantId: string,
+    options: { anyGrant?: boolean } = {}
   ): Promise<"started" | "exists"> {
     // A client-level thaw has no grant to track; the frozen-grants set exists
     // so getNextRequest can skip individual grants.
@@ -1544,12 +1587,7 @@ class MemoryBackend implements DianemoBackend {
     for (const otherId of this.sorted(queueKey)) {
       if (otherId === requestId) continue;
       const metadataKey = `${metadataKeyPrefix}:${otherId}`;
-      const otherGrantId = this.hget(metadataKey, "grantId") ?? "";
-      if (
-        this.hget(metadataKey, "status") === "inProgress" &&
-        otherGrantId === grantId &&
-        this.hget(metadataKey, "isThawRequest") === "true"
-      ) {
+      if (this.isCompetingProbe(metadataKey, grantId, !!options.anyGrant)) {
         return "exists";
       }
     }

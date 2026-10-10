@@ -82,9 +82,19 @@ await handler.registerClientTemplate("acme", (creds) => [
 ]);
 ```
 
-A sub-client **inherits** the parent's endpoint configuration, authentication
-and retry options, and **overrides** whatever it declares — most usefully its
-own `rateLimit`. Address it by appending its name:
+A sub-client **inherits** the parent's endpoint configuration, authentication,
+retry options and `rateLimitChange`, and **overrides** whatever it declares —
+most usefully its own `rateLimit`. An inherited `rateLimitChange` runs on the
+sub-client's own responses and retunes the sub-client's own budget, so a callback
+written for the parent's limit names has to cope with the child's. Objects that
+are not plain — an `httpAgent`, a `Buffer` — are shared with the parent as the
+same object rather than copied.
+
+A sub-client that declares its own `authentication` authenticates as itself: its
+tokens are filed under its own name, not its parent's. One that declares none
+uses its parent's credential entry and so its parent's tokens.
+
+Address a sub-client by appending its name:
 
 ```ts
 await handler.handleRequest({

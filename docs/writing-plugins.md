@@ -103,6 +103,11 @@ export * from "./requests/index.js";
 key credentials are filed under, so two plugins claiming one name would route
 one's credentials to the other's builder. `use()` refuses that.
 
+Call `use()` before the first request where you can. Called on a handler that
+has already started, it registers the template there and then and builds any
+tenants already stored for it; since `use()` is synchronous, a registration
+that fails at that point is logged as an error rather than thrown.
+
 ## The template
 
 ```ts
@@ -229,13 +234,26 @@ Four more things worth knowing:
   limits in one plan, or a `defaultRateLimitOption` naming a plan that is not
   declared, fails the deploy that introduced it rather than the first tenant who
   picks it.
-- **Renaming a plan does not strand its tenants.** A stored key the template no
-  longer declares is dropped with a warning, and the client is built from the
-  limits its builder declares — not from `defaultRateLimitOption`.
+- **Renaming a plan does not strand its tenants, but it does change their
+  limits.** A stored key the template no longer declares is dropped, logged as an
+  error, and the client is built from the limits its builder declares — not from
+  `defaultRateLimitOption`. A builder that leaves limits to the plan declares
+  none, so its tenants on the old key run `noLimit` until they are re-added with
+  a key that exists. Keep the old key as an alias until every tenant has moved.
+- **A plan never changes what kind of client is built.** `""` reaches every root
+  client the builder returns except a
+  [`sharedLimit`](rate-limits/shared-limit.md) one, which keeps drawing on its
+  owner — and the owner is one of the roots `""` just retuned. A path whose only
+  match is a client of the other kind is skipped and logged, as an
+  [override](concepts.md#rate-limit-overrides) of that shape would be.
 - **One tenant cannot take the others down.** A tenant whose stored settings no
   longer build is logged and skipped — at startup, and when the template is
   registered after `start()` — and the tenants after it are built as usual.
   Re-adding it with `addTemplateClient` replaces the stored settings.
+- **A re-add that cannot be built changes nothing.** `addTemplateClient` builds
+  the new credentials and settings before storing them, so one that throws is
+  refused with the tenant's running clients, their queued requests and the stored
+  record all left as they were.
 
 `handler.getRateLimitOptions("acme")` lists the keys, for a host rendering a
 picker.

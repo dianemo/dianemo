@@ -43,30 +43,65 @@ export function collectClientNames(
  */
 export async function generateClients(
   this: RequestHandler,
-  clients: CreateClientData[],
-  parent?: CreateClientData
+  clients: CreateClientData[]
 ) {
-  for (const declared of clients) {
-    const client = parent
-      ? mergeChildParentClients.bind(this)(declared, parent)
-      : declared;
-    const existing = this.clients.get(client.name);
-    if (!existing || !clientDataEqual(existing.getSourceClientData(), client)) {
-      const previous = await resetClient.bind(this)(client.name);
-      await createClient.bind(this)(client);
-      // The replacement takes over the requests the old client had parked, so it
-      // can still fail them with a reason if the rebuilt budget cannot serve them.
-      if (previous)
-        this.clients.get(client.name)?.adoptWaitingRequests(previous);
+  await prepareClients.bind(this)(clients)();
+}
+
+/**
+ * Constructs every client `clients` declares that differs from the one
+ * registered under its name, and returns the step that swaps them in.
+ *
+ * Everything that can refuse a config runs here, before any client is torn
+ * down, so a rebuild whose new config cannot be built throws and leaves the
+ * working clients — and the requests they have parked — where they are.
+ * `retiring` names clients the caller is about to remove, which a `sharedLimit`
+ * in this build may not borrow from.
+ */
+export function prepareClients(
+  this: RequestHandler,
+  clients: CreateClientData[],
+  retiring: ReadonlySet<string> = new Set()
+): () => Promise<void> {
+  const built = new Map<string, BaseClient>();
+  const lookup = (name: string): BaseClient | undefined =>
+    built.get(name) ??
+    (retiring.has(name) ? undefined : this.clients.get(name));
+  const replacements: BaseClient[] = [];
+  const walk = (list: CreateClientData[], parent?: CreateClientData) => {
+    for (const declared of list) {
+      const client = parent
+        ? mergeChildParentClients(declared, parent)
+        : declared;
+      const existing = this.clients.get(client.name);
+      if (
+        !existing ||
+        !clientDataEqual(existing.getSourceClientData(), client)
+      ) {
+        const next = buildClient.bind(this)(client, lookup);
+        built.set(client.name, next);
+        replacements.push(next);
+      }
+      // Recursed from what was declared, not from the merged copy: the merge
+      // drops `subClients` so a child does not inherit its siblings, so reading
+      // them back off the merged object stops the recursion at depth one —
+      // while `collectClientNames` keeps going, reporting clients that were
+      // never built.
+      if (declared.subClients) walk(declared.subClients, client);
     }
-    // Recursed from what was declared, not from the merged copy: the merge drops
-    // `subClients` so a child does not inherit its siblings, so reading them back
-    // off the merged object stops the recursion at depth one — while
-    // `collectClientNames` keeps going, reporting clients that were never built.
-    if (declared.subClients) {
-      await generateClients.bind(this)(declared.subClients, client);
+  };
+  walk(clients);
+
+  return async () => {
+    for (const next of replacements) {
+      const previous = await resetClient.bind(this)(next.getName());
+      await registerClient.bind(this)(next);
+      // The replacement takes over the requests the old client had parked, so
+      // it can still fail them with a reason if the rebuilt budget cannot serve
+      // them.
+      if (previous) next.adoptWaitingRequests(previous);
     }
-  }
+  };
 }
 
 /**
@@ -107,6 +142,10 @@ function deepEqualIgnoringFunctionIdentity(a: unknown, b: unknown): boolean {
   return true;
 }
 
+/**
+ * A sub-client as built: the parent's config with the child's on top, so it
+ * inherits everything it does not declare — `rateLimitChange` included.
+ */
 function mergeChildParentClients(
   child: CreateClientData,
   parent: CreateClientData
@@ -115,11 +154,6 @@ function mergeChildParentClients(
     ...deepCloneWithFunctions(parent),
     ...child,
     name: `${parent.name}:${child.name}`,
-    // Credentials belong to the client at the top of the sub-client chain, since
-    // a sub-client inherits its parent's authentication. Inheriting the parent's
-    // own owner rather than using `parent.name` keeps that true at any nesting
-    // depth. A `sharedLimit` child is not a sub-client and never reaches here.
-    authOwnerName: parent.authOwnerName ?? parent.name,
     metadata: {
       ...(parent.metadata ? deepCloneWithFunctions(parent.metadata) : {}),
       ...child.metadata,
@@ -150,24 +184,33 @@ function mergeChildParentClients(
     },
   } as unknown as CreateClientData;
   delete merged.subClients;
+  // Credentials belong to whoever declared the authentication: the parent's
+  // owner, inherited rather than `parent.name` so it holds at any depth, unless
+  // the child declares its own. See
+  // docs/design-notes.md#credential-keying-and-sub-clients.
+  if (child.authentication) delete merged.authOwnerName;
+  else merged.authOwnerName = parent.authOwnerName ?? parent.name;
   return merged;
 }
 
+/**
+ * Copies plain objects and arrays, so a child writing into its merged config
+ * cannot reach its parent's. Anything else is passed by reference: an
+ * `http.Agent`, a `Buffer` or a `Date` copied key by key loses its prototype,
+ * and Node's http module refuses an agent that is not an `Agent`.
+ */
 function deepCloneWithFunctions<T>(obj: T): T {
   if (obj === null || typeof obj !== "object") return obj;
-
   if (Array.isArray(obj)) {
     return obj.map((item) => deepCloneWithFunctions(item)) as T;
   }
+  const proto = Object.getPrototypeOf(obj);
+  if (proto !== Object.prototype && proto !== null) return obj;
 
   const cloned = {} as T;
   for (const key in obj) {
     if (Object.prototype.hasOwnProperty.call(obj, key)) {
-      const value = obj[key];
-      if (typeof value === "function") cloned[key] = value;
-      else if (value !== null && typeof value === "object") {
-        cloned[key] = deepCloneWithFunctions(value);
-      } else cloned[key] = value;
+      cloned[key] = deepCloneWithFunctions(obj[key]);
     }
   }
   return cloned;
@@ -194,14 +237,17 @@ export async function resetClient(
   return client;
 }
 
-export async function createClient(
+/**
+ * Validates `data` and constructs its client without registering it, so a
+ * config that cannot be built throws before anything it would replace is
+ * touched. `lookup` resolves a `sharedLimit` owner, including one built
+ * alongside this client and not yet registered.
+ */
+function buildClient(
   this: RequestHandler,
-  data: CreateClientData
-) {
-  const existing = this.clients.get(data.name);
-  if (existing) {
-    throw new ClientConflictError(data.name);
-  }
+  data: CreateClientData,
+  lookup: (name: string) => BaseClient | undefined
+): BaseClient {
   const baseData = {
     client: data,
     backend: this.backend,
@@ -210,15 +256,6 @@ export async function createClient(
     key: this.key,
     emitter: this.emitter,
     instanceId: this.id,
-  };
-  // Lets the health tick re-run election; see its call site.
-  const attachReconcile = <T extends { reconcileRole?: () => Promise<void> }>(
-    client: T
-  ): T => {
-    client.reconcileRole = async () => {
-      await this.scheduleClientRoles();
-    };
-    return client;
   };
   // `"rateLimit" in data`, not `??`: only an absent property is the documented
   // `noLimit` default. A property that is present and null or undefined throws,
@@ -258,20 +295,14 @@ export async function createClient(
   // same entry in a template plan is checked at registration.
   assertUsableRateLimits(limits, data.name);
 
-  if (!isSharedLimitOnly(limits)) {
-    const client = new MeteredClient(baseData, limits);
-    this.clients.set(data.name, attachReconcile(client));
-    await client.init();
-    this.emitter.emit(`clientRegistered:${data.name}`);
-    return;
-  }
+  if (!isSharedLimitOnly(limits)) return new MeteredClient(baseData, limits);
 
   // A child whose owner does not exist is forced to `worker` by the election and
   // so is never drained by anyone: it accepts requests, sends none, and grows its
   // queue by one permanent entry per request.
   const shared = limits[0] as SharedLimitClientOptions & { name: string };
   const parentName = shared.clientName;
-  const parent = this.clients.get(parentName);
+  const parent = lookup(parentName);
   if (!parent) {
     throw new ConfigurationError(
       "shared_limit_parent_not_found",
@@ -298,8 +329,17 @@ export async function createClient(
   slClient.getBudgetOwnerAuthData = () =>
     this.clients.get(parentName)?.getAuthData();
   slClient.getBudgetOwnerClient = () => this.clients.get(parentName);
-  this.clients.set(data.name, attachReconcile(slClient));
-  await slClient.init();
+  return slClient;
+}
 
-  this.emitter.emit(`clientRegistered:${data.name}`);
+async function registerClient(this: RequestHandler, client: BaseClient) {
+  const name = client.getName();
+  if (this.clients.has(name)) throw new ClientConflictError(name);
+  // Lets the health tick re-run election; see its call site.
+  client.reconcileRole = async () => {
+    await this.scheduleClientRoles();
+  };
+  this.clients.set(name, client);
+  await client.init();
+  this.emitter.emit(`clientRegistered:${name}`);
 }

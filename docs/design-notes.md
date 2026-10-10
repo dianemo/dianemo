@@ -167,7 +167,9 @@ Two mechanisms implement this, and they are easy to confuse:
 
 - **`authOwnerName`** is set when a sub-client is merged onto its parent and
   carries the parent's own auth owner, so a nested path (`a:b:c`) resolves to the
-  client that actually holds the credentials rather than to the template.
+  client that actually holds the credentials rather than to the template. A
+  sub-client declaring its own `authentication` gets none: it owns its
+  credentials, and its own sub-clients inherit it as their owner.
 - **`sharedLimit` is the deliberate exception.** It is constructed with its
   *parent's* `name`, so its queue, bucket and freeze state resolve to the
   parent's keys — that is the whole point of the type. But it is a peer with its

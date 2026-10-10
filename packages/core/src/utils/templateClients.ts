@@ -1,5 +1,7 @@
 import type { CreateClientData, DeclaredRateLimit } from "../client/types.js";
-import { collectClientNames, generateClients } from "./createClients.js";
+import { retireCredentialWrites } from "../client/methods/authenticate.js";
+import { collectClientNames, prepareClients } from "./createClients.js";
+import { noopLogger, type Logger } from "../logger.js";
 import { encrypt, decrypt } from "./encryption.js";
 import { ConfigurationError } from "../errors.js";
 import type RequestHandler from "../index.js";
@@ -19,7 +21,7 @@ import type {
 /**
  * Serializes concurrent rebuilds of one `(templateName, instanceId)`. A local writer
  * races its own `templateClientAdded` broadcast, and two interleaved rebuilds both
- * pass the destroy phase, so the second `createClient` throws and both write the same
+ * pass the destroy phase, so the second registration throws and both write the same
  * `templateClientMap` entry. Keyed by handler, so two in one process stay independent.
  */
 const buildLocks = new Map<string, Promise<void>>();
@@ -310,65 +312,32 @@ async function doBuildAndRegister(
   credentials: unknown,
   settings?: TemplateClientOptions
 ): Promise<void> {
-  const template = this.templates.get(templateName);
-  if (!template) {
+  const build = planTemplateBuild.call(
+    this,
+    this.logger,
+    templateName,
+    instanceId,
+    credentials,
+    settings
+  );
+  if (!build) {
     this.logger.warn(
       `No builder registered for template "${templateName}", skipping`
     );
     return;
   }
-
-  const context = resolveTemplateContext.bind(this)(
+  const { clientDataList, newClientNames } = build;
+  const retiring = retiringNames.call(
+    this,
     templateName,
-    template.options,
-    settings
+    instanceId,
+    newClientNames
   );
-  const result = template.builder(credentials, context);
-  const clientDataList: CreateClientData[] = Array.isArray(result)
-    ? result
-    : [result];
+  // Before anything is torn down, so a config that cannot be built throws here
+  // and leaves the working clients in place.
+  const commit = prepareClients.bind(this)(clientDataList, retiring);
 
-  // The plan first, then the overrides on top: the plan is what the template
-  // says this tenant is entitled to, and an override is the operator overruling
-  // it. The other order would let a plan quietly undo an operator's decision.
-  if (context.rateLimits) {
-    applyPlan.bind(this)(templateName, clientDataList, context.rateLimits);
-  }
-
-  const overrides = settings?.rateLimitOverrides;
-  // A shape mismatch skips the override — changing shape would switch the
-  // underlying client class.
-  if (overrides && Object.keys(overrides).length > 0) {
-    for (const root of clientDataList) {
-      applyOverrides.bind(this)(root, overrides, "");
-    }
-  }
-
-  // The names are third-party builder output, and `doAddTemplateClient` validates
-  // only the segments it was given, not that the builder used them. A name that does
-  // not vary by instance collapses every tenant onto one client, which
-  // `generateClients` destroys and recreates per tenant rather than reporting a
-  // conflict — so each tenant's requests go out under whichever authenticated first.
-  //
-  // Only the instance segment is required: a template may legitimately build several
-  // differently-named root clients.
-  for (const client of clientDataList) {
-    const segments = client.name.split(":");
-    if (!segments.includes(instanceId)) {
-      throw new ConfigurationError(
-        "template_client_name_mismatch",
-        `Template "${templateName}" built a client named "${client.name}" for instance "${instanceId}", which does not appear in the name. Client names must identify their instance — use buildClientName() — or two tenants resolve to one client and one credential entry.`
-      );
-    }
-  }
-
-  const newClientNames = collectClientNames(clientDataList);
-
-  const prevNames =
-    this.templateClientMap.get(templateName)?.get(instanceId) ??
-    new Set<string>();
-  for (const prevName of prevNames) {
-    if (newClientNames.has(prevName)) continue;
+  for (const prevName of retiring) {
     const stale = this.clients.get(prevName);
     if (stale) {
       // A name the template stopped producing: nothing replaces it, so its parked
@@ -394,7 +363,116 @@ async function doBuildAndRegister(
     await this.backend.sadd(namesKey, name).catch(() => {});
   }
 
-  await generateClients.bind(this)(clientDataList);
+  await commit();
+}
+
+/**
+ * Throws whatever building these credentials and settings would throw, and
+ * changes nothing — for a caller about to store them, so a record that cannot
+ * be built is refused rather than written.
+ */
+export function assertTemplateClientBuildable(
+  this: RequestHandler,
+  templateName: string,
+  instanceId: string,
+  credentials: unknown,
+  settings?: TemplateClientOptions
+): void {
+  const build = planTemplateBuild.call(
+    this,
+    noopLogger,
+    templateName,
+    instanceId,
+    credentials,
+    settings
+  );
+  if (!build) return;
+  prepareClients.bind(this)(
+    build.clientDataList,
+    retiringNames.call(this, templateName, instanceId, build.newClientNames)
+  );
+}
+
+function retiringNames(
+  this: RequestHandler,
+  templateName: string,
+  instanceId: string,
+  newClientNames: ReadonlySet<string>
+): Set<string> {
+  const previous =
+    this.templateClientMap.get(templateName)?.get(instanceId) ?? [];
+  return new Set([...previous].filter((name) => !newClientNames.has(name)));
+}
+
+/**
+ * Runs the builder and places the plan and overrides on what it returns.
+ * `undefined` when the template is not registered here.
+ */
+function planTemplateBuild(
+  this: RequestHandler,
+  log: Logger,
+  templateName: string,
+  instanceId: string,
+  credentials: unknown,
+  settings?: TemplateClientOptions
+):
+  | { clientDataList: CreateClientData[]; newClientNames: Set<string> }
+  | undefined {
+  const template = this.templates.get(templateName);
+  if (!template) return undefined;
+
+  const context = resolveTemplateContext(
+    log,
+    templateName,
+    template.options,
+    settings
+  );
+  const result = template.builder(credentials, context);
+  const clientDataList: CreateClientData[] = Array.isArray(result)
+    ? result
+    : [result];
+
+  // The plan first, then the overrides on top: the plan is what the template
+  // says this tenant is entitled to, and an override is the operator overruling
+  // it. The other order would let a plan quietly undo an operator's decision.
+  if (context.rateLimits) {
+    applyPlan(
+      log,
+      templateName,
+      context.rateLimitOption!,
+      clientDataList,
+      context.rateLimits
+    );
+  }
+
+  const overrides = settings?.rateLimitOverrides;
+  // A shape mismatch skips the override — changing shape would switch the
+  // underlying client class.
+  if (overrides && Object.keys(overrides).length > 0) {
+    for (const root of clientDataList) {
+      applyOverrides(log, root, overrides, "");
+    }
+  }
+
+  // The names are third-party builder output, and `doAddTemplateClient` validates
+  // only the segments it was given, not that the builder used them. A name that does
+  // not vary by instance collapses every tenant onto one client, which
+  // `generateClients` destroys and recreates per tenant rather than reporting a
+  // conflict — so each tenant's requests go out under whichever authenticated first.
+  //
+  // Only the instance segment is required: a template may legitimately build several
+  // differently-named root clients.
+  for (const client of clientDataList) {
+    const segments = client.name.split(":");
+    if (!segments.includes(instanceId)) {
+      throw new ConfigurationError(
+        "template_client_name_mismatch",
+        `Template "${templateName}" built a client named "${client.name}" for instance "${instanceId}", which does not appear in the name. Client names must identify their instance — use buildClientName() — or two tenants resolve to one client and one credential entry.`
+      );
+    }
+  }
+
+  return { clientDataList, newClientNames: collectClientNames(clientDataList) };
 }
 
 /**
@@ -402,11 +480,12 @@ async function doBuildAndRegister(
  *
  * An option this template no longer declares is dropped rather than refused: the
  * key was written when it was valid, and a plugin that renames a plan should not
- * make every client already on it unbuildable on the next restart. The warning
- * is what says the client is now on the template default.
+ * make every client already on it unbuildable on the next restart. Logged as an
+ * error, since a tenant built purely from the plan is now on the builder's own
+ * limits — `noLimit`, for a builder that declares none.
  */
 function resolveTemplateContext(
-  this: RequestHandler,
+  log: Logger,
   templateName: string,
   options: ClientTemplateOptions,
   settings?: TemplateClientOptions
@@ -417,8 +496,8 @@ function resolveTemplateContext(
   const plan =
     declared && Object.hasOwn(declared, chosen) ? declared[chosen] : undefined;
   if (plan === undefined) {
-    this.logger.warn(
-      `Template "${templateName}" no longer declares a rateLimitOption "${chosen}"; building on the template default instead`
+    log.error(
+      `Template "${templateName}" no longer declares a rateLimitOption "${chosen}"; building from the limits its builder declares instead`
     );
     return {};
   }
@@ -462,38 +541,56 @@ function ownEntry<T>(map: Record<string, T>, path: string): T | undefined {
 /**
  * Places a chosen plan's limits onto the clients the builder produced.
  *
- * Unlike an override, a plan is not held to the shape the builder declared: both
- * are the template author's own, the plan was validated at registration, and a
- * plan silently skipped for disagreeing with a default it is meant to replace
- * would be far harder to explain than one that simply applies.
+ * Held to the same shape rule as an override: a plan retunes budgets, and never
+ * turns a client that borrows another's budget into one with its own, or the
+ * reverse. So `""` reaches every root client except a `sharedLimit` one, which
+ * keeps drawing on its owner — the owner that the same `""` entry just retuned.
  *
  * A path matching no client is a plugin bug — a renamed sub-client, most likely —
  * so it is reported rather than dropped, since the symptom otherwise is one
- * endpoint quietly running unlimited.
+ * endpoint quietly running unlimited. So is a path that only clients of the
+ * other shape match.
  */
 function applyPlan(
-  this: RequestHandler,
+  log: Logger,
   templateName: string,
+  option: string,
   clients: CreateClientData[],
   rateLimits: Record<string, DeclaredRateLimit[]>
 ): void {
   const applied = new Set<string>();
-  const walk = (client: CreateClientData, path: string): void => {
+  const refused = new Map<string, string>();
+  const walk = (
+    client: CreateClientData,
+    path: string,
+    inherited?: DeclaredRateLimit[]
+  ): void => {
+    let effective: DeclaredRateLimit[] = client.rateLimit ??
+      inherited ?? [{ type: "noLimit" }];
     const limit = ownEntry(rateLimits, path);
     if (limit !== undefined) {
-      client.rateLimit = limit;
-      applied.add(path);
+      const mismatch = describeShapeMismatch(effective, limit);
+      if (mismatch) {
+        refused.set(path, mismatch);
+      } else {
+        client.rateLimit = limit;
+        effective = limit;
+        applied.add(path);
+      }
     }
     for (const sub of client.subClients ?? []) {
-      walk(sub, path === "" ? sub.name : `${path}:${sub.name}`);
+      walk(sub, path === "" ? sub.name : `${path}:${sub.name}`, effective);
     }
   };
   for (const root of clients) walk(root, "");
 
   for (const path of Object.keys(rateLimits)) {
     if (applied.has(path)) continue;
-    this.logger.warn(
-      `Template "${templateName}" has a rate-limit option covering path "${path}", which no client it built matches; that limit was not applied`
+    const mismatch = refused.get(path);
+    log.warn(
+      mismatch
+        ? `Template "${templateName}" has a rate-limit option "${option}" whose limits for path "${path}" ${mismatch}; that limit was not applied`
+        : `Template "${templateName}" has a rate-limit option covering path "${path}", which no client it built matches; that limit was not applied`
     );
   }
 }
@@ -503,7 +600,7 @@ function applyPlan(
  * takes its parent's, so that, not `noLimit`, is what an override replaces.
  */
 function applyOverrides(
-  this: RequestHandler,
+  log: Logger,
   client: CreateClientData,
   overrides: RateLimitOverrides,
   path: string,
@@ -516,7 +613,7 @@ function applyOverrides(
   if (override !== undefined) {
     const mismatch = describeShapeMismatch(existing, override);
     if (mismatch) {
-      this.logger.warn(
+      log.warn(
         `Rate-limit override for path "${path}" ${mismatch} — skipping override`
       );
     } else {
@@ -532,7 +629,7 @@ function applyOverrides(
   if (client.subClients) {
     for (const sub of client.subClients) {
       const subPath = path === "" ? sub.name : `${path}:${sub.name}`;
-      applyOverrides.bind(this)(sub, overrides, subPath, effective);
+      applyOverrides(log, sub, overrides, subPath, effective);
     }
   }
 }
@@ -557,31 +654,52 @@ function describeShapeMismatch(
     : "shares another client's budget where the template default declares its own";
 }
 
+/**
+ * Removes a template instance's clients from this replica, failing their parked
+ * requests.
+ *
+ * Their credential writes are stopped before anything else, so a refresh still
+ * in flight cannot write tokens back after they are purged. When the backend no
+ * longer lists the instance, its credentials are purged here as well: a peer's
+ * refresh can land between the removing replica's purge and this replica
+ * hearing of it.
+ */
 export async function destroyTemplateClients(
   this: RequestHandler,
   templateName: string,
   instanceId: string,
   /**
-   * Whether to delete the clients' stored credentials too. False for a rebuild,
-   * which recreates the same clients and would otherwise force a needless
-   * re-authentication; true for a genuine removal.
+   * Whether this replica is the one removing the instance, which also decides
+   * whether fleet-wide state may be cleared. A peer hearing of the removal, or
+   * a startup finding the instance gone from the backend, passes false.
    */
   purgeCredentials = false
 ): Promise<void> {
+  const entry = `${templateName}::${instanceId}`;
   const names =
     this.templateClientMap.get(templateName)?.get(instanceId) ??
     new Set<string>();
-  for (const name of names) {
+  const clients = [...names].flatMap((name) => {
     const client = this.clients.get(name);
-    if (client) {
-      if (purgeCredentials) await client.purgeCredentials();
-      // `purgeCredentials` marks a genuine removal rather than a rebuild, which
-      // is also what decides whether fleet-wide state may be cleared. Either way
-      // this client is going away with no replacement, so its parked requests are
-      // failed with a reason instead of waiting out `cleanupTimeout`.
-      await client.destroy(purgeCredentials ? "finalRemoval" : "removal");
-      this.clients.delete(name);
-    }
+    return client ? [{ name, client }] : [];
+  });
+  for (const { client } of clients) retireCredentialWrites(client);
+  for (const { name, client } of clients) {
+    // Either way this client is going away with no replacement, so its parked
+    // requests are failed with a reason instead of waiting out `cleanupTimeout`.
+    await client.destroy(purgeCredentials ? "finalRemoval" : "removal");
+    this.clients.delete(name);
+  }
+
+  const purge =
+    purgeCredentials ||
+    (clients.length > 0 &&
+      !(await this.backend
+        .smembers(`${this.namespace}:templates`)
+        .then((entries) => entries.includes(entry))
+        .catch(() => true)));
+  if (purge) {
+    for (const { client } of clients) await client.purgeCredentials();
   }
 
   // A replica that never built these clients has nothing to enumerate, but the
@@ -589,18 +707,18 @@ export async function destroyTemplateClients(
   // which no purge can ever find the credentials again, and they sit in the
   // backend for their full TTL. Deriving the keys from the name means a removal
   // handled by a read-only replica still deletes what the tenant asked us to.
-  if (purgeCredentials && names.size === 0) {
+  if (purgeCredentials && clients.length === 0) {
     await purgeCredentialsByName
       .bind(this)(templateName, instanceId)
       .catch((error: unknown) => {
         this.logger.error(
           { error },
-          `Failed to purge credentials for ${templateName}::${instanceId} without a local client`
+          `Failed to purge credentials for ${entry} without a local client`
         );
       });
   }
   this.templateClientMap.get(templateName)?.delete(instanceId);
-  this.localTemplateClients.delete(`${templateName}::${instanceId}`);
+  this.localTemplateClients.delete(entry);
 }
 
 /** Where the client names for a template instance are recorded, for any replica to read. */

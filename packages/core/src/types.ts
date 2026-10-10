@@ -85,7 +85,13 @@ export type RateLimitPlan =
  * `CreateClientData.rateLimit` lists for an unusable limit, and
  * `unknown_rate_limit_option` for a `defaultRateLimitOption` that names no
  * plan. A chosen plan replaces whatever limits the builder declared on the
- * paths it covers; an operator's {@link RateLimitOverrides} apply on top.
+ * paths it covers, except where that would swap a client's own budgets for a
+ * `sharedLimit` or the reverse: so `""` covers every root client but a
+ * `sharedLimit` one. An operator's {@link RateLimitOverrides} apply on top.
+ *
+ * A stored option the template has since stopped declaring is logged as an
+ * error and the client built from its builder's own limits; see
+ * docs/writing-plugins.md#letting-callers-pick-a-plan.
  *
  * ```ts
  * await handler.registerClientTemplate("acme", builder, {

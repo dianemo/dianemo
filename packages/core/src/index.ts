@@ -18,6 +18,7 @@ import {
   decryptCredentials,
   templateClientNamesKey,
   assertTemplateOptions,
+  assertTemplateClientBuildable,
   normalizeTemplateClientOptions,
   serializeTemplateClientOptions,
   readTemplateClientOptions,
@@ -160,6 +161,21 @@ export type {
 } from "./types.js";
 
 /**
+ * At the boundary, so a bad identifier is rejected by the call that introduced
+ * it rather than later, from inside client generation.
+ */
+function assertInstanceSegments(credentials: unknown): void {
+  const { instanceId, organizationId } = credentials as {
+    instanceId: string;
+    organizationId?: string | null;
+  };
+  assertNameSegment(instanceId, "instanceId");
+  if (organizationId !== undefined && organizationId !== null) {
+    assertNameSegment(organizationId, "organizationId");
+  }
+}
+
+/**
  * The host for every outbound client in one process, and this process's seat
  * in the fleet that shares their budgets through `backend`.
  *
@@ -260,7 +276,11 @@ export default class RequestHandler {
    * docs/writing-plugins.md.
    *
    * Synchronous and safe at module scope: template registration is queued as a
-   * startup hook. Plugin names must be unique across every call.
+   * startup hook. Called after `start()`, it also registers the template at
+   * once — before returning, for a plugin that calls `registerClientTemplate`
+   * before its first `await` — and builds the template's stored tenants. A
+   * registration that fails then has no caller to reject, so it is logged as
+   * an error. Plugin names must be unique across every call.
    */
   public use<const P extends readonly RequestHandlerPlugin[]>(
     ...plugins: P
@@ -287,10 +307,46 @@ export default class RequestHandler {
         handler: this,
       };
       namespaces[plugin.name] = plugin.createRequests(ctx);
-      this.registerStartupHook(() => plugin.registerTemplate(this));
+      const hook = () => plugin.registerTemplate(this);
+      this.registerStartupHook(hook);
+      if (this.status !== "stopped") this.runLateStartupHook(plugin.name, hook);
     }
 
     return namespaces as MergedNamespaces<P>;
+  }
+
+  /**
+   * Runs a plugin's registration for a `use()` that came after `start()` began.
+   *
+   * Called synchronously, so a plugin whose `registerTemplate` reaches
+   * `registerClientTemplate` before its first `await` has its template in place
+   * when `use()` returns. During a start it waits for the start instead: the
+   * startup hooks may already have run, and a template registered before
+   * `started` would not build its stored tenants.
+   */
+  private runLateStartupHook(pluginName: string, hook: StartupHook): void {
+    const report = (error: unknown) => {
+      this.logger.error(
+        { error },
+        `Plugin "${pluginName}" failed to register its template after start()`
+      );
+    };
+    if (this.status === "started") {
+      try {
+        void Promise.resolve(hook(this)).catch(report);
+      } catch (error) {
+        report(error);
+      }
+      return;
+    }
+    // A start that fails leaves the hook queued for the next one.
+    void (this.startPromise ?? this.stopPromise ?? Promise.resolve())
+      .then(
+        () => this.status === "started",
+        () => false
+      )
+      .then((started) => (started ? hook(this) : undefined))
+      .catch(report);
   }
 
   /** Plugin names registered on this handler, in registration order. */
@@ -627,6 +683,7 @@ export default class RequestHandler {
    * template default, then the chosen plan, then overrides and any
    * `rateLimitChange` since — every name resolved. `name` is the registered
    * name, which for a `sharedLimit` client is its own rather than its owner's.
+   * The limits are copies: editing them changes no client.
    */
   public getLoadedClients(): Array<{
     name: string;
@@ -634,7 +691,7 @@ export default class RequestHandler {
   }> {
     return Array.from(this.clients.values()).map((c) => ({
       name: c.getName(),
-      rateLimit: c.getRateLimit(),
+      rateLimit: c.getRateLimit().map((limit) => ({ ...limit })),
     }));
   }
 
@@ -930,9 +987,12 @@ export default class RequestHandler {
    * `invalid_template_client_options` for an object mixing `rateLimitOption` or
    * `rateLimitOverrides` with path keys, the codes {@link RateLimitOverrides}
    * lists for an unusable override, and `invalid_client_name_segment` for an
-   * `instanceId` or `organizationId` that cannot be a name segment. After the
-   * write, `template_client_name_mismatch` from a builder whose client names
-   * omit the `instanceId`.
+   * `instanceId` or `organizationId` that cannot be a name segment,
+   * `template_client_name_mismatch` from a builder whose client names omit the
+   * `instanceId`, and anything else building the clients would throw — the
+   * codes `CreateClientData.rateLimit` lists, or the builder's own error. A
+   * re-add refused this way leaves the instance's existing clients running on
+   * what was stored before.
    * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
    */
   public async addTemplateClient<K extends keyof ClientTemplates>(
@@ -962,9 +1022,9 @@ export default class RequestHandler {
    * would leak it. Every replica calls this at startup and they converge without
    * pub/sub. Contrast {@link addTemplateClient}.
    *
-   * `options` is as {@link addTemplateClient} takes it, validated the same way
-   * and with the same `ConfigurationError` codes. An unregistered template is
-   * logged and skipped.
+   * `options` is as {@link addTemplateClient} takes it, and `instanceId` and
+   * `organizationId` are validated the same way, with the same
+   * `ConfigurationError` codes. An unregistered template is logged and skipped.
    *
    * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
    */
@@ -987,6 +1047,7 @@ export default class RequestHandler {
     );
     this.assertRateLimitOptionAllowed(templateName, settings.rateLimitOption);
     const { instanceId } = credentials as { instanceId: string };
+    assertInstanceSegments(credentials);
     this.localTemplateClients.add(`${templateName}::${instanceId}`);
     await buildAndRegisterTemplateClients.bind(this)(
       templateName,
@@ -1037,14 +1098,16 @@ export default class RequestHandler {
     this.assertRateLimitOptionAllowed(templateName, settings.rateLimitOption);
 
     const { instanceId } = credentials;
-    // At the boundary, so a bad identifier is rejected by the call that
-    // introduced it rather than later, from inside client generation.
-    assertNameSegment(instanceId, "instanceId");
-    const organizationId = (credentials as { organizationId?: string })
-      .organizationId;
-    if (organizationId !== undefined && organizationId !== null) {
-      assertNameSegment(organizationId, "organizationId");
-    }
+    assertInstanceSegments(credentials);
+    // Before the write, so credentials whose clients cannot be built are refused
+    // with nothing stored, and the running clients and every restart keep the
+    // record that works.
+    assertTemplateClientBuildable.bind(this)(
+      templateName,
+      instanceId,
+      credentials,
+      settings
+    );
     const entry = `${templateName}::${instanceId}`;
     const encrypted = encryptCredentials(credentials, this.key);
 

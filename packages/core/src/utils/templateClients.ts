@@ -70,13 +70,22 @@ export async function loadTemplateClientsFromBackend(
       continue;
     }
 
-    const settings = await readTemplateClientOptions.bind(this)(entry);
-    await buildAndRegisterTemplateClients.bind(this)(
-      templateName,
-      instanceId,
-      credentials,
-      settings
-    );
+    // Same reasoning as the decryption failure above: one tenant whose stored
+    // settings no longer build must not keep every other tenant offline.
+    try {
+      const settings = await readTemplateClientOptions.bind(this)(entry);
+      await buildAndRegisterTemplateClients.bind(this)(
+        templateName,
+        instanceId,
+        credentials,
+        settings
+      );
+    } catch (error) {
+      this.logger.error(
+        { error },
+        `Template client ${entry} could not be built from its stored settings; skipping it. Re-add it with addTemplateClient to replace them.`
+      );
+    }
   }
 
   for (const [templateName, instances] of this.templateClientMap) {
@@ -101,11 +110,30 @@ export async function readTemplateClientOptions(
   const raw = await this.backend.get(`${this.namespace}:overrides:${entry}`);
   if (!raw) return undefined;
   try {
-    return decodeTemplateClientOptions(JSON.parse(raw));
+    const settings = decodeTemplateClientOptions(JSON.parse(raw));
+    // Stored by 1.x, whose overrides were single limits rather than lists. Read
+    // as lists rather than refused, because refusing would make every tenant
+    // with an override unbuildable on the first start after the upgrade.
+    const overrides = settings.rateLimitOverrides;
+    if (overrides) {
+      for (const [path, value] of Object.entries(overrides)) {
+        if (isLimitObject(value)) overrides[path] = [value];
+      }
+    }
+    return settings;
   } catch {
     this.logger.warn(`Malformed template options JSON for ${entry}; ignoring`);
     return undefined;
   }
+}
+
+function isLimitObject(value: unknown): value is DeclaredRateLimit {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    typeof (value as { type?: unknown }).type === "string"
+  );
 }
 
 /**
@@ -129,12 +157,49 @@ function decodeTemplateClientOptions(parsed: unknown): TemplateClientOptions {
 /**
  * Accepts either shape at the call site too, so the argument that used to be a
  * bare overrides record still is one.
+ *
+ * Validated here, before anything is stored: a record that cannot be built from
+ * would otherwise be written first and refused only by the rebuild after it,
+ * leaving the tenant with no client and the backend holding the bad record for
+ * every restart to trip on.
  */
 export function normalizeTemplateClientOptions(
+  templateName: string,
   options?: TemplateClientOptions | RateLimitOverrides
 ): TemplateClientOptions {
   if (!options) return {};
-  return decodeTemplateClientOptions(options);
+  const settings = decodeTemplateClientOptions(options);
+  // Typed as a union whose overrides arm has an index signature, so TypeScript
+  // accepts `{ rateLimitOption, "": [...] }` and the path would be dropped here.
+  const extra =
+    settings === options
+      ? Object.keys(options).filter(
+          (key) => key !== "rateLimitOption" && key !== "rateLimitOverrides"
+        )
+      : [];
+  if (extra.length > 0) {
+    throw new ConfigurationError(
+      "invalid_template_client_options",
+      `Template "${templateName}" was given options mixing rateLimitOption or rateLimitOverrides with ${extra
+        .map((key) => `"${key}"`)
+        .join(", ")}. Put path overrides under rateLimitOverrides.`
+    );
+  }
+  for (const [path, value] of Object.entries(
+    settings.rateLimitOverrides ?? {}
+  )) {
+    const label = `${templateName} (override${path === "" ? "" : ` for path "${path}"`})`;
+    if (!Array.isArray(value)) {
+      throw new ConfigurationError(
+        "unknown_rate_limit_type",
+        `Client template ${label} gives a rate limit that is not a list. It takes a list, so wrap it: [${JSON.stringify(
+          value
+        )}].`
+      );
+    }
+    assertUsableRateLimits(normalizeRateLimit(value), label);
+  }
+  return settings;
 }
 
 /** The JSON to store, or `undefined` when there is nothing worth a key. */
@@ -166,19 +231,32 @@ export function assertTemplateOptions(
   const declared = options.rateLimitOptions;
   if (declared) {
     for (const [key, plan] of Object.entries(declared)) {
-      for (const [path, rateLimit] of Object.entries(planPaths(plan))) {
+      // Shape first: plans reach here from untyped plugin code too, and anything
+      // but a list or a map of lists fails inside normalisation as a TypeError
+      // naming neither the template nor the fix.
+      const paths =
+        isPathMap(plan) && !isLimitObject(plan)
+          ? Object.entries(plan)
+          : [["", plan]];
+      for (const [path, rateLimit] of paths as [string, unknown][]) {
+        const label = `${templateName} (option "${key}"${path === "" ? "" : `, path "${path}"`})`;
+        if (!Array.isArray(rateLimit)) {
+          throw new ConfigurationError(
+            "unknown_rate_limit_type",
+            `Client template ${label} gives a rate limit that is not a list. A plan is a list of limits, or an object mapping sub-client paths to lists: wrap it as [${JSON.stringify(
+              rateLimit ?? null
+            )}].`
+          );
+        }
         // Names resolved first, as `createClient` will: a plan whose two limits
         // both take the default is a duplicate, and the deploy should say so.
-        assertUsableRateLimits(
-          normalizeRateLimit(rateLimit),
-          `${templateName} (option "${key}"${path === "" ? "" : `, path "${path}"`})`
-        );
+        assertUsableRateLimits(normalizeRateLimit(rateLimit), label);
       }
     }
   }
   const fallback = options.defaultRateLimitOption;
   if (fallback === undefined) return;
-  if (declared && fallback in declared) return;
+  if (declared && Object.hasOwn(declared, fallback)) return;
   throw new ConfigurationError(
     "unknown_rate_limit_option",
     `Template "${templateName}" names "${fallback}" as its defaultRateLimitOption, which is not one of its rateLimitOptions${
@@ -335,15 +413,24 @@ function resolveTemplateContext(
 ): ClientTemplateContext {
   const chosen = settings?.rateLimitOption ?? options.defaultRateLimitOption;
   if (chosen === undefined) return {};
-  const plan = options.rateLimitOptions?.[chosen];
+  const declared = options.rateLimitOptions;
+  const plan =
+    declared && Object.hasOwn(declared, chosen) ? declared[chosen] : undefined;
   if (plan === undefined) {
     this.logger.warn(
       `Template "${templateName}" no longer declares a rateLimitOption "${chosen}"; building on the template default instead`
     );
     return {};
   }
-  const rateLimits = planPaths(plan);
-  return { rateLimit: rateLimits[""], rateLimits, rateLimitOption: chosen };
+  // A copy per build: the plan is shared by every tenant on it, and a builder
+  // tuning `ctx.rateLimit` for one tenant would otherwise retune it for all of
+  // them, past the validation registration gave it.
+  const rateLimits = structuredClone(planPaths(plan));
+  return {
+    rateLimit: ownEntry(rateLimits, ""),
+    rateLimits,
+    rateLimitOption: chosen,
+  };
 }
 
 /**
@@ -357,6 +444,19 @@ export function planPaths(
   plan: RateLimitPlan
 ): Record<string, DeclaredRateLimit[]> {
   return Array.isArray(plan) ? { "": plan } : plan;
+}
+
+function isPathMap(plan: unknown): plan is Record<string, unknown> {
+  return !!plan && typeof plan === "object" && !Array.isArray(plan);
+}
+
+/**
+ * A path's entry, read only from the map itself: paths are sub-client names, and
+ * a sub-client called `constructor` would otherwise be handed
+ * `Object.prototype.constructor` as its limits.
+ */
+function ownEntry<T>(map: Record<string, T>, path: string): T | undefined {
+  return Object.hasOwn(map, path) ? map[path] : undefined;
 }
 
 /**
@@ -379,7 +479,7 @@ function applyPlan(
 ): void {
   const applied = new Set<string>();
   const walk = (client: CreateClientData, path: string): void => {
-    const limit = rateLimits[path];
+    const limit = ownEntry(rateLimits, path);
     if (limit !== undefined) {
       client.rateLimit = limit;
       applied.add(path);
@@ -398,30 +498,41 @@ function applyPlan(
   }
 }
 
+/**
+ * `inherited` is the parent's effective limits: a sub-client declaring none
+ * takes its parent's, so that, not `noLimit`, is what an override replaces.
+ */
 function applyOverrides(
   this: RequestHandler,
   client: CreateClientData,
   overrides: RateLimitOverrides,
-  path: string
+  path: string,
+  inherited?: DeclaredRateLimit[]
 ): void {
-  const override = overrides[path];
+  const existing: DeclaredRateLimit[] = client.rateLimit ??
+    inherited ?? [{ type: "noLimit" }];
+  const override = ownEntry(overrides, path);
+  let effective = existing;
   if (override !== undefined) {
-    const existing: DeclaredRateLimit[] = client.rateLimit ?? [
-      { type: "noLimit" },
-    ];
     const mismatch = describeShapeMismatch(existing, override);
     if (mismatch) {
       this.logger.warn(
         `Rate-limit override for path "${path}" ${mismatch} — skipping override`
       );
     } else {
-      client.rateLimit = override;
+      // Named against what it replaces, as a `rateLimitChange` is: an override
+      // retuning a named limit without repeating its name keeps its budget.
+      effective = normalizeRateLimit(
+        override,
+        Array.isArray(existing) ? normalizeRateLimit(existing) : undefined
+      );
+      client.rateLimit = effective;
     }
   }
   if (client.subClients) {
     for (const sub of client.subClients) {
       const subPath = path === "" ? sub.name : `${path}:${sub.name}`;
-      applyOverrides.bind(this)(sub, overrides, subPath);
+      applyOverrides.bind(this)(sub, overrides, subPath, effective);
     }
   }
 }

@@ -341,6 +341,51 @@ describe("memory backend: a backend written to after close()", () => {
   });
 });
 
+describe("memory backend: a bucket slower than a day", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const WEEK_MS = 7 * 86_400_000;
+  const weekly = { maxTokens: 3, tokensToAdd: 3, interval: WEEK_MS };
+  const DAY_AND_A_BIT = 86_401_000;
+
+  it("does not hand a spent weekly budget back after a day of quiet", async () => {
+    const backend = memoryBackend();
+    for (let i = 0; i < 3; i++) {
+      expect((await backend.acquireTokens("mk:week", 1, weekly)).acquired).toBe(
+        true
+      );
+    }
+    vi.setSystemTime(Date.now() + DAY_AND_A_BIT);
+
+    expect((await backend.acquireTokens("mk:week", 1, weekly)).acquired).toBe(
+      false
+    );
+    await backend.close();
+  });
+
+  it("does not hand a spent weekly budget back when it is one of several limits", async () => {
+    const backend = memoryBackend();
+    const specs = [
+      {
+        kind: "tokenBucket" as const,
+        key: "mk:per_second",
+        config: { maxTokens: 10, tokensToAdd: 10, interval: 1000 },
+      },
+      { kind: "tokenBucket" as const, key: "mk:per_week", config: weekly },
+    ];
+    await backend.acquireMultiLimit!(specs, 3);
+    vi.setSystemTime(Date.now() + DAY_AND_A_BIT);
+
+    expect((await backend.acquireMultiLimit!(specs, 1)).acquired).toBe(false);
+    await backend.close();
+  });
+});
+
 // ------------------------------------------------------------ backend parity
 
 describe.each(harnesses(0))(

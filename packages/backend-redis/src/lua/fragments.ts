@@ -83,6 +83,23 @@ end`,
   );
 
 /**
+ * Declares `bucketTtl(ttl, maxTokens, tokensToAdd, interval)`, a bucket's key
+ * lifetime in seconds: `ttl`, or longer for a bucket that takes longer than that
+ * to refill from empty. An expired bucket reads as full, so a key outliving only
+ * part of the refill hands a spent per-week budget back after a day of quiet.
+ * Twin of the memory backend's `bucketTtl`.
+ *
+ * Requires: nothing. Declares `bucketTtl`. Call only with validated config.
+ */
+export const bucketTtlFn = (prefix = "  "): string =>
+  indent(
+    `local function bucketTtl(ttl, maxTokens, tokensToAdd, interval)
+  return math.max(ttl, math.ceil(math.ceil(maxTokens / tokensToAdd) * interval / 1000))
+end`,
+    prefix
+  );
+
+/**
  * Declares `usableConcurrency(max)`, the one test for a ceiling that can admit.
  *
  * Each of the three concurrency scripts refuses differently — two encode an `error`

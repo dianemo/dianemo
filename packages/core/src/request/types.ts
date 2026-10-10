@@ -65,6 +65,14 @@ export interface RequestMetadata {
   isThawRequest: boolean;
   /** Admitted without queueing; no queue entry exists for it. */
   fastPath?: boolean;
+  /**
+   * The budget keys this attempt claimed from, set by whoever claimed it.
+   * Release and refund act on these rather than on the keys the client's
+   * current limits name, which differ once an override or `rateLimitChange`
+   * has renamed or removed a limit while the request ran. Absent from a replica
+   * predating the field, where both fall back to the current limits.
+   */
+  claimedKeys?: string[];
   /** Whoever originated it. Orphan cleanup spares an entry whose owner is alive. */
   ownerId: string;
 }

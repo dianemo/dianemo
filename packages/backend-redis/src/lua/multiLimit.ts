@@ -1,4 +1,5 @@
 import {
+  bucketTtlFn,
   finiteNumberFn,
   lazyRefill,
   redisNow,
@@ -31,27 +32,30 @@ import {
  * intervals really did elapse. Slot reaping is likewise unconditional — an
  * expired slot is expired whoever asked.
  *
- * Requires: `KEYS`, `finiteNumber`, `usableConcurrency` and `usableCost`.
+ * Requires: `KEYS`, `finiteNumber`, `bucketTtl`, `usableConcurrency` and
+ * `usableCost`.
  * Declares `planMultiLimit`, `commitMultiLimit` and `persistRefills`.
  */
 const planFn = `
-local function planMultiLimit(specs, cost, now)
+local function planMultiLimit(specs, cost, now, ttl)
   local plan = { acquired = true, buckets = {}, slots = {} }
   for _, spec in ipairs(specs) do
     local key = KEYS[spec.k]
     if spec.kind == 'tokenBucket' then
-      local maxTokens = spec.maxTokens
-      local tokensToAdd = spec.tokensToAdd
-      local interval = spec.interval
+      -- tonumber: a non-finite value arrives as a string; see wire() in
+      -- ops/multiLimit.ts.
+      local maxTokens = tonumber(spec.maxTokens)
+      local tokensToAdd = tonumber(spec.tokensToAdd)
+      local interval = tonumber(spec.interval)
       -- The same four refusals the single-budget token bucket makes, in the same
       -- order, so one unusable entry is reported rather than metered.
-      if not (tokensToAdd > 0) then
+      if tokensToAdd == nil or not (tokensToAdd > 0) then
         return { acquired = false, error = 'tokensToAdd must be greater than 0' }
       end
-      if not (maxTokens > 0) or maxTokens == math.huge then
+      if maxTokens == nil or not (maxTokens > 0) or maxTokens == math.huge then
         return { acquired = false, error = 'maxTokens must be a finite number greater than 0' }
       end
-      if cost == nil or cost ~= cost or cost == math.huge then
+      if cost == nil or cost ~= cost or cost == math.huge or cost == -math.huge then
         return { acquired = false, error = 'cost must be a finite number' }
       end
       if interval == nil or interval ~= interval or interval == math.huge or interval == -math.huge then
@@ -63,7 +67,12 @@ local function planMultiLimit(specs, cost, now)
 
 ${lazyRefill("      ")}
 
-      table.insert(plan.buckets, { key = key, tokens = tokens, lastUpdate = lastUpdate })
+      table.insert(plan.buckets, {
+        key = key,
+        tokens = tokens,
+        lastUpdate = lastUpdate,
+        ttl = bucketTtl(ttl, maxTokens, tokensToAdd, interval),
+      })
       if tokens < cost then
         local intervalsNeeded = math.ceil((cost - tokens) / tokensToAdd)
         local wait = intervalsNeeded * interval - (now - lastUpdate)
@@ -77,8 +86,8 @@ ${lazyRefill("      ")}
         plan.acquired = false
       end
     else
-      local maxConcurrency = spec.maxConcurrency
-      local requestTtl = spec.requestTtl
+      local maxConcurrency = tonumber(spec.maxConcurrency)
+      local requestTtl = tonumber(spec.requestTtl)
       local requestId = spec.slotId
       if not usableConcurrency(maxConcurrency) then
         return { acquired = false, error = 'maxConcurrency must be a finite number greater than 0' }
@@ -106,7 +115,7 @@ end
 local function commitMultiLimit(plan, cost, now, ttl)
   for _, bucket in ipairs(plan.buckets) do
     redis.call('HSET', bucket.key, 'tokens', bucket.tokens - cost, 'lastUpdate', bucket.lastUpdate)
-    redis.call('EXPIRE', bucket.key, ttl)
+    redis.call('EXPIRE', bucket.key, bucket.ttl)
   end
   for _, slot in ipairs(plan.slots) do
     redis.call('ZADD', slot.key, now, slot.slotId)
@@ -116,10 +125,10 @@ local function commitMultiLimit(plan, cost, now, ttl)
   end
 end
 
-local function persistRefills(plan, ttl)
+local function persistRefills(plan)
   for _, bucket in ipairs(plan.buckets) do
     redis.call('HSET', bucket.key, 'tokens', bucket.tokens, 'lastUpdate', bucket.lastUpdate)
-    redis.call('EXPIRE', bucket.key, ttl)
+    redis.call('EXPIRE', bucket.key, bucket.ttl)
   end
 end
 `;
@@ -133,18 +142,20 @@ ${redisNow()}
 
 ${finiteNumberFn()}
 
+${bucketTtlFn()}
+
 ${usableConcurrencyFn()}
 
 ${usableCostFn()}
 
 ${planFn}
 
-  local plan = planMultiLimit(specs, cost, now)
+  local plan = planMultiLimit(specs, cost, now, ttl)
   if plan.error then
     return cjson.encode({ acquired = false, error = plan.error })
   end
   if not plan.acquired then
-    persistRefills(plan, ttl)
+    persistRefills(plan)
     return cjson.encode({ acquired = false, waitTime = plan.waitTime or 0, blockedBy = plan.blockedBy })
   end
   commitMultiLimit(plan, cost, now, ttl)
@@ -171,6 +182,8 @@ ${redisNow()}
 
 ${finiteNumberFn()}
 
+${bucketTtlFn()}
+
 ${usableConcurrencyFn()}
 
 ${usableCostFn()}
@@ -190,10 +203,10 @@ ${planFn}
     end
   end
 
-  local plan = planMultiLimit(specs, cost, now)
+  local plan = planMultiLimit(specs, cost, now, ttl)
   if plan.error then return 0 end
   if not plan.acquired then
-    persistRefills(plan, ttl)
+    persistRefills(plan)
     return 0
   end
   commitMultiLimit(plan, cost, now, ttl)
@@ -233,7 +246,7 @@ ${redisNow()}
         if raw ~= false then
           local tokens = tonumber(raw)
           if tokens == nil or tokens ~= tokens then tokens = 0 end
-          redis.call('HSET', key, 'tokens', math.min(spec.maxTokens, tokens + cost))
+          redis.call('HSET', key, 'tokens', math.min(tonumber(spec.maxTokens), tokens + cost))
         end
       end
     end

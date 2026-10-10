@@ -314,6 +314,7 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
       throw new RequestAbortedError(request.id);
     }
     request.fastPath = true;
+    request.claimedKeys = metadata.claimedKeys;
     request.setStatus("inProgress");
     return true;
   }
@@ -380,6 +381,7 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
       signal?.removeEventListener?.("abort", onAbort);
       this.unregisterWaitingRequest(request.id);
       request.isThawRequest = ready.isThawRequest;
+      request.claimedKeys = ready.claimedKeys;
       request.setStatus("inProgress");
       resolve(true);
     };

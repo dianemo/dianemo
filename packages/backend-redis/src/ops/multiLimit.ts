@@ -98,13 +98,23 @@ type SpecPayload = {
   kind: MultiLimitSpec["kind"];
   k: number;
   fk?: number;
-  maxTokens?: number;
-  tokensToAdd?: number;
-  interval?: number;
-  maxConcurrency?: number;
-  requestTtl?: number;
+  maxTokens?: number | string;
+  tokensToAdd?: number | string;
+  interval?: number | string;
+  maxConcurrency?: number | string;
+  requestTtl?: number | string;
   slotId?: string;
 };
+
+/**
+ * A number as JSON can carry it. JSON has no NaN or Infinity, so
+ * `JSON.stringify` writes `null`, which `cjson` decodes to userdata that every
+ * guard in the scripts lets past. As a string, Lua's `tonumber` reads it back
+ * through `strtod` and the guards see what the memory backend sees.
+ */
+function wire(value: number): number | string {
+  return Number.isFinite(value) ? value : String(value);
+}
 
 function encodeSpecs(
   specs: MultiLimitSpec[],
@@ -124,16 +134,16 @@ function encodeSpecs(
       return {
         ...base,
         ...fk,
-        maxTokens: spec.config.maxTokens,
-        tokensToAdd: spec.config.tokensToAdd,
-        interval: spec.config.interval,
+        maxTokens: wire(spec.config.maxTokens),
+        tokensToAdd: wire(spec.config.tokensToAdd),
+        interval: wire(spec.config.interval),
       };
     }
     return {
       ...base,
       ...fk,
-      maxConcurrency: spec.config.maxConcurrency,
-      requestTtl: spec.config.requestTtl,
+      maxConcurrency: wire(spec.config.maxConcurrency),
+      requestTtl: wire(spec.config.requestTtl),
       slotId: spec.slotId,
     };
   });

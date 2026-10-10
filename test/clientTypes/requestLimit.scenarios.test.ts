@@ -1475,6 +1475,7 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
   it("does not let a failed bucket reset escape as an unhandled rejection", async () => {
     const escaped: unknown[] = [];
     const record = (error: unknown) => escaped.push(error);
+    let injected = 0;
     process.on("unhandledRejection", record);
     try {
       upstream.code("/hiccup", 429);
@@ -1487,7 +1488,11 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
           // Only the bucket reset fails. What happens to the rest of the
           // freeze is the implementation's business; what must not happen is
           // a rejection nobody owns.
-          failHsetOn: (key) => key.endsWith(":rateLimit"),
+          failHsetOn: (key) => {
+            const hit = key.endsWith(":rateLimit:default");
+            if (hit) injected++;
+            return hit;
+          },
         },
         async (ctx) => {
           await sendCatching(ctx.handler, "/hiccup");
@@ -1497,6 +1502,9 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
     } finally {
       process.off("unhandledRejection", record);
     }
+    // Counted, so a change to the key layout cannot turn this into a test of
+    // nothing: the reset must actually have failed.
+    expect(injected).toBeGreaterThan(0);
     // One "backend unavailable (injected)" rejection with no handler, before
     // the fix — which under Node's default policy ends the process.
     expect(escaped).toHaveLength(0);

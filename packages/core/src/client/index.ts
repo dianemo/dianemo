@@ -367,8 +367,9 @@ abstract class BaseClient {
     const updatedData: ClientTypes.RateLimitUpdatedData = {
       clientName: this.name,
       // Normalised here rather than at each receiver, so every listener and every
-      // `handleRateLimitUpdated` sees the one shape.
-      rateLimit: normalizeRateLimit(data),
+      // `handleRateLimitUpdated` sees the one shape. Against the current limits,
+      // so an update that leaves a name out keeps that limit's budget.
+      rateLimit: normalizeRateLimit(data, this.rateLimit),
       source,
       publisherInstanceId: this.instanceId,
     };

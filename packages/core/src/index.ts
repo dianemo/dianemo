@@ -741,7 +741,14 @@ export default class RequestHandler {
     assertTemplateOptions(name as string, options);
     this.templates.set(name as string, {
       builder: builder as ClientTemplateBuilder<unknown>,
-      options,
+      // A copy of the plans, so a caller mutating its own object afterwards
+      // cannot change what was validated above.
+      options: {
+        ...options,
+        rateLimitOptions: options.rateLimitOptions
+          ? structuredClone(options.rateLimitOptions)
+          : undefined,
+      },
     });
 
     if (this.status !== "started") return;
@@ -753,11 +760,19 @@ export default class RequestHandler {
     for (const entry of myEntries) {
       // Through the rebuild path rather than reading the blob here, so a client
       // built by a late registration gets the same stored plan and overrides one
-      // built at startup does.
-      await this.rebuildTemplateClient(
-        name as string,
-        entry.slice(prefix.length)
-      );
+      // built at startup does. One that fails is logged and stepped over, as at
+      // startup, so it neither strands the tenants after it nor skips election.
+      try {
+        await this.rebuildTemplateClient(
+          name as string,
+          entry.slice(prefix.length)
+        );
+      } catch (error) {
+        this.logger.error(
+          { error },
+          `Template client ${entry} could not be rebuilt for the late registration of "${String(name)}"; skipping it`
+        );
+      }
     }
 
     if (myEntries.length > 0) {
@@ -819,7 +834,7 @@ export default class RequestHandler {
     await this.doAddTemplateClient(
       templateName,
       credentials,
-      normalizeTemplateClientOptions(options)
+      normalizeTemplateClientOptions(templateName as string, options)
     );
     await this.scheduleClientRoles();
   }
@@ -846,7 +861,10 @@ export default class RequestHandler {
       );
       return;
     }
-    const settings = normalizeTemplateClientOptions(options);
+    const settings = normalizeTemplateClientOptions(
+      templateName as string,
+      options
+    );
     this.assertRateLimitOptionAllowed(templateName, settings.rateLimitOption);
     const { instanceId } = credentials as { instanceId: string };
     this.localTemplateClients.add(`${templateName}::${instanceId}`);

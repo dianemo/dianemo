@@ -61,7 +61,7 @@ class MeteredClient extends BaseClient {
     super(data, data.client.name);
     assertUsableRateLimits(rateLimit, data.client.name);
     this.rateLimit = rateLimit;
-    assertBackendCanClaim(data, rateLimit, soleRateLimit(rateLimit));
+    assertBackendCanClaim(data.backend, data.client.name, rateLimit);
     const slotTtl = data.client.requestOptions?.concurrencySlotTtl;
     if (slotTtl && Number.isFinite(slotTtl) && slotTtl > 0) {
       this.requestTtl = slotTtl;
@@ -95,6 +95,10 @@ class MeteredClient extends BaseClient {
     if (limits.some((limit) => limit.type === "sharedLimit")) return;
     try {
       assertUsableRateLimits(limits, this.name);
+      // Checked here as in the constructor: one limit growing to several would
+      // otherwise reach a backend without the multi-limit methods only at claim
+      // time, where every pass throws and the queue waits out its timeouts.
+      assertBackendCanClaim(this.backend, this.name, limits);
     } catch (error) {
       this.logger.error(
         { error, rateLimit: data.rateLimit },
@@ -181,35 +185,39 @@ class MeteredClient extends BaseClient {
   protected async tryAdmitImmediately(
     request: RequestMetadata
   ): Promise<boolean> {
-    if (request.grantId) return false;
-    const cost = request.cost ?? 1;
-    const sole = this.sole;
-
     if (!this.metered) {
       // One atomic operation, not two reads: a peer enqueueing between a separate
       // "queue empty?" and "frozen?" would be overtaken by the arrival that read
       // first, which the backend contract forbids. A client with no budget does
       // still queue — a 5xx freezes it, and that backlog is still draining when
-      // this path reopens.
+      // this path reopens. Grant traffic included: with no budget to scope there
+      // is no turn for the grant scan to decide, only the grant's own freeze.
       return this.backend.tryAdmitNoLimit(
         this.getQueueKey(),
         this.getFreezeStateKey(request.grantId)
       );
     }
+    if (request.grantId) return false;
+    const cost = request.cost ?? 1;
+    const sole = this.sole;
 
     if (sole?.type === "requestLimit") {
+      const key = this.getBucketKey(sole.name);
+      request.claimedKeys = [key];
       return this.backend.tryAdmitImmediately(
         this.getQueueKey(),
-        this.getBucketKey(sole.name),
+        key,
         this.getFreezeStateKey(),
         cost,
         this.bucketConfig(sole)
       );
     }
     if (sole?.type === "concurrencyLimit") {
+      const key = this.getSlotKey(sole.name);
+      request.claimedKeys = [key];
       return this.backend.tryAdmitConcurrency(
         this.getQueueKey(),
-        this.getSlotKey(sole.name),
+        key,
         this.getFreezeStateKey(),
         cost,
         this.getSlotId(request),
@@ -219,11 +227,13 @@ class MeteredClient extends BaseClient {
 
     const tryAdmit = this.backend.tryAdmitMultiLimit;
     if (!tryAdmit) return false;
+    const specs = this.getLimitSpecs(undefined, this.getSlotId(request));
+    request.claimedKeys = specs.map((spec) => spec.key);
     return tryAdmit.call(
       this.backend,
       this.getQueueKey(),
       [this.getFreezeStateKey()],
-      this.getLimitSpecs(undefined, this.getSlotId(request)),
+      specs,
       cost
     );
   }
@@ -311,11 +321,9 @@ class MeteredClient extends BaseClient {
     const { grantId } = request;
 
     if (sole?.type === "requestLimit") {
-      return this.backend.acquireTokens(
-        this.getBucketKey(sole.name, grantId),
-        cost,
-        this.bucketConfig(sole)
-      );
+      const key = this.getBucketKey(sole.name, grantId);
+      request.claimedKeys = [key];
+      return this.backend.acquireTokens(key, cost, this.bucketConfig(sole));
     }
     if (sole?.type === "concurrencyLimit") {
       const config = {
@@ -323,6 +331,7 @@ class MeteredClient extends BaseClient {
         requestTtl: this.requestTtl,
       };
       const key = this.getSlotKey(sole.name, grantId);
+      request.claimedKeys = [key];
       const slotId = this.getSlotId(request);
       // Claims only while the entry is still `inProgress`, in one operation. The
       // request can finish between the drain loop selecting it and this claim, and
@@ -349,42 +358,84 @@ class MeteredClient extends BaseClient {
         `Client "${this.name}" declares several rate limits, which needs a backend implementing acquireMultiLimit.`
       );
     }
-    return acquire.call(
-      this.backend,
-      this.getLimitSpecs(grantId, this.getSlotId(request)),
-      cost
-    );
+    const specs = this.getLimitSpecs(grantId, this.getSlotId(request));
+    request.claimedKeys = specs.map((spec) => spec.key);
+    return acquire.call(this.backend, specs, cost);
   }
 
-  /** Hands back a claim, by the call matching the one that made it. */
+  /**
+   * Hands back a claim, by the call matching the one that made it.
+   *
+   * Only to the budgets the attempt claimed from: a limit renamed or added since
+   * would otherwise be refunded tokens it never gave out. A slot ledger the
+   * current limits no longer name is still released, and a bucket they no longer
+   * name keeps the spend — losing a token is the safe direction.
+   */
   private async releaseClaim(
     request: RequestMetadata,
     cost: number
   ): Promise<void> {
-    const sole = this.sole;
-    const { grantId } = request;
+    const slotId = this.getSlotId(request);
+    const specs = this.getLimitSpecs(request.grantId, slotId);
+    await this.releaseStaleSlots(request, specs, slotId);
+    const claimed = specs.filter((spec) => wasClaimed(request, spec.key));
+    if (claimed.length === 0) return;
 
+    const sole = this.sole;
     if (sole?.type === "requestLimit") {
       if (!this.backend.refundTokens) return;
       await this.backend.refundTokens(
-        this.getBucketKey(sole.name, grantId),
+        claimed[0].key,
         cost,
         sole.maxTokens,
-        this.getFreezeStateKey(grantId)
+        this.getFreezeStateKey(request.grantId)
       );
       return;
     }
     if (sole?.type === "concurrencyLimit") {
-      await this.backend.releaseConcurrency(
-        this.getSlotKey(sole.name, grantId),
-        this.getSlotId(request)
-      );
+      await this.backend.releaseConcurrency(claimed[0].key, slotId);
       return;
     }
+    // The backend refuses a refund while the bucket's freeze stands, because a
+    // freeze empties that bucket. Only one bucket here is emptied by a freeze
+    // (see `handleFreezeOwnTypeRequests`), so the others drop their freeze key
+    // and are refunded as any unsent request's would be.
+    const freezeEmpties = this.emptiedOnFreeze();
     await this.backend.releaseMultiLimit?.(
-      this.getLimitSpecs(grantId, this.getSlotId(request)),
+      claimed.map((spec) =>
+        spec.kind === "tokenBucket" && !freezeEmpties
+          ? { ...spec, freezeKey: undefined }
+          : spec
+      ),
       cost
     );
+  }
+
+  /** Whether a freeze empties this client's bucket; see the method below. */
+  private emptiedOnFreeze(): boolean {
+    return (
+      this.rateLimit.filter((limit) => limit.type === "requestLimit").length ===
+      1
+    );
+  }
+
+  /**
+   * Releases the slots this attempt holds in ledgers the client's current limits
+   * no longer name — what a rebuild or `rateLimitChange` that renamed or dropped
+   * a concurrency limit mid-flight leaves behind.
+   */
+  private async releaseStaleSlots(
+    request: RequestMetadata,
+    specs: MultiLimitSpec[],
+    slotId: string
+  ): Promise<void> {
+    if (!request.claimedKeys) return;
+    const current = new Set(specs.map((spec) => spec.key));
+    const concurrencyPrefix = `${this.getConcurrencyKey(request.grantId)}:`;
+    for (const key of request.claimedKeys) {
+      if (current.has(key) || !key.startsWith(concurrencyPrefix)) continue;
+      await this.backend.releaseConcurrency(key, slotId);
+    }
   }
 
   /**
@@ -423,9 +474,11 @@ class MeteredClient extends BaseClient {
    * a request that ran, which is what spending means.
    */
   protected async handleOwnTypeRequestDone(data: RequestDoneData) {
-    if (!this.rateLimit.some((limit) => limit.type === "concurrencyLimit")) {
-      return;
-    }
+    const concurrencyPrefix = `${this.getConcurrencyKey(data.grantId)}:`;
+    const heldSlots = data.claimedKeys
+      ? data.claimedKeys.some((key) => key.startsWith(concurrencyPrefix))
+      : this.rateLimit.some((limit) => limit.type === "concurrencyLimit");
+    if (!heldSlots) return;
     // A retry's payload is built after `incrementRetries`, so `data.retries` names
     // the next attempt while the slot being given back belongs to the one that
     // just ran. `retry` and the increment are biconditional, so the adjustment
@@ -441,9 +494,11 @@ class MeteredClient extends BaseClient {
         ? { ...data, retries: Math.max(0, data.retries - 1) }
         : data;
     const slotId = this.getSlotId(attempt);
-    for (const spec of this.getLimitSpecs(data.grantId, slotId)) {
-      if (spec.kind !== "concurrency") continue;
-      await this.backend.releaseConcurrency(spec.key, spec.slotId);
+    const specs = this.getLimitSpecs(data.grantId, slotId);
+    await this.releaseStaleSlots(data, specs, slotId);
+    for (const spec of specs) {
+      if (spec.kind !== "concurrency" || !wasClaimed(data, spec.key)) continue;
+      await this.backend.releaseConcurrency(spec.key, slotId);
     }
     this.logger.debug(
       `Request ${data.requestId} released concurrency slot for ${this.name}`
@@ -466,14 +521,17 @@ class MeteredClient extends BaseClient {
    * not say which limit was breached, and zeroing a per-day bucket over a
    * per-second breach would stand the client down until tomorrow — so the freeze
    * window is the whole stand-down there, floored at the shortest refill interval
-   * by `getFreezeBaseTime` below.
+   * by `getFreezeBaseTime` below. Counted among `requestLimit`s only: a `noLimit`
+   * placeholder or a concurrency cap beside one bucket leaves no doubt about it.
    */
   protected async handleFreezeOwnTypeRequests(grantId?: string): Promise<void> {
-    const sole = this.sole;
-    if (sole?.type !== "requestLimit") return;
+    if (!this.emptiedOnFreeze()) return;
+    const bucket = this.rateLimit.find(
+      (limit) => limit.type === "requestLimit"
+    )!;
     // Keyed by grant so an isolated grant's freeze empties its own bucket rather
     // than the client-level one.
-    await this.backend.hset(this.getBucketKey(sole.name, grantId), {
+    await this.backend.hset(this.getBucketKey(bucket.name, grantId), {
       tokens: 0,
       lastUpdate: await this.backend.now(),
     });
@@ -540,6 +598,11 @@ class MeteredClient extends BaseClient {
   private knownGrantIds = new Set<string>();
 }
 
+/** True unless the attempt recorded its claims and this key is not among them. */
+function wasClaimed(request: RequestMetadata, key: string): boolean {
+  return request.claimedKeys?.includes(key) ?? true;
+}
+
 /**
  * Refuses to build a client whose budgets the backend cannot claim atomically.
  *
@@ -551,16 +614,20 @@ class MeteredClient extends BaseClient {
  * budgets had already handed over.
  */
 function assertBackendCanClaim(
-  data: ClientConstructorData,
-  rateLimit: NamedRateLimitData[],
-  sole: NamedRateLimitData | undefined
+  backend: ClientConstructorData["backend"],
+  clientName: string,
+  rateLimit: NamedRateLimitData[]
 ): void {
-  if (sole) return;
-  const { backend } = data;
-  if (backend.acquireMultiLimit && backend.releaseMultiLimit) return;
+  if (soleRateLimit(rateLimit)) return;
+  const missing = (["acquireMultiLimit", "releaseMultiLimit"] as const).filter(
+    (method) => !backend[method]
+  );
+  if (missing.length === 0) return;
   throw new ConfigurationError(
     "backend_missing_multi_limit",
-    `Client "${data.client.name}" declares ${rateLimit.length} rate limits, which needs a backend implementing acquireMultiLimit and releaseMultiLimit. This backend implements neither, and claiming the budgets one at a time would leak the ones claimed before a decline.`
+    `Client "${clientName}" declares ${rateLimit.length} rate limits, which needs a backend implementing acquireMultiLimit and releaseMultiLimit. This backend lacks ${missing.join(
+      " and "
+    )}, and claiming the budgets one at a time would leak the ones claimed before a decline.`
   );
 }
 

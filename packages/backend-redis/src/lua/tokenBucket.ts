@@ -1,4 +1,5 @@
 import {
+  bucketTtlFn,
   finiteNumberFn,
   freezeGate,
   lazyRefill,
@@ -38,7 +39,7 @@ ${finiteNumberFn()}
   if not (maxTokens > 0) or maxTokens == math.huge then
     return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'maxTokens must be a finite number greater than 0' })
   end
-  if cost == nil or cost ~= cost or cost == math.huge then
+  if cost == nil or cost ~= cost or cost == math.huge or cost == -math.huge then
     return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'cost must be a finite number' })
   end
   -- Guarded even though the refill below tolerates it: waitTime is derived from
@@ -47,6 +48,9 @@ ${finiteNumberFn()}
   if interval == nil or interval ~= interval or interval == math.huge or interval == -math.huge then
     return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'interval must be a finite number' })
   end
+
+${bucketTtlFn()}
+  ttl = bucketTtl(ttl, maxTokens, tokensToAdd, interval)
 
   -- finiteNumber, not tonumber: a stored 'nan' passes a nil test, survives every
   -- comparison and math.min, and then fails in cjson.encode below — so one corrupt
@@ -139,8 +143,11 @@ ${redisNow()}
 ${finiteNumberFn()}
   if not (tokensToAdd > 0) then return 0 end
   if not (maxTokens > 0) or maxTokens == math.huge then return 0 end
-  if cost == nil or cost ~= cost or cost == math.huge then return 0 end
+  if cost == nil or cost ~= cost or cost == math.huge or cost == -math.huge then return 0 end
   if interval == nil or interval ~= interval or interval == math.huge or interval == -math.huge then return 0 end
+
+${bucketTtlFn()}
+  ttl = bucketTtl(ttl, maxTokens, tokensToAdd, interval)
 
 ${queueEmptyGate()}
 

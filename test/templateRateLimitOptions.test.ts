@@ -309,7 +309,9 @@ describe("what a template may declare", () => {
       register({
         rateLimitOptions: { pro: [{ ...FREE[0] }, { ...FREE[0] }] },
       })
-    ).rejects.toThrow(/two rate limits without a name/);
+    ).rejects.toThrow(
+      /two rate limits named "default", the name a limit without one takes/
+    );
   });
 
   it("accepts a plan that names its limits", async () => {
@@ -656,6 +658,261 @@ describe("operator overrides beside a plan", () => {
       expect(limitOf(rig.handler)).toEqual(withNames(FREE));
     } finally {
       await rig.stop();
+    }
+  });
+
+  it("keeps a named limit's name when an override leaves it out", async () => {
+    const PER_HOUR = [{ ...FREE[0], name: "per_hour", interval: 3_600_000 }];
+    const rig = await build({
+      rateLimitOptions: { hourly: PER_HOUR },
+      defaultRateLimitOption: "hourly",
+    });
+    try {
+      const { name: _name, ...unnamed } = PER_HOUR[0];
+      await rig.handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never,
+        { rateLimitOverrides: { "": [{ ...unnamed, maxTokens: 9 }] } }
+      );
+
+      expect(limitOf(rig.handler)).toEqual([{ ...PER_HOUR[0], maxTokens: 9 }]);
+    } finally {
+      await rig.stop();
+    }
+  });
+});
+
+describe("template settings that could not be built from", () => {
+  /** A second replica on `backend`, started cold, as a restart would be. */
+  async function restart(backend: ReturnType<typeof memoryBackend>) {
+    const errors: string[] = [];
+    const noop = () => {};
+    const handler = new RequestHandler({
+      key: KEY,
+      backend,
+      keyPrefix: "tro",
+      logger: {
+        debug: noop,
+        info: noop,
+        warn: noop,
+        error: (...args: unknown[]) => {
+          errors.push(args.map((a) => String(a)).join(" "));
+        },
+      } as never,
+    });
+    await handler.registerClientTemplate(
+      "acme" as never,
+      ((creds: { instanceId: string }, ctx: ClientTemplateContext) => [
+        {
+          name: `acme:_:${creds.instanceId}`,
+          rateLimit: ctx.rateLimit ?? FREE,
+        },
+      ]) as never
+    );
+    await handler.start();
+    return { handler, errors };
+  }
+
+  const loaded = (handler: RequestHandler) =>
+    handler.getLoadedClients().map((c) => c.name);
+
+  it("reads a 1.x override record, whose limits were single objects, as lists", async () => {
+    const rig = await build({}, FREE);
+    try {
+      await rig.handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never
+      );
+      await rig.backend.set(
+        "tro:requestHandler:overrides:acme::a",
+        JSON.stringify({ "": { ...FREE[0], maxTokens: 7 } })
+      );
+      await rig.handler.rebuildTemplateClient("acme", "a");
+
+      expect(limitOf(rig.handler)).toEqual(
+        withNames([{ ...FREE[0], maxTokens: 7 }])
+      );
+    } finally {
+      await rig.stop();
+    }
+  });
+
+  it("starts every other tenant when one tenant's stored settings cannot be built", async () => {
+    const rig = await build({}, FREE);
+    for (const instanceId of ["a", "b"]) {
+      await rig.handler.addTemplateClient(
+        "acme" as never,
+        { instanceId } as never
+      );
+    }
+    await rig.backend.set(
+      "tro:requestHandler:overrides:acme::a",
+      JSON.stringify({ "": [{ ...FREE[0], tokensToAdd: 0 }] })
+    );
+
+    const { handler, errors } = await restart(rig.backend);
+    try {
+      expect(loaded(handler)).toContain("acme:_:b");
+      expect(loaded(handler)).not.toContain("acme:_:a");
+      expect(errors.join("\n")).toContain("acme::a");
+    } finally {
+      await handler.stop();
+      await rig.stop();
+    }
+  });
+
+  it("refuses an override that could not be built, before storing it or touching the client", async () => {
+    const rig = await build({}, FREE);
+    try {
+      await rig.handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never
+      );
+
+      await expect(
+        rig.handler.addTemplateClient(
+          "acme" as never,
+          { instanceId: "a" } as never,
+          { rateLimitOverrides: { "": [{ ...FREE[0], tokensToAdd: 0 }] } }
+        )
+      ).rejects.toBeInstanceOf(ConfigurationError);
+
+      expect(
+        await rig.backend.get("tro:requestHandler:overrides:acme::a")
+      ).toBeNull();
+      expect(limitOf(rig.handler)).toEqual(withNames(FREE));
+    } finally {
+      await rig.stop();
+    }
+  });
+
+  it("refuses an override given as a single limit, and shows how to wrap it", async () => {
+    const rig = await build({}, FREE);
+    try {
+      await expect(
+        rig.handler.addTemplateClient(
+          "acme" as never,
+          { instanceId: "a" } as never,
+          { rateLimitOverrides: { "": FREE[0] as never } }
+        )
+      ).rejects.toThrow(/wrap it: \[/);
+    } finally {
+      await rig.stop();
+    }
+  });
+
+  it("refuses options that mix a plan choice with path overrides", async () => {
+    // TypeScript accepts this, through the overrides record's index signature,
+    // and the path would otherwise be dropped without a word.
+    const rig = await build({ rateLimitOptions: { free: FREE, pro: PRO } });
+    try {
+      await expect(
+        rig.handler.addTemplateClient(
+          "acme" as never,
+          { instanceId: "a" } as never,
+          { rateLimitOption: "pro", "": FREE } as never
+        )
+      ).rejects.toThrow(/under rateLimitOverrides/);
+    } finally {
+      await rig.stop();
+    }
+  });
+});
+
+describe("plans a template cannot be trusted with", () => {
+  it("refuses a plan written as a single limit, naming the template", async () => {
+    const handler = new RequestHandler({
+      key: KEY,
+      backend: memoryBackend(),
+      keyPrefix: "tro",
+    });
+    await expect(
+      handler.registerClientTemplate("acme" as never, (() => []) as never, {
+        rateLimitOptions: { free: FREE[0] as never },
+      })
+    ).rejects.toThrow(/acme \(option "free"\).*wrap it/);
+  });
+
+  it("refuses a default naming a property every object has", async () => {
+    const handler = new RequestHandler({
+      key: KEY,
+      backend: memoryBackend(),
+      keyPrefix: "tro",
+    });
+    await expect(
+      handler.registerClientTemplate("acme" as never, (() => []) as never, {
+        rateLimitOptions: { free: FREE },
+        defaultRateLimitOption: "toString",
+      })
+    ).rejects.toBeInstanceOf(ConfigurationError);
+  });
+
+  it("gives each tenant its own copy of the plan", async () => {
+    const backend = memoryBackend();
+    const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "tro" });
+    await handler.registerClientTemplate(
+      "acme" as never,
+      ((creds: { instanceId: string }, ctx: ClientTemplateContext) => {
+        // A builder tuning the plan for one tenant, as a quota from its
+        // credentials might.
+        if (creds.instanceId === "a") {
+          (ctx.rateLimit![0] as { maxTokens: number }).maxTokens = 1;
+        }
+        return [
+          { name: `acme:_:${creds.instanceId}`, rateLimit: ctx.rateLimit },
+        ];
+      }) as never,
+      { rateLimitOptions: { free: FREE }, defaultRateLimitOption: "free" }
+    );
+    await handler.start();
+    try {
+      for (const instanceId of ["a", "b"]) {
+        await handler.addTemplateClient(
+          "acme" as never,
+          { instanceId } as never
+        );
+      }
+      const of = (name: string) =>
+        handler.getLoadedClients().find((c) => c.name === name)?.rateLimit;
+
+      // Literals, not `FREE`: a leak would have mutated that constant too.
+      expect(of("acme:_:a")?.[0]).toMatchObject({ maxTokens: 1 });
+      expect(of("acme:_:b")?.[0]).toMatchObject({ maxTokens: 2 });
+      expect(FREE[0].maxTokens).toBe(2);
+    } finally {
+      await handler.stop();
+      await backend.close();
+    }
+  });
+
+  it("gives a sub-client named like an Object property only the limits it inherits", async () => {
+    const backend = memoryBackend();
+    const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "tro" });
+    await handler.registerClientTemplate(
+      "acme" as never,
+      ((creds: { instanceId: string }) => [
+        {
+          name: `acme:_:${creds.instanceId}`,
+          rateLimit: FREE,
+          subClients: [{ name: "constructor" }],
+        },
+      ]) as never
+    );
+    await handler.start();
+    try {
+      await handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never,
+        { rateLimitOverrides: { "": [{ ...FREE[0], maxTokens: 5 }] } }
+      );
+      const sub = handler
+        .getLoadedClients()
+        .find((c) => c.name === "acme:_:a:constructor");
+
+      expect(sub?.rateLimit).toEqual(withNames([{ ...FREE[0], maxTokens: 5 }]));
+    } finally {
+      await handler.stop();
+      await backend.close();
     }
   });
 });

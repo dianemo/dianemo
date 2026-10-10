@@ -104,6 +104,18 @@ function usableDeadline(raw: string): number | undefined {
 }
 
 /**
+ * A bucket key's lifetime in seconds: `ttlSeconds`, or longer for a bucket that
+ * takes longer than that to refill from empty. An expired bucket reads as full,
+ * so a key outliving only part of the refill hands a spent per-week budget back
+ * after a day of quiet. Twin of the Lua `bucketTtl` in `fragments.ts`.
+ */
+function bucketTtl(ttlSeconds: number, config: TokenBucketConfig): number {
+  const refill =
+    Math.ceil(config.maxTokens / config.tokensToAdd) * config.interval;
+  return Math.max(ttlSeconds, Math.ceil(refill / 1000));
+}
+
+/**
  * Why this budget cannot admit anything, or `undefined` if it can.
  *
  * Reported through `AcquireTokensResult.error` rather than thrown, so an unusable
@@ -471,16 +483,21 @@ class MemoryBackend implements DianemoBackend {
     return { tokens, lastUpdate };
   }
 
+  /**
+   * `config` sizes the key to outlive a refill from empty, as the Lua's
+   * `bucketTtl` does; omitted only for a bucket written full.
+   */
   private writeBucket(
     key: string,
     tokens: number,
     lastUpdate: number,
-    ttlSeconds: number
+    ttlSeconds: number,
+    config?: TokenBucketConfig
   ) {
     const hash = this.hash(key);
     hash.set("tokens", String(tokens));
     hash.set("lastUpdate", String(lastUpdate));
-    this.expire(key, ttlSeconds);
+    this.expire(key, config ? bucketTtl(ttlSeconds, config) : ttlSeconds);
   }
 
   async acquireTokens(
@@ -501,7 +518,7 @@ class MemoryBackend implements DianemoBackend {
     const { tokens, lastUpdate } = this.refill(key, config, now);
 
     if (tokens >= cost) {
-      this.writeBucket(key, tokens - cost, lastUpdate, 86400);
+      this.writeBucket(key, tokens - cost, lastUpdate, 86400, config);
       return { acquired: true, remainingTokens: tokens - cost };
     }
 
@@ -514,7 +531,7 @@ class MemoryBackend implements DianemoBackend {
       0,
       intervalsNeeded * config.interval - (now - lastUpdate)
     );
-    this.writeBucket(key, tokens, lastUpdate, 86400);
+    this.writeBucket(key, tokens, lastUpdate, 86400, config);
     return { acquired: false, waitTime, remainingTokens: tokens };
   }
 
@@ -565,10 +582,10 @@ class MemoryBackend implements DianemoBackend {
 
     const { tokens, lastUpdate } = this.refill(bucketKey, config, now);
     if (tokens < cost) {
-      this.writeBucket(bucketKey, tokens, lastUpdate, ttl);
+      this.writeBucket(bucketKey, tokens, lastUpdate, ttl, config);
       return false;
     }
-    this.writeBucket(bucketKey, tokens - cost, lastUpdate, ttl);
+    this.writeBucket(bucketKey, tokens - cost, lastUpdate, ttl, config);
     return true;
   }
 
@@ -601,7 +618,13 @@ class MemoryBackend implements DianemoBackend {
       // Refill progress is persisted even on refusal, as the single-budget path
       // does: the credit is real whether or not this request gets to spend it.
       for (const bucket of planned.buckets) {
-        this.writeBucket(bucket.key, bucket.tokens, bucket.lastUpdate, 86400);
+        this.writeBucket(
+          bucket.key,
+          bucket.tokens,
+          bucket.lastUpdate,
+          86400,
+          bucket.config
+        );
       }
       return {
         acquired: false,
@@ -614,7 +637,8 @@ class MemoryBackend implements DianemoBackend {
         bucket.key,
         bucket.tokens - cost,
         bucket.lastUpdate,
-        86400
+        86400,
+        bucket.config
       );
     }
     for (const slot of planned.slots) {
@@ -657,7 +681,13 @@ class MemoryBackend implements DianemoBackend {
     const planned = this.planMultiLimit(specs, cost, now);
     if (planned.error || !planned.acquired) {
       for (const bucket of planned.buckets) {
-        this.writeBucket(bucket.key, bucket.tokens, bucket.lastUpdate, ttl);
+        this.writeBucket(
+          bucket.key,
+          bucket.tokens,
+          bucket.lastUpdate,
+          ttl,
+          bucket.config
+        );
       }
       return false;
     }
@@ -666,7 +696,8 @@ class MemoryBackend implements DianemoBackend {
         bucket.key,
         bucket.tokens - cost,
         bucket.lastUpdate,
-        ttl
+        ttl,
+        bucket.config
       );
     }
     for (const slot of planned.slots) {
@@ -692,10 +723,20 @@ class MemoryBackend implements DianemoBackend {
     error?: string;
     waitTime?: number;
     blockedBy?: string;
-    buckets: { key: string; tokens: number; lastUpdate: number }[];
+    buckets: {
+      key: string;
+      tokens: number;
+      lastUpdate: number;
+      config: TokenBucketConfig;
+    }[];
     slots: { key: string; slotId: string }[];
   } {
-    const buckets: { key: string; tokens: number; lastUpdate: number }[] = [];
+    const buckets: {
+      key: string;
+      tokens: number;
+      lastUpdate: number;
+      config: TokenBucketConfig;
+    }[] = [];
     const slots: { key: string; slotId: string }[] = [];
     let acquired = true;
     let waitTime: number | undefined;
@@ -706,7 +747,12 @@ class MemoryBackend implements DianemoBackend {
         const error = unusableBudget(cost, spec.config);
         if (error) return { acquired: false, error, buckets, slots };
         const { tokens, lastUpdate } = this.refill(spec.key, spec.config, now);
-        buckets.push({ key: spec.key, tokens, lastUpdate });
+        buckets.push({
+          key: spec.key,
+          tokens,
+          lastUpdate,
+          config: spec.config,
+        });
         if (tokens >= cost) continue;
         const intervalsNeeded = Math.ceil(
           (cost - tokens) / spec.config.tokensToAdd

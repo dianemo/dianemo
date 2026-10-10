@@ -32,18 +32,37 @@ export const DEFAULT_RATE_LIMIT_NAME = "default";
 /**
  * A declared list with every name resolved.
  *
- * Called once, where the client is built, so nothing past that point deals in
- * anything but named limits. Names are filled before validation rather than
- * after: two limits that both took the default are a duplicate, and reporting
- * that is the whole reason the default is a real name and not a blank.
+ * Names are filled before validation rather than after: two limits that both
+ * took the default are a duplicate, and reporting that is the whole reason the
+ * default is a real name and not a blank.
+ *
+ * With `previous`, the list replacing it, an unnamed limit keeps the name of
+ * the one limit of its type there, provided nothing else here claims that name.
+ * A name is the budget's key, so taking the default instead would start a full
+ * bucket and forget what the old one had spent — and `() => [{ type, ...fromHeaders }]`
+ * is the natural way to write a `rateLimitChange` for a client with one limit.
  */
 export function normalizeRateLimit(
-  config: readonly DeclaredRateLimit[]
+  config: readonly DeclaredRateLimit[],
+  previous?: readonly NamedRateLimitData[]
 ): NamedRateLimitData[] {
+  const taken = new Set(config.flatMap((limit) => limit.name ?? []));
   return config.map((limit) => ({
     ...limit,
-    name: limit.name ?? DEFAULT_RATE_LIMIT_NAME,
+    name: limit.name ?? inheritedName(limit.type, previous, taken),
   })) as NamedRateLimitData[];
+}
+
+function inheritedName(
+  type: DeclaredRateLimit["type"],
+  previous: readonly NamedRateLimitData[] | undefined,
+  taken: Set<string>
+): string {
+  const sameType = previous?.filter((limit) => limit.type === type) ?? [];
+  const name = sameType.length === 1 ? sameType[0].name : undefined;
+  if (name === undefined || taken.has(name)) return DEFAULT_RATE_LIMIT_NAME;
+  taken.add(name);
+  return name;
 }
 
 /**
@@ -128,7 +147,7 @@ export function assertUsableRateLimits(
       throw new ConfigurationError(
         "invalid_rate_limit",
         limit.name === DEFAULT_RATE_LIMIT_NAME
-          ? `Client "${clientName}" declares two rate limits without a name, so both took "${DEFAULT_RATE_LIMIT_NAME}". A name keys the limit's budget, so give each of them one — "per_second" and "per_day", say.`
+          ? `Client "${clientName}" declares two rate limits named "${DEFAULT_RATE_LIMIT_NAME}", the name a limit without one takes. A name keys the limit's budget, so give each of them its own — "per_second" and "per_day", say.`
           : `Client "${clientName}" declares two rate limits named "${limit.name}". Names key the buckets, so duplicates would meter both limits against one balance.`
       );
     }

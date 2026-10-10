@@ -1,5 +1,4 @@
 import SharedLimitClient from "../client/clientTypes/sharedLimitClient.js";
-import { isSharedLimitOnly, normalizeRateLimit } from "./rateLimit.js";
 import { ClientConflictError, ConfigurationError } from "../errors.js";
 import MeteredClient from "../client/clientTypes/meteredClient.js";
 import type BaseClient from "../client/index.js";
@@ -9,6 +8,11 @@ import type {
   DeclaredRateLimit,
   SharedLimitClientOptions,
 } from "../client/types.js";
+import {
+  assertUsableRateLimits,
+  isSharedLimitOnly,
+  normalizeRateLimit,
+} from "./rateLimit.js";
 
 /**
  * Recursively collects all client names that a list of CreateClientData will produce,
@@ -249,6 +253,10 @@ export async function createClient(
 
   // Normalised once, here, so nothing past this point deals in an unnamed limit.
   const limits = normalizeRateLimit(rateLimit);
+  // Here as well as in `MeteredClient`, which a `sharedLimit` never reaches: its
+  // name and owner would otherwise go unchecked when built directly, though the
+  // same entry in a template plan is checked at registration.
+  assertUsableRateLimits(limits, data.name);
 
   if (!isSharedLimitOnly(limits)) {
     const client = new MeteredClient(baseData, limits);

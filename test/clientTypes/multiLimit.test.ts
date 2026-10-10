@@ -149,6 +149,37 @@ describe.each(harnesses(4))("multiLimit backend — $name", (harness) => {
     });
   });
 
+  it("reports a non-finite budget rather than metering against it", async () => {
+    // JSON has no NaN or Infinity, so a backend that ships the config as JSON
+    // has to carry them some other way for its guards to see them at all.
+    await withBackend(async (backend) => {
+      for (const config of [
+        { ...ample, interval: NaN },
+        { ...ample, interval: Infinity },
+        { ...ample, maxTokens: Infinity },
+      ]) {
+        const result = await backend.acquireMultiLimit!(
+          [
+            { kind: "tokenBucket", key: `${P}:nf`, config },
+            ...pair().slice(0, 1),
+          ],
+          1
+        );
+        expect(result.acquired).toBe(false);
+        expect(result.error).toBeDefined();
+      }
+    });
+  });
+
+  it("refuses a cost of negative infinity rather than crediting it", async () => {
+    await withBackend(async (backend) => {
+      const result = await backend.acquireMultiLimit!(pair(), -Infinity);
+
+      expect(result.acquired).toBe(false);
+      expect(result.error).toContain("cost");
+    });
+  });
+
   it("refuses the fast path while anything is queued or a freeze stands", async () => {
     await withBackend(async (backend) => {
       const queueKey = `${P}:queue`;
@@ -388,6 +419,58 @@ describe.each(harnesses(4))("multiLimit — $name", (harness) => {
       await new Promise<void>((r) => rejecting.close(() => r()));
     }
   }, 30_000);
+
+  it("empties its one bucket on a 429 when nothing else in the list is a bucket", async () => {
+    const rejecting = createServer((_req, res) => {
+      res.writeHead(429);
+      res.end("{}");
+    });
+    await new Promise<void>((r) => rejecting.listen(0, "127.0.0.1", () => r()));
+    const address = rejecting.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+
+    try {
+      await withHandler(
+        harness,
+        `http://127.0.0.1:${port}`,
+        [
+          {
+            name: "ml",
+            rateLimit: [perWindow, { name: "spare", type: "noLimit" }],
+            retryOptions: { maxRetries: 0 },
+          },
+        ],
+        async (handler, backend) => {
+          await handler
+            .handleRequest({
+              clientName: CLIENT,
+              requestName: "t.rejected",
+              method: "GET",
+              url: "/",
+            })
+            .catch(() => undefined);
+
+          // A `noLimit` placeholder leaves no doubt which bucket was wrong.
+          // Polled: the freeze is armed by the completion, after the caller
+          // already has its rejection.
+          await expect
+            .poll(
+              async () =>
+                (
+                  await backend.getTokenBucketState(
+                    `${NS}:rateLimit:per_window`,
+                    { maxTokens: 6, tokensToAdd: 6, interval: HOUR }
+                  )
+                ).tokens,
+              { timeout: 2000 }
+            )
+            .toBe(0);
+        }
+      );
+    } finally {
+      await new Promise<void>((r) => rejecting.close(() => r()));
+    }
+  }, 30_000);
 });
 
 // --------------------------------------------------------------- configuration
@@ -453,7 +536,7 @@ describe("multiLimit configuration", () => {
           maxTokens: 5,
         },
       ],
-      /two rate limits without a name/
+      /two rate limits named "default", the name a limit without one takes/
     );
   }, 30_000);
 

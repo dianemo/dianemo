@@ -111,6 +111,8 @@ export default class Request {
   public isThawRequest: boolean = false;
   /** Admitted without queueing, so there is no queue entry to clean up. */
   public fastPath: boolean = false;
+  /** See `RequestMetadata.claimedKeys`. */
+  public claimedKeys?: string[];
   /** Whether `requestDone` has already been emitted for an abandonment. */
   public abandonmentPublished: boolean = false;
 
@@ -171,6 +173,7 @@ export default class Request {
       grantId: this.config.grantId,
       isThawRequest: this.isThawRequest,
       fastPath: this.fastPath,
+      claimedKeys: this.claimedKeys,
       ownerId: this.ownerId,
     };
   }

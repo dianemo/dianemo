@@ -48,6 +48,21 @@ await handler.handleRequest({
 export can legitimately count as ten calls. `priority` exists so a backfill can
 be admitted behind interactive traffic instead of starving it.
 
+A number is charged to every limit the client declares. When the limits meter
+different things — an AI API limiting requests and tokens per minute — give an
+amount per limit instead, keyed by name:
+
+```ts
+cost: { rpm: 1, itpm: 1_200, otpm: 4_096 },
+```
+
+The object must name every `requestLimit` and `concurrencyLimit` the client
+declares and nothing else, or the request fails with
+`RequestCostMismatchError`. An entry may be `0` — an embeddings call spends no
+output tokens — but at least one must be positive. A single limit declared
+without a name is called `default`, and a `sharedLimit` client names its
+owner's limits, since those are the budgets it spends.
+
 `priority` feeds one packed sorted-set score: priority first, then retry count,
 then arrival time; `cost` is not part of it. A retried request sorts ahead of a
 fresh one at equal priority, so work already part-done finishes rather than

@@ -1,3 +1,5 @@
+import type { RequestCost } from "../request/types.js";
+
 /** A token bucket as the backend meters it: a `requestLimit` without its name. */
 export interface TokenBucketConfig {
   /** Bucket ceiling; a bucket with no stored state reads as this full. */
@@ -72,6 +74,13 @@ export type MultiLimitSpec = {
    * `releaseMultiLimit` withholds a refund while it stands.
    */
   freezeKey?: string;
+  /**
+   * What the request spends against this budget. Per budget, not per claim,
+   * because a request can charge each limit differently — one request against
+   * a per-minute request limit, a thousand tokens against a token limit. May be
+   * 0, which this budget then admits without spending.
+   */
+  cost: number;
 } & (
   | { kind: "tokenBucket"; key: string; config: TokenBucketConfig }
   | {
@@ -119,8 +128,11 @@ export interface QueuedRequest {
   status: "pending" | "inProgress";
   /** Higher served first. Part of the queue score, which clamps it to 0-10. */
   priority: number;
-  /** Budget spent on admission. Read back as 1 if zero or unparseable. */
-  cost: number;
+  /**
+   * Budget spent on admission: a number, or one amount per limit name. Stored
+   * through `formatStoredCost` and read back through `parseStoredCost`.
+   */
+  cost: RequestCost;
   /** Attempts already failed; more retries sort ahead. Part of the score. */
   retries: number;
   /** Arrival in epoch ms; earlier sorts ahead at equal priority and retries. */
@@ -145,7 +157,14 @@ export interface FreezeState {
 export interface QueueStats {
   pending: number;
   inProgress: number;
+  /** Summed over requests whose cost is a single number. */
   totalCost: number;
+  /**
+   * Summed per limit name over requests whose cost names its limits. Kept apart
+   * from `totalCost` because the backend does not know which limits a number
+   * applies to — the client does, and combines the two.
+   */
+  costByLimit: Record<string, number>;
 }
 
 /**
@@ -397,10 +416,7 @@ export interface DianemoBackend {
    * An unusable configuration is reported through `error` rather than thrown,
    * as {@link acquireTokens} does.
    */
-  acquireMultiLimit?(
-    specs: MultiLimitSpec[],
-    cost: number
-  ): Promise<AcquireMultiLimitResult>;
+  acquireMultiLimit?(specs: MultiLimitSpec[]): Promise<AcquireMultiLimitResult>;
   /**
    * Hands back what `acquireMultiLimit` claimed for a request that was never
    * dispatched. Token buckets are credited, up to each spec's
@@ -411,7 +427,7 @@ export interface DianemoBackend {
    * the bucket stands, matching {@link DianemoBackend.refundTokens}, as does a
    * cost that is negative or not finite. Slots are released regardless.
    */
-  releaseMultiLimit?(specs: MultiLimitSpec[], cost: number): Promise<void>;
+  releaseMultiLimit?(specs: MultiLimitSpec[]): Promise<void>;
   /**
    * The no-queue fast path for several budgets: admit only if nothing is queued,
    * none of `freezeKeys` stands or owes thaw probes, and every budget can be
@@ -423,7 +439,6 @@ export interface DianemoBackend {
     queueKey: string,
     freezeKeys: string[],
     specs: MultiLimitSpec[],
-    cost: number,
     ttl?: number
   ): Promise<boolean>;
 

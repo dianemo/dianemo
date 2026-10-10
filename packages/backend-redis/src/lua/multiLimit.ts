@@ -20,11 +20,11 @@ import {
  * `:costs` companion is derived inside the script, as every slot script derives
  * it — see docs/design-notes.md#the-redis-backend-requires-one-logical-keyspace.
  *
- * `ARGV[1]` is the cost, `ARGV[2]` the spec list as JSON and, in the two
- * acquiring scripts, `ARGV[3]` the key TTL in seconds (a bucket's is raised to
- * outlive its refill by `bucketTtl`). A spec is one object per budget, holding
- * the kind, the 1-based `KEYS` index it lives at, and the configuration to
- * meter it against; `tryAdmitMultiLimit` wraps the list as
+ * `ARGV[1]` carries the spec list as JSON and, in the two acquiring scripts,
+ * `ARGV[2]` the key TTL in seconds (a bucket's is raised to outlive its refill
+ * by `bucketTtl`). A spec is one object per budget, holding the kind, the
+ * 1-based `KEYS` index it lives at, what the request spends against it, and the
+ * configuration to meter it against; `tryAdmitMultiLimit` wraps the list as
  * `{ specs, freezeKeys }`. A positional ARGV per field would renumber every
  * slot whenever a budget was added — see `ttlArgvWarning` in `fragments.ts`.
  */
@@ -42,10 +42,12 @@ import {
  * Declares `planMultiLimit`, `commitMultiLimit` and `persistRefills`.
  */
 const planFn = `
-local function planMultiLimit(specs, cost, now, ttl)
+local function planMultiLimit(specs, now, ttl)
   local plan = { acquired = true, buckets = {}, slots = {} }
   for _, spec in ipairs(specs) do
     local key = KEYS[spec.k]
+    -- tonumber, as for the fields below: a non-finite value arrives as a string.
+    local cost = tonumber(spec.c)
     if spec.kind == 'tokenBucket' then
       -- tonumber: a non-finite value arrives as a string; see wire() in
       -- ops/multiLimit.ts.
@@ -76,6 +78,7 @@ ${lazyRefill("      ")}
         key = key,
         tokens = tokens,
         lastUpdate = lastUpdate,
+        cost = cost,
         ttl = bucketTtl(ttl, maxTokens, tokensToAdd, interval),
       })
       if tokens < cost then
@@ -113,21 +116,21 @@ ${slotAccounting("      ")}
         -- already claimed the report.
         if plan.blockedBy == nil then plan.blockedBy = key end
       else
-        table.insert(plan.slots, { key = key, slotId = requestId })
+        table.insert(plan.slots, { key = key, slotId = requestId, cost = cost })
       end
     end
   end
   return plan
 end
 
-local function commitMultiLimit(plan, cost, now, ttl)
+local function commitMultiLimit(plan, now, ttl)
   for _, bucket in ipairs(plan.buckets) do
-    redis.call('HSET', bucket.key, 'tokens', bucket.tokens - cost, 'lastUpdate', bucket.lastUpdate)
+    redis.call('HSET', bucket.key, 'tokens', bucket.tokens - bucket.cost, 'lastUpdate', bucket.lastUpdate)
     redis.call('EXPIRE', bucket.key, bucket.ttl)
   end
   for _, slot in ipairs(plan.slots) do
     redis.call('ZADD', slot.key, now, slot.slotId)
-    redis.call('HSET', slot.key .. ':costs', slot.slotId, cost)
+    redis.call('HSET', slot.key .. ':costs', slot.slotId, slot.cost)
     redis.call('EXPIRE', slot.key, ttl)
     redis.call('EXPIRE', slot.key .. ':costs', ttl)
   end
@@ -142,9 +145,8 @@ end
 `;
 
 export const acquireMultiLimit = `
-  local cost = tonumber(ARGV[1])
-  local specs = cjson.decode(ARGV[2])
-  local ttl = tonumber(ARGV[3]) or 86400
+  local specs = cjson.decode(ARGV[1])
+  local ttl = tonumber(ARGV[2]) or 86400
 
 ${redisNow()}
 
@@ -162,7 +164,7 @@ ${exactFn()}
 
 ${planFn}
 
-  local plan = planMultiLimit(specs, cost, now, ttl)
+  local plan = planMultiLimit(specs, now, ttl)
   if plan.error then
     return cjson.encode({ acquired = false, error = plan.error })
   end
@@ -170,7 +172,7 @@ ${planFn}
     persistRefills(plan)
     return cjson.encode({ acquired = false, waitTime = exact(plan.waitTime or 0), blockedBy = plan.blockedBy })
   end
-  commitMultiLimit(plan, cost, now, ttl)
+  commitMultiLimit(plan, now, ttl)
   return cjson.encode({ acquired = true })
 `;
 
@@ -178,16 +180,15 @@ ${planFn}
  * The no-queue fast path across several budgets.
  *
  * `KEYS[1]` is the queue; the freeze keys and the budgets follow, addressed by
- * the indices in `ARGV[2]`. Refusing while anything is queued and while any
+ * the indices in `ARGV[1]`. Refusing while anything is queued and while any
  * governing freeze stands are both part of the same atomic decision, for the
  * reason `tryAdmitImmediately` gives: answering them separately lets a peer
  * enqueue in between and be overtaken.
  */
 export const tryAdmitMultiLimit = `
   local queueKey = KEYS[1]
-  local cost = tonumber(ARGV[1])
-  local payload = cjson.decode(ARGV[2])
-  local ttl = tonumber(ARGV[3]) or 86400
+  local payload = cjson.decode(ARGV[1])
+  local ttl = tonumber(ARGV[2]) or 86400
   local specs = payload.specs
 
 ${redisNow()}
@@ -217,13 +218,13 @@ ${planFn}
     end
   end
 
-  local plan = planMultiLimit(specs, cost, now, ttl)
+  local plan = planMultiLimit(specs, now, ttl)
   if plan.error then return 0 end
   if not plan.acquired then
     persistRefills(plan)
     return 0
   end
-  commitMultiLimit(plan, cost, now, ttl)
+  commitMultiLimit(plan, now, ttl)
   return 1
 `;
 
@@ -235,8 +236,7 @@ ${planFn}
  * budget the freeze meant to withhold.
  */
 export const releaseMultiLimit = `
-  local cost = tonumber(ARGV[1])
-  local specs = cjson.decode(ARGV[2])
+  local specs = cjson.decode(ARGV[1])
 
 ${redisNow()}
 
@@ -244,14 +244,12 @@ ${finiteNumberFn()}
 
 ${usableCostFn()}
 
-  local creditable = usableCost(cost)
-
   for _, spec in ipairs(specs) do
     local key = KEYS[spec.k]
     if spec.kind == 'concurrency' then
       redis.call('ZREM', key, spec.slotId)
       redis.call('HDEL', key .. ':costs', spec.slotId)
-    elseif creditable then
+    elseif usableCost(tonumber(spec.c)) then
       local frozen = false
       if spec.fk ~= nil then
         -- The gate refundTokens applies, read identically.
@@ -264,7 +262,7 @@ ${usableCostFn()}
         local raw = redis.call('HGET', key, 'tokens')
         if raw ~= false then
           local tokens = finiteNumber(raw, 0)
-          redis.call('HSET', key, 'tokens', math.min(tonumber(spec.maxTokens), tokens + cost))
+          redis.call('HSET', key, 'tokens', math.min(tonumber(spec.maxTokens), tokens + tonumber(spec.c)))
         end
       end
     end

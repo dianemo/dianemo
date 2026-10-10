@@ -1,8 +1,11 @@
-import { RequestCostExceedsBudgetError } from "../../packages/core/src/errors.js";
 import { fireMany, harnesses, startUpstream, withHandler } from "./harness.js";
 import type { MultiLimitSpec } from "../../packages/core/src/backend/types.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createServer } from "node:http";
+import {
+  RequestCostExceedsBudgetError,
+  RequestCostMismatchError,
+} from "../../packages/core/src/errors.js";
 
 /**
  * Several rate limits on one client.
@@ -26,8 +29,8 @@ describe.each(harnesses(4))("multiLimit backend — $name", (harness) => {
   const scarce = { maxTokens: 1, tokensToAdd: 1, interval: HOUR };
 
   const pair = (): MultiLimitSpec[] => [
-    { kind: "tokenBucket", key: `${P}:ample`, config: ample },
-    { kind: "tokenBucket", key: `${P}:scarce`, config: scarce },
+    { kind: "tokenBucket", key: `${P}:ample`, cost: 1, config: ample },
+    { kind: "tokenBucket", key: `${P}:scarce`, cost: 1, config: scarce },
   ];
 
   const withBackend = async (
@@ -49,9 +52,9 @@ describe.each(harnesses(4))("multiLimit backend — $name", (harness) => {
       // by it, and must leave the ample budget exactly where the first left it.
       // A backend claiming in turn instead would show 8 here, and those two
       // tokens would never come back.
-      expect((await backend.acquireMultiLimit!(pair(), 1)).acquired).toBe(true);
+      expect((await backend.acquireMultiLimit!(pair())).acquired).toBe(true);
 
-      const declined = await backend.acquireMultiLimit!(pair(), 1);
+      const declined = await backend.acquireMultiLimit!(pair());
       expect(declined.acquired).toBe(false);
 
       const state = await backend.getTokenBucketState(`${P}:ample`, ample);
@@ -61,8 +64,8 @@ describe.each(harnesses(4))("multiLimit backend — $name", (harness) => {
 
   it("reports the longest wait any budget asks for", async () => {
     await withBackend(async (backend) => {
-      await backend.acquireMultiLimit!(pair(), 1);
-      const declined = await backend.acquireMultiLimit!(pair(), 1);
+      await backend.acquireMultiLimit!(pair());
+      const declined = await backend.acquireMultiLimit!(pair());
 
       // Waking on the ample budget's much sooner refill would only be refused by
       // the scarce one again, so the wait has to be the scarce one's.
@@ -74,22 +77,23 @@ describe.each(harnesses(4))("multiLimit backend — $name", (harness) => {
   it("claims a slot and a bucket together, and hands both back together", async () => {
     await withBackend(async (backend) => {
       const specs: MultiLimitSpec[] = [
-        { kind: "tokenBucket", key: `${P}:ample`, config: ample },
+        { kind: "tokenBucket", key: `${P}:ample`, cost: 1, config: ample },
         {
           kind: "concurrency",
           key: `${P}:slots`,
+          cost: 1,
           config: { maxConcurrency: 2, requestTtl: 120_000 },
           slotId: "req-1",
         },
       ];
 
-      expect((await backend.acquireMultiLimit!(specs, 1)).acquired).toBe(true);
+      expect((await backend.acquireMultiLimit!(specs)).acquired).toBe(true);
       expect(
         (await backend.getConcurrencyState(`${P}:slots`, 120_000))
           .currentConcurrency
       ).toBe(1);
 
-      await backend.releaseMultiLimit!(specs, 1);
+      await backend.releaseMultiLimit!(specs);
 
       expect(
         (await backend.getTokenBucketState(`${P}:ample`, ample)).tokens
@@ -104,19 +108,18 @@ describe.each(harnesses(4))("multiLimit backend — $name", (harness) => {
   it("refuses a full concurrency ledger without spending the bucket beside it", async () => {
     await withBackend(async (backend) => {
       const slot = (slotId: string): MultiLimitSpec[] => [
-        { kind: "tokenBucket", key: `${P}:ample`, config: ample },
+        { kind: "tokenBucket", key: `${P}:ample`, cost: 1, config: ample },
         {
           kind: "concurrency",
           key: `${P}:slots`,
+          cost: 1,
           config: { maxConcurrency: 1, requestTtl: 120_000 },
           slotId,
         },
       ];
 
-      expect((await backend.acquireMultiLimit!(slot("a"), 1)).acquired).toBe(
-        true
-      );
-      expect((await backend.acquireMultiLimit!(slot("b"), 1)).acquired).toBe(
+      expect((await backend.acquireMultiLimit!(slot("a"))).acquired).toBe(true);
+      expect((await backend.acquireMultiLimit!(slot("b"))).acquired).toBe(
         false
       );
 
@@ -128,17 +131,15 @@ describe.each(harnesses(4))("multiLimit backend — $name", (harness) => {
 
   it("reports an unusable budget rather than metering against it", async () => {
     await withBackend(async (backend) => {
-      const result = await backend.acquireMultiLimit!(
-        [
-          { kind: "tokenBucket", key: `${P}:ample`, config: ample },
-          {
-            kind: "tokenBucket",
-            key: `${P}:broken`,
-            config: { maxTokens: 5, tokensToAdd: 0, interval: 1000 },
-          },
-        ],
-        1
-      );
+      const result = await backend.acquireMultiLimit!([
+        { kind: "tokenBucket", key: `${P}:ample`, cost: 1, config: ample },
+        {
+          kind: "tokenBucket",
+          key: `${P}:broken`,
+          cost: 1,
+          config: { maxTokens: 5, tokensToAdd: 0, interval: 1000 },
+        },
+      ]);
 
       expect(result.acquired).toBe(false);
       expect(result.error).toContain("tokensToAdd");
@@ -158,13 +159,10 @@ describe.each(harnesses(4))("multiLimit backend — $name", (harness) => {
         { ...ample, interval: Infinity },
         { ...ample, maxTokens: Infinity },
       ]) {
-        const result = await backend.acquireMultiLimit!(
-          [
-            { kind: "tokenBucket", key: `${P}:nf`, config },
-            ...pair().slice(0, 1),
-          ],
-          1
-        );
+        const result = await backend.acquireMultiLimit!([
+          { kind: "tokenBucket", key: `${P}:nf`, cost: 1, config },
+          ...pair().slice(0, 1),
+        ]);
         expect(result.acquired).toBe(false);
         expect(result.error).toBeDefined();
       }
@@ -173,10 +171,82 @@ describe.each(harnesses(4))("multiLimit backend — $name", (harness) => {
 
   it("refuses a cost of negative infinity rather than crediting it", async () => {
     await withBackend(async (backend) => {
-      const result = await backend.acquireMultiLimit!(pair(), -Infinity);
+      const result = await backend.acquireMultiLimit!(
+        pair().map((spec) => ({ ...spec, cost: -Infinity }))
+      );
 
       expect(result.acquired).toBe(false);
       expect(result.error).toContain("cost");
+    });
+  });
+
+  it("charges each budget its own cost, and refunds each its own", async () => {
+    await withBackend(async (backend) => {
+      const tokens = { maxTokens: 1_000, tokensToAdd: 1_000, interval: HOUR };
+      const specs: MultiLimitSpec[] = [
+        { kind: "tokenBucket", key: `${P}:ample`, cost: 1, config: ample },
+        { kind: "tokenBucket", key: `${P}:tokens`, cost: 400, config: tokens },
+        {
+          kind: "concurrency",
+          key: `${P}:slots`,
+          cost: 2,
+          config: { maxConcurrency: 3, requestTtl: 120_000 },
+          slotId: "req-1",
+        },
+      ];
+
+      expect((await backend.acquireMultiLimit!(specs)).acquired).toBe(true);
+      expect(
+        (await backend.getTokenBucketState(`${P}:ample`, ample)).tokens
+      ).toBe(9);
+      expect(
+        (await backend.getTokenBucketState(`${P}:tokens`, tokens)).tokens
+      ).toBe(600);
+      expect(
+        (await backend.getConcurrencyState(`${P}:slots`, 120_000))
+          .currentConcurrency
+      ).toBe(2);
+
+      await backend.releaseMultiLimit!(specs);
+      expect(
+        (await backend.getTokenBucketState(`${P}:tokens`, tokens)).tokens
+      ).toBe(1_000);
+    });
+  });
+
+  it("declines on the budget whose own cost does not fit", async () => {
+    await withBackend(async (backend) => {
+      const tokens = { maxTokens: 1_000, tokensToAdd: 1_000, interval: HOUR };
+      const request = (cost: number): MultiLimitSpec[] => [
+        { kind: "tokenBucket", key: `${P}:ample`, cost: 1, config: ample },
+        { kind: "tokenBucket", key: `${P}:tokens`, cost, config: tokens },
+      ];
+
+      expect((await backend.acquireMultiLimit!(request(700))).acquired).toBe(
+        true
+      );
+      const declined = await backend.acquireMultiLimit!(request(700));
+      expect(declined.acquired).toBe(false);
+      expect(declined.blockedBy).toBe(`${P}:tokens`);
+      // The request budget had room for it, and spent nothing on the refusal.
+      expect(
+        (await backend.getTokenBucketState(`${P}:ample`, ample)).tokens
+      ).toBe(9);
+    });
+  });
+
+  it("admits a zero cost against a budget without spending it", async () => {
+    await withBackend(async (backend) => {
+      const specs: MultiLimitSpec[] = [
+        { kind: "tokenBucket", key: `${P}:ample`, cost: 1, config: ample },
+        { kind: "tokenBucket", key: `${P}:scarce`, cost: 0, config: scarce },
+      ];
+
+      expect((await backend.acquireMultiLimit!(specs)).acquired).toBe(true);
+      expect((await backend.acquireMultiLimit!(specs)).acquired).toBe(true);
+      expect(
+        (await backend.getTokenBucketState(`${P}:scarce`, scarce)).tokens
+      ).toBe(1);
     });
   });
 
@@ -186,12 +256,12 @@ describe.each(harnesses(4))("multiLimit backend — $name", (harness) => {
       const freezeKey = `${P}:freeze`;
 
       expect(
-        await backend.tryAdmitMultiLimit!(queueKey, [freezeKey], pair(), 1)
+        await backend.tryAdmitMultiLimit!(queueKey, [freezeKey], pair())
       ).toBe(true);
 
       await backend.setFreezeState(freezeKey, Date.now() + 60_000, 0);
       expect(
-        await backend.tryAdmitMultiLimit!(queueKey, [freezeKey], pair(), 1)
+        await backend.tryAdmitMultiLimit!(queueKey, [freezeKey], pair())
       ).toBe(false);
     });
   });
@@ -284,6 +354,98 @@ describe.each(harnesses(4))("multiLimit — $name", (harness) => {
           cost: 10,
         })
       ).rejects.toBeInstanceOf(RequestCostExceedsBudgetError);
+    });
+  }, 30_000);
+
+  it("spends a per-limit cost against each limit by name", async () => {
+    await run([perSecond, perWindow], async (handler, backend) => {
+      await handler.handleRequest({
+        clientName: CLIENT,
+        requestName: "t.weighted",
+        method: "GET",
+        url: "/",
+        cost: { per_second: 1, per_window: 4 },
+      });
+
+      const window = await backend.getTokenBucketState(
+        `${NS}:rateLimit:per_window`,
+        { maxTokens: 6, tokensToAdd: 6, interval: HOUR }
+      );
+      expect(window.tokens).toBe(2);
+    });
+  }, 30_000);
+
+  it("charges a zero entry nothing against its limit", async () => {
+    await run([perSecond, perWindow], async (handler, backend) => {
+      // Seven requests against a window of six: only possible because each one
+      // is free against it.
+      for (let i = 0; i < 7; i++) {
+        await handler.handleRequest({
+          clientName: CLIENT,
+          requestName: "t.free",
+          method: "GET",
+          url: "/",
+          cost: { per_second: 1, per_window: 0 },
+        });
+      }
+
+      const window = await backend.getTokenBucketState(
+        `${NS}:rateLimit:per_window`,
+        { maxTokens: 6, tokensToAdd: 6, interval: HOUR }
+      );
+      expect(window.tokens).toBe(6);
+    });
+  }, 30_000);
+
+  it("refuses a per-limit cost that omits a limit", async () => {
+    await run([perSecond, perWindow], async (handler) => {
+      const attempt = handler.handleRequest({
+        clientName: CLIENT,
+        requestName: "t.partial",
+        method: "GET",
+        url: "/",
+        cost: { per_second: 1 },
+      });
+      await expect(attempt).rejects.toBeInstanceOf(RequestCostMismatchError);
+      await expect(attempt).rejects.toThrow(/omits "per_window"/);
+    });
+  }, 30_000);
+
+  it("refuses a per-limit cost that names a limit the client does not declare", async () => {
+    await run([perSecond, perWindow], async (handler) => {
+      await expect(
+        handler.handleRequest({
+          clientName: CLIENT,
+          requestName: "t.stray",
+          method: "GET",
+          url: "/",
+          cost: { per_second: 1, per_window: 1, per_day: 1 },
+        })
+      ).rejects.toThrow(/names "per_day", which it does not declare/);
+    });
+  }, 30_000);
+
+  it("holds each per-limit amount to its own limit's ceiling", async () => {
+    await run([perSecond, perWindow], async (handler) => {
+      // Ten would breach `per_window` as a number. Here it is charged only to
+      // `per_second`, whose ceiling is twenty, so it is admitted.
+      await handler.handleRequest({
+        clientName: CLIENT,
+        requestName: "t.heavy_second",
+        method: "GET",
+        url: "/",
+        cost: { per_second: 10, per_window: 1 },
+      });
+
+      await expect(
+        handler.handleRequest({
+          clientName: CLIENT,
+          requestName: "t.heavy_window",
+          method: "GET",
+          url: "/",
+          cost: { per_second: 1, per_window: 7 },
+        })
+      ).rejects.toThrow(/of rate limit "per_window"/);
     });
   }, 30_000);
 

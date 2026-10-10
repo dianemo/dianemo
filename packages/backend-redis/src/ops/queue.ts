@@ -167,7 +167,15 @@ export function queueOps(ctx: Ctx) {
       );
 
       const stats = JSON.parse(result as string) as QueueStats;
-      return { ...stats, totalCost: parseLuaNumber(stats.totalCost) };
+      const costByLimit: Record<string, number> = {};
+      for (const [name, total] of Object.entries(stats.costByLimit ?? {})) {
+        costByLimit[name] = parseLuaNumber(total);
+      }
+      return {
+        ...stats,
+        totalCost: parseLuaNumber(stats.totalCost),
+        costByLimit,
+      };
     },
 
     async getAllRequests(

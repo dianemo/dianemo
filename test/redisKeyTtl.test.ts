@@ -138,17 +138,15 @@ describeIfRedis("redis key expiry", () => {
   });
 
   it("keeps a weekly bucket's key when it is one of several limits", async () => {
-    await backend.acquireMultiLimit!(
-      [
-        {
-          kind: "tokenBucket",
-          key: "kt:per_second",
-          config: { maxTokens: 10, tokensToAdd: 10, interval: 1000 },
-        },
-        { kind: "tokenBucket", key: "kt:per_week", config: weekly },
-      ],
-      1
-    );
+    await backend.acquireMultiLimit!([
+      {
+        kind: "tokenBucket",
+        key: "kt:per_second",
+        cost: 1,
+        config: { maxTokens: 10, tokensToAdd: 10, interval: 1000 },
+      },
+      { kind: "tokenBucket", key: "kt:per_week", cost: 1, config: weekly },
+    ]);
 
     await expectDayLongTtl("kt:per_second");
     await expectWeekLongTtl("kt:per_week");

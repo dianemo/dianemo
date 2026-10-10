@@ -4,15 +4,18 @@ import type BaseClient from "../index.js";
 import {
   ClientFrozenError,
   RequestCostExceedsBudgetError,
+  RequestCostMismatchError,
 } from "../../errors.js";
 
-/** A cost above the ceiling is not waiting for capacity — nothing will fit it. */
+/**
+ * A cost over a ceiling, or naming limits the client no longer declares, is not
+ * waiting for capacity — nothing will fit it.
+ */
 function isPermanentlyUnsatisfiable(
   client: BaseClient,
   request: RequestMetadata
 ): boolean {
-  const ceiling = client.getCostCeilingForQueue();
-  return ceiling !== undefined && (request.cost ?? 1) > ceiling;
+  return client.getCostProblemForQueue(request.cost ?? 1) !== undefined;
 }
 
 /**
@@ -24,24 +27,18 @@ function isPermanentlyUnsatisfiable(
 async function failUnsatisfiable(
   this: BaseClient,
   request: RequestMetadata,
-  known?: RequestCostExceedsBudgetError
+  known?: RequestCostExceedsBudgetError | RequestCostMismatchError
 ): Promise<void> {
   if (request.ownerId !== this.instanceId) return;
 
-  // Re-checked against the ceiling as it stands now: reaching here costs two
+  // Re-checked against the limits as they stand now: reaching here costs two
   // awaited backend calls, an ordinary window for a `rateLimitChange` to arrive,
   // and a ceiling that dips and recovers inside it must not turn a transient dip
   // into a permanent rejection.
-  if (!isPermanentlyUnsatisfiable(this, request)) return;
+  const current = this.getCostProblemForQueue(request.cost ?? 1);
+  if (!current) return;
 
-  const ceiling = this.getCostCeilingForQueue();
-  const error =
-    known ??
-    new RequestCostExceedsBudgetError(
-      this.name,
-      request.cost ?? 1,
-      ceiling ?? 0
-    );
+  const error = known ?? current;
   if (this.failWaitingRequest(request.requestId, error)) {
     await this.removeRequestFromQueue(request.requestId).catch(() => {});
   }
@@ -233,13 +230,16 @@ async function processRequests(this: BaseClient) {
       } catch (error) {
         await returnToQueue().catch(() => {});
 
-        // A ceiling lowered while this request sat in the queue makes its cost
-        // impossible. Stepping over it is what keeps everything behind it
-        // moving; breaking here would re-select the same head every pass and
-        // the client would never admit anything again.
-        if (error instanceof RequestCostExceedsBudgetError) {
+        // A ceiling lowered or a limit renamed while this request sat in the
+        // queue makes its cost impossible. Stepping over it is what keeps
+        // everything behind it moving; breaking here would re-select the same
+        // head every pass and the client would never admit anything again.
+        if (
+          error instanceof RequestCostExceedsBudgetError ||
+          error instanceof RequestCostMismatchError
+        ) {
           this.logger.warn(
-            `Client ${this.name} | request ${requestId} costs more than the current budget allows; failing it and moving on`
+            `Client ${this.name} | request ${requestId} has a cost the current limits cannot admit; failing it and moving on`
           );
           skippedRequestIds.add(requestId);
           await failUnsatisfiable.bind(this)(requestMetadata, error);

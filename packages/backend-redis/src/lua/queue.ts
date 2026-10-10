@@ -221,21 +221,36 @@ ${exactFn()}
   local pending = 0
   local inProgress = 0
   local totalCost = 0
+  local costByLimit = {}
 
   for i, requestId in ipairs(requestIds) do
     local metadataKey = metadataKeyPrefix .. ':' .. requestId
     local fields = redis.call('HMGET', metadataKey, 'status', 'cost')
     local status = fields[1]
-    -- finiteNumber: a stored 'nan' or '1e400' parses through tonumber and then
-    -- fails in cjson.encode below, which failed the stats read for every request
-    -- in the queue rather than the one corrupt entry.
-    local cost = finiteNumber(fields[2], 1)
+    local raw = fields[2]
 
     -- '~= ""' as well as the false test: HMGET yields false for an absent field,
     -- but an empty string is truthy in Lua and falsy in the memory twin's
     -- JavaScript, so a blank status counted its cost here and was skipped there.
     if status and status ~= '' then
-      totalCost = totalCost + cost
+      if type(raw) == 'string' and string.match(raw, '^%s*{') then
+        -- A per-limit cost, stored as JSON. pcall and the finite test, because
+        -- one corrupt entry must not fail the stats read for the whole queue.
+        local ok, decoded = pcall(cjson.decode, raw)
+        if ok and type(decoded) == 'table' then
+          for name, amount in pairs(decoded) do
+            if type(name) == 'string' and type(amount) == 'number'
+              and amount == amount and amount ~= math.huge and amount ~= -math.huge then
+              costByLimit[name] = (costByLimit[name] or 0) + amount
+            end
+          end
+        end
+      else
+        -- finiteNumber: a stored 'nan' or '1e400' parses through tonumber and
+        -- then fails in cjson.encode below, which failed the stats read for every
+        -- request in the queue rather than the one corrupt entry.
+        totalCost = totalCost + finiteNumber(raw, 1)
+      end
       if status == 'pending' then
         pending = pending + 1
       elseif status == 'inProgress' then
@@ -244,7 +259,11 @@ ${exactFn()}
     end
   end
 
-  return cjson.encode({ pending = pending, inProgress = inProgress, totalCost = exact(totalCost) })
+  -- Sent as exact strings like totalCost: a sum of finite entries can still
+  -- overflow to inf, which cjson refuses to encode.
+  local exactByLimit = {}
+  for name, total in pairs(costByLimit) do exactByLimit[name] = exact(total) end
+  return cjson.encode({ pending = pending, inProgress = inProgress, totalCost = exact(totalCost), costByLimit = exactByLimit })
 `;
 
 export const getAllRequests = `

@@ -6,6 +6,7 @@ import Request from "../../request/index.js";
 import type BaseClient from "../index.js";
 import type {
   RequestConfig,
+  RequestCost,
   RequestDoneData,
   RequestMetadata,
   RequestRetryData,
@@ -20,7 +21,6 @@ import {
 import {
   NoResponseError,
   RequestAbortedError,
-  RequestCostExceedsBudgetError,
   RequestTimeoutError,
 } from "../../errors.js";
 
@@ -43,33 +43,27 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
         "dianemo.client_name": this.name,
         "dianemo.request_name": config.requestName,
         "dianemo.priority": config.priority ?? 1,
-        "dianemo.cost": config.cost ?? 1,
+        ...costAttributes(config.cost ?? 1),
         ...(config.grantId ? { "dianemo.grant_id": config.grantId } : {}),
       },
     },
     async (span) => {
       await this.assertReadyToQueue();
-      // Constructed before the ceiling test, because its constructor validates the
-      // shape of `cost`, `priority` and `grantId`. Testing the ceiling first makes
-      // the error a caller sees depend on whether their malformed value also
-      // exceeded the budget, reporting `cost: Infinity` as "budget too small".
+      // Constructed before that test, because its constructor validates the shape
+      // of `cost`, `priority` and `grantId`. Testing the budget first makes the
+      // error a caller sees depend on whether their malformed value also exceeded
+      // it, reporting `cost: Infinity` as "budget too small".
       const request = new Request(
         this.name,
         config,
         this.instanceId,
         this.requestOptions
       );
-      // A cost above the ceiling can never be admitted, so reject it here — to
-      // the caller — rather than letting it occupy the queue until it times out
-      // on whichever replica happens to be the controller.
-      const ceiling = this.getCostCeiling();
-      if (ceiling !== undefined && (config.cost ?? 1) > ceiling) {
-        throw new RequestCostExceedsBudgetError(
-          this.name,
-          config.cost ?? 1,
-          ceiling
-        );
-      }
+      // A cost no wait could admit — over a ceiling, or naming the wrong
+      // limits — is refused to the caller rather than occupying the queue
+      // until it times out on whichever replica is the controller.
+      const costProblem = this.getCostProblem(config.cost ?? 1);
+      if (costProblem) throw costProblem;
       span.setAttribute("dianemo.request_id", request.id);
       this.logger.debug(`Request ID: ${request.id} | Waiting...`);
       // Counted for the shutdown drain, which otherwise cannot see a fast-path
@@ -679,3 +673,20 @@ function handleLogError(
 }
 
 export default handleRequest;
+
+/**
+ * Span attributes for a cost. A per-limit cost becomes one attribute per limit,
+ * since an attribute value cannot be an object.
+ */
+function costAttributes(cost: RequestCost): Record<string, number> {
+  // Taken before `Request` validates the cost, so anything unusable is recorded
+  // as it was passed and left for that validation to reject.
+  if (typeof cost !== "object" || cost === null) {
+    return { "dianemo.cost": cost };
+  }
+  const attributes: Record<string, number> = {};
+  for (const [name, amount] of Object.entries(cost)) {
+    if (typeof amount === "number") attributes[`dianemo.cost.${name}`] = amount;
+  }
+  return attributes;
+}

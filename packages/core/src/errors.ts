@@ -135,18 +135,63 @@ export class GrantRefreshTokenMissingError extends RequestHandlerError {
 }
 
 /**
- * A request declared a cost larger than the client's tightest ceiling — the
- * smallest `maxTokens` or `maxConcurrency` among its limits — so no amount of
- * waiting could ever admit it.
+ * A request declared a cost larger than a limit's ceiling — its `maxTokens` or
+ * `maxConcurrency` — so no amount of waiting could ever admit it.
  */
 export class RequestCostExceedsBudgetError extends RequestHandlerError {
-  constructor(clientName: string, cost: number, ceiling: number) {
+  constructor(
+    clientName: string,
+    cost: number,
+    ceiling: number,
+    /** The limit whose ceiling was exceeded, when the client declares several. */
+    limitName?: string
+  ) {
+    const limit =
+      limitName === undefined
+        ? "its smallest maxTokens or maxConcurrency"
+        : `the maxTokens or maxConcurrency of rate limit "${limitName}"`;
     super(
       400,
       "request_cost_exceeds_budget",
-      `Request cost (${cost}) exceeds the maximum client ${clientName} can ever admit (${ceiling}), its smallest maxTokens or maxConcurrency`
+      `Request cost (${cost}) exceeds the maximum client ${clientName} can ever admit (${ceiling}), ${limit}`
     );
   }
+}
+
+/**
+ * A request's per-limit cost does not name exactly the limits the client
+ * declares, so some budget would go unmetered or some amount would meter nothing.
+ *
+ * Raised where the request is made, and again when it is admitted: the client's
+ * limits can be renamed while the request waits in the queue.
+ */
+export class RequestCostMismatchError extends RequestHandlerError {
+  constructor(
+    clientName: string,
+    missing: readonly string[],
+    unknown: readonly string[],
+    declared: readonly string[]
+  ) {
+    const problems = [
+      missing.length ? `omits ${quoteList(missing)}` : "",
+      unknown.length
+        ? `names ${quoteList(unknown)}, which it does not declare`
+        : "",
+    ].filter(Boolean);
+    super(
+      400,
+      "request_cost_mismatch",
+      `Request cost for client ${clientName} ${problems.join(" and ")}. A per-limit cost must name every limit the client meters: ${
+        declared.length
+          ? quoteList(declared)
+          : "it meters none, so pass a number"
+      }.`
+    );
+  }
+}
+
+function quoteList(names: readonly string[]): string {
+  return names.map((name) => `"${name}"`).join(", ");
 }
 
 /**

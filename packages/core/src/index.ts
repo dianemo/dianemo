@@ -89,6 +89,7 @@ export {
   NotOAuth2ClientError,
   GrantRefreshTokenMissingError,
   RequestCostExceedsBudgetError,
+  RequestCostMismatchError,
   RequestAbortedError,
   RequestError,
   getOriginalStatus,
@@ -108,8 +109,10 @@ export {
   QUEUE_SCORE_EPOCH_MS,
 } from "./backend/queueScore.js";
 export {
+  formatStoredCost,
   parseFiniteStored,
   parsePriority,
+  parseStoredCost,
   parseStoredNumber,
 } from "./backend/parseStored.js";
 export {
@@ -147,7 +150,11 @@ export {
   type TryHandleRequestOptions,
 } from "./tryHandleRequest.js";
 
-export type { RequestConfig, RequestMetadata } from "./request/types.js";
+export type {
+  RequestConfig,
+  RequestCost,
+  RequestMetadata,
+} from "./request/types.js";
 export type {
   CreateClientData,
   RateLimitData,

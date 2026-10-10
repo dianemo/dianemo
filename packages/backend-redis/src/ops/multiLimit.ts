@@ -10,14 +10,12 @@ import type { Ctx } from "../context.js";
 export function multiLimitOps(ctx: Ctx) {
   return {
     async acquireMultiLimit(
-      specs: MultiLimitSpec[],
-      cost: number
+      specs: MultiLimitSpec[]
     ): Promise<AcquireMultiLimitResult> {
       const { keys, payload } = encodeSpecs(specs);
       const result = await ctx.runVariadic(
         "dianemoAcquireMultiLimit",
         keys,
-        cost,
         JSON.stringify(payload),
         86400
       );
@@ -28,16 +26,12 @@ export function multiLimitOps(ctx: Ctx) {
       return parsed;
     },
 
-    async releaseMultiLimit(
-      specs: MultiLimitSpec[],
-      cost: number
-    ): Promise<void> {
+    async releaseMultiLimit(specs: MultiLimitSpec[]): Promise<void> {
       if (specs.length === 0) return;
       const { keys, payload } = encodeSpecs(specs, { includeFreezeKeys: true });
       await ctx.runVariadic(
         "dianemoReleaseMultiLimit",
         keys,
-        cost,
         JSON.stringify(payload)
       );
     },
@@ -46,7 +40,6 @@ export function multiLimitOps(ctx: Ctx) {
       queueKey: string,
       freezeKeys: string[],
       specs: MultiLimitSpec[],
-      cost: number,
       ttl = 86400
     ): Promise<boolean> {
       // Normalised here rather than left to the script, which spends the budgets
@@ -59,7 +52,6 @@ export function multiLimitOps(ctx: Ctx) {
       const result = await ctx.runVariadic(
         "dianemoTryAdmitMultiLimit",
         index.keys,
-        cost,
         JSON.stringify({
           specs: encoded.payload,
           freezeKeys: freezeIndices,
@@ -102,6 +94,8 @@ class KeyIndex {
 type SpecPayload = {
   kind: MultiLimitSpec["kind"];
   k: number;
+  /** What the request spends against this budget. */
+  c: number | string;
   fk?: number;
   maxTokens?: number | string;
   tokensToAdd?: number | string;
@@ -127,7 +121,7 @@ function encodeSpecs(
 ): { keys: string[]; payload: SpecPayload[] } {
   const index = options.index ?? new KeyIndex();
   const payload = specs.map((spec): SpecPayload => {
-    const base = { kind: spec.kind, k: index.of(spec.key) };
+    const base = { kind: spec.kind, k: index.of(spec.key), c: wire(spec.cost) };
     // Only the release path consults them, so the admission scripts are not
     // handed keys they would never read — a key in `KEYS` is a key Redis Cluster
     // requires to hash to this slot.

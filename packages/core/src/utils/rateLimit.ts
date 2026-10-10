@@ -259,38 +259,6 @@ function describeEntry(entryName?: string): string {
 }
 
 /**
- * The largest `cost` a config could ever admit, or undefined when nothing in it
- * imposes a ceiling. Several limits mean the tightest one decides.
- *
- * `resolveShared` answers for a `sharedLimit` entry, whose ceiling belongs to the
- * client that owns the budget; it returns undefined when that client is gone,
- * which is reported by the queue path rather than here.
- */
-export function costCeilingFor(
-  config: readonly NamedRateLimitData[],
-  resolveShared?: (
-    clientName: string
-  ) => readonly NamedRateLimitData[] | undefined
-): number | undefined {
-  let ceiling: number | undefined;
-  const consider = (value: number | undefined) => {
-    if (value === undefined) return;
-    ceiling = ceiling === undefined ? value : Math.min(ceiling, value);
-  };
-  for (const limit of config) {
-    if (limit.type === "requestLimit") consider(limit.maxTokens);
-    else if (limit.type === "concurrencyLimit") consider(limit.maxConcurrency);
-    else if (limit.type === "sharedLimit") {
-      const owner = resolveShared?.(limit.clientName);
-      // Not recursed through another `sharedLimit`: registration refuses a
-      // budget owner that is itself shared, so one hop always reaches the owner.
-      if (owner) consider(costCeilingFor(owner));
-    }
-  }
-  return ceiling;
-}
-
-/**
  * The shortest refill interval in a config, which is how soon an emptied budget
  * can hand out anything at all.
  *

@@ -422,7 +422,12 @@ export interface ClientStatistics {
 
 export interface ClientRequestsStatistics {
   count: number;
-  cost: number;
+  /**
+   * Total cost against each limit the client meters, by limit name. A number
+   * cost counts against every one of them; a client that meters nothing has no
+   * entries.
+   */
+  cost: Record<string, number>;
   requests: RequestMetadata[];
 }
 

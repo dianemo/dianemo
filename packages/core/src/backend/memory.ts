@@ -1,7 +1,9 @@
 import { EventEmitter } from "node:events";
 import {
+  formatStoredCost,
   parseFiniteStored,
   parsePriority,
+  parseStoredCost,
   parseStoredNumber,
 } from "./parseStored.js";
 import {
@@ -32,6 +34,21 @@ import {
   REDIS_MAX_TTL_SECONDS,
   REQUEST_TOMBSTONE_TTL_SECONDS,
 } from "./ttl.js";
+
+/** A bucket's refilled balance, held until every budget in the claim admits. */
+interface PlannedBucket {
+  key: string;
+  tokens: number;
+  lastUpdate: number;
+  cost: number;
+  config: TokenBucketConfig;
+}
+
+interface PlannedSlot {
+  key: string;
+  slotId: string;
+  cost: number;
+}
 
 interface Entry {
   expiresAt?: number;
@@ -708,11 +725,10 @@ class MemoryBackend implements DianemoBackend {
    * would let another spender land in between.
    */
   async acquireMultiLimit(
-    specs: MultiLimitSpec[],
-    cost: number
+    specs: MultiLimitSpec[]
   ): Promise<AcquireMultiLimitResult> {
     const now = Date.now();
-    const planned = this.planMultiLimit(specs, cost, now);
+    const planned = this.planMultiLimit(specs, now);
     if (planned.error) return { acquired: false, error: planned.error };
     if (!planned.acquired) {
       // Refill progress is persisted even on refusal, as the single-budget path
@@ -735,28 +751,30 @@ class MemoryBackend implements DianemoBackend {
     for (const bucket of planned.buckets) {
       this.writeBucket(
         bucket.key,
-        bucket.tokens - cost,
+        bucket.tokens - bucket.cost,
         bucket.lastUpdate,
         86400,
         bucket.config
       );
     }
     for (const slot of planned.slots) {
-      this.claimSlot(slot.key, slot.slotId, cost, now, 86400);
+      this.claimSlot(slot.key, slot.slotId, slot.cost, now, 86400);
     }
     return { acquired: true };
   }
 
-  async releaseMultiLimit(
-    specs: MultiLimitSpec[],
-    cost: number
-  ): Promise<void> {
+  async releaseMultiLimit(specs: MultiLimitSpec[]): Promise<void> {
     for (const spec of specs) {
       if (spec.kind === "concurrency") {
         this.releaseSlot(spec.key, spec.slotId);
         continue;
       }
-      this.creditTokens(spec.key, cost, spec.config.maxTokens, spec.freezeKey);
+      this.creditTokens(
+        spec.key,
+        spec.cost,
+        spec.config.maxTokens,
+        spec.freezeKey
+      );
     }
   }
 
@@ -764,7 +782,6 @@ class MemoryBackend implements DianemoBackend {
     queueKey: string,
     freezeKeys: string[],
     specs: MultiLimitSpec[],
-    cost: number,
     ttl = 86400
   ): Promise<boolean> {
     // Before anything else, as the Redis twin reads it before its script runs.
@@ -775,7 +792,7 @@ class MemoryBackend implements DianemoBackend {
       if (this.freezeBlocksAdmission(freezeKey, now)) return false;
     }
 
-    const planned = this.planMultiLimit(specs, cost, now);
+    const planned = this.planMultiLimit(specs, now);
     if (planned.error) return false;
     if (!planned.acquired) {
       for (const bucket of planned.buckets) {
@@ -792,21 +809,21 @@ class MemoryBackend implements DianemoBackend {
     for (const bucket of planned.buckets) {
       this.writeBucket(
         bucket.key,
-        bucket.tokens - cost,
+        bucket.tokens - bucket.cost,
         bucket.lastUpdate,
         keyTtl,
         bucket.config
       );
     }
     for (const slot of planned.slots) {
-      this.claimSlot(slot.key, slot.slotId, cost, now, keyTtl);
+      this.claimSlot(slot.key, slot.slotId, slot.cost, now, keyTtl);
     }
     return true;
   }
 
   /**
    * The check phase both multi-budget paths share: refills every bucket, reaps
-   * every slot ledger, and reports whether all of them could take `cost`.
+   * every slot ledger, and reports whether each could take its spec's `cost`.
    *
    * Returns the refilled balances rather than writing them, so the caller
    * commits once it knows the whole set admitted. Reaping is a write and happens
@@ -814,33 +831,23 @@ class MemoryBackend implements DianemoBackend {
    */
   private planMultiLimit(
     specs: MultiLimitSpec[],
-    cost: number,
     now: number
   ): {
     acquired: boolean;
     error?: string;
     waitTime?: number;
     blockedBy?: string;
-    buckets: {
-      key: string;
-      tokens: number;
-      lastUpdate: number;
-      config: TokenBucketConfig;
-    }[];
-    slots: { key: string; slotId: string }[];
+    buckets: PlannedBucket[];
+    slots: PlannedSlot[];
   } {
-    const buckets: {
-      key: string;
-      tokens: number;
-      lastUpdate: number;
-      config: TokenBucketConfig;
-    }[] = [];
-    const slots: { key: string; slotId: string }[] = [];
+    const buckets: PlannedBucket[] = [];
+    const slots: PlannedSlot[] = [];
     let acquired = true;
     let waitTime: number | undefined;
     let blockedBy: string | undefined;
 
     for (const spec of specs) {
+      const { cost } = spec;
       if (spec.kind === "tokenBucket") {
         const error = unusableBudget(cost, spec.config);
         if (error) return { acquired: false, error, buckets, slots };
@@ -849,6 +856,7 @@ class MemoryBackend implements DianemoBackend {
           key: spec.key,
           tokens,
           lastUpdate,
+          cost,
           config: spec.config,
         });
         if (tokens >= cost) continue;
@@ -903,7 +911,7 @@ class MemoryBackend implements DianemoBackend {
         if (blockedBy === undefined) blockedBy = spec.key;
         continue;
       }
-      slots.push({ key: spec.key, slotId: spec.slotId });
+      slots.push({ key: spec.key, slotId: spec.slotId, cost });
     }
 
     return { acquired, waitTime, blockedBy, buckets, slots };
@@ -1129,7 +1137,7 @@ class MemoryBackend implements DianemoBackend {
       requestName: metadata.requestName,
       status: metadata.status as "pending" | "inProgress",
       priority: parsePriority(metadata.priority),
-      cost: parseFloat(metadata.cost) || 1,
+      cost: parseStoredCost(metadata.cost),
       retries: parseInt(metadata.retries, 10) || 0,
       timestamp: parseInt(metadata.timestamp, 10) || 0,
       grantId: metadata.grantId || undefined,
@@ -1172,7 +1180,7 @@ class MemoryBackend implements DianemoBackend {
     hash.set("requestName", request.requestName);
     hash.set("status", request.status);
     hash.set("priority", String(request.priority));
-    hash.set("cost", String(request.cost));
+    hash.set("cost", formatStoredCost(request.cost));
     hash.set("retries", String(request.retries));
     hash.set("timestamp", String(request.timestamp));
     hash.set("grantId", request.grantId || "");
@@ -1298,18 +1306,35 @@ class MemoryBackend implements DianemoBackend {
     let pending = 0;
     let inProgress = 0;
     let totalCost = 0;
+    const costByLimit: Record<string, number> = {};
     for (const requestId of this.sorted(queueKey)) {
       const metadataKey = `${metadataKeyPrefix}:${requestId}`;
       const status = this.hget(metadataKey, "status");
       if (!status) continue;
-      // The shared parse, not Number: `Number("")` is 0 and `Number("abc")` is
-      // NaN, and a single NaN here poisons totalCost for the whole queue while
-      // the Redis twin's `finiteNumber(..., 1)` reports 1 for both.
-      totalCost += parseFiniteStored(this.hget(metadataKey, "cost"), 1);
+      const raw = this.hget(metadataKey, "cost");
+      const perLimit = raw?.trimStart().startsWith("{")
+        ? parseStoredCost(raw)
+        : undefined;
+      if (perLimit !== undefined) {
+        // Finite numbers only, as the Lua twin keeps them: one corrupt entry
+        // must not poison the totals for every limit.
+        if (typeof perLimit !== "number") {
+          for (const [name, amount] of Object.entries(perLimit)) {
+            if (typeof amount !== "number" || !Number.isFinite(amount))
+              continue;
+            costByLimit[name] = (costByLimit[name] ?? 0) + amount;
+          }
+        }
+      } else {
+        // The shared parse, not Number: `Number("")` is 0 and `Number("abc")`
+        // is NaN, and a single NaN here poisons totalCost for the whole queue
+        // while the Redis twin's `finiteNumber(..., 1)` reports 1 for both.
+        totalCost += parseFiniteStored(raw, 1);
+      }
       if (status === "pending") pending++;
       else if (status === "inProgress") inProgress++;
     }
-    return { pending, inProgress, totalCost };
+    return { pending, inProgress, totalCost, costByLimit };
   }
 
   async getAllRequests(

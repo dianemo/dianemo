@@ -131,21 +131,23 @@ describe("memory backend: releasing several budgets", () => {
       {
         kind: "concurrency",
         key: "r:slots",
+        cost: 1,
         config: { maxConcurrency: 1, requestTtl: 60_000 },
         slotId,
       },
       {
         kind: "tokenBucket",
         key: "r:bucket",
+        cost: 1,
         config: { maxTokens: 1, tokensToAdd: 1, interval: 600_000 },
       },
     ];
-    expect(await backend.acquireMultiLimit!(specs("a"), 1)).toEqual({
+    expect(await backend.acquireMultiLimit!(specs("a"))).toEqual({
       acquired: true,
     });
     const [, claim] = await Promise.all([
-      backend.releaseMultiLimit!(specs("a"), 1),
-      backend.acquireMultiLimit!(specs("b"), 1),
+      backend.releaseMultiLimit!(specs("a")),
+      backend.acquireMultiLimit!(specs("b")),
     ]);
     expect(claim).toEqual({ acquired: true });
   });
@@ -406,18 +408,24 @@ describe("memory backend: a bucket slower than a day", () => {
 
   it("does not hand a spent weekly budget back when it is one of several limits", async () => {
     const backend = memoryBackend();
-    const specs = [
+    const specs = (cost: number) => [
       {
         kind: "tokenBucket" as const,
         key: "mk:per_second",
+        cost,
         config: { maxTokens: 10, tokensToAdd: 10, interval: 1000 },
       },
-      { kind: "tokenBucket" as const, key: "mk:per_week", config: weekly },
+      {
+        kind: "tokenBucket" as const,
+        key: "mk:per_week",
+        cost,
+        config: weekly,
+      },
     ];
-    await backend.acquireMultiLimit!(specs, 3);
+    await backend.acquireMultiLimit!(specs(3));
     vi.setSystemTime(Date.now() + DAY_AND_A_BIT);
 
-    expect((await backend.acquireMultiLimit!(specs, 1)).acquired).toBe(false);
+    expect((await backend.acquireMultiLimit!(specs(1))).acquired).toBe(false);
     await backend.close();
   });
 });

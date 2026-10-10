@@ -2,6 +2,17 @@ import type { AxiosRequestConfig, Method } from "axios";
 
 export type RequestStatus = "inQueue" | "inProgress";
 
+/**
+ * What a request spends: one amount charged to every limit the client declares,
+ * or an amount per limit, keyed by limit name.
+ *
+ * The keyed form must name every `requestLimit` and `concurrencyLimit` the client
+ * declares and nothing else. An entry may be 0 — an embeddings call that produces
+ * no output tokens — but at least one must be positive. A `sharedLimit` client
+ * names its owner's limits, since those are the budgets it spends.
+ */
+export type RequestCost = number | Readonly<Record<string, number>>;
+
 export interface RequestConfig<
   TRequestData = unknown,
 > extends AxiosRequestConfig<TRequestData> {
@@ -21,12 +32,14 @@ export interface RequestConfig<
   metadata?: Record<string, unknown>;
   /**
    * Budget this request spends, for vendors that do not price every endpoint the
-   * same. Fractional costs spend fractionally, and cost decides what a request
-   * spends rather than where it sits in the queue.
+   * same — or, keyed by limit name, a different amount against each limit, as for
+   * an API that meters requests and tokens separately. Fractional costs spend
+   * fractionally, and cost decides what a request spends rather than where it
+   * sits in the queue. See {@link RequestCost}.
    *
    * **Default value: 1**
    */
-  cost?: number;
+  cost?: RequestCost;
   /**
    * Set by the handler before any `requestInterceptor` runs, and unique per
    * `handleRequest` call: every retry of that call carries the same id. A value
@@ -54,13 +67,13 @@ export interface RequestMetadata {
   priority: number;
   timestamp: number;
   clientName: string;
-  cost: number;
+  cost: RequestCost;
   /**
    * `cost` as the call site actually set it, undefined when it did not — which is how
    * the metrics path tells a cost-budgeted endpoint from a count-budgeted one. The
    * rate limiter uses the post-default `cost` above.
    */
-  explicitCost?: number;
+  explicitCost?: RequestCost;
   requestName: string;
   retries: number;
   grantId?: string;

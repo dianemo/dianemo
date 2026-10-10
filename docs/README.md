@@ -54,5 +54,7 @@ own, see [writing a plugin](writing-plugins.md).
 ## Project
 
 - [Roadmap](roadmap.md) — what is planned, and why
+- [Proposal: usage-based limits](proposals/usage-based-limits.md) — per-limit
+  cost, settling against the response, and streaming
 - [Contributing](../CONTRIBUTING.md) — how to verify a change, and the bar for
   comments and docs

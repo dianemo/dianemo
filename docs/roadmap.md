@@ -7,6 +7,18 @@ Nothing here is required for the library as it stands. Dianemo has run in
 production since 2023 without any of it; these are the things that would make it
 serve more people, or serve them in more places.
 
+## Usage-based limits
+
+Some vendors meter what a request consumed rather than that it was made — AI
+APIs most visibly, which limit input and output tokens per minute alongside
+requests. The cost of such a request is not known until its response arrives,
+and for a streamed response not until the stream ends.
+
+Planned: a cost per limit rather than one for all of them, settled against what
+the response reports, carried through streamed responses, and respecting the
+vendor's `retry-after`. The design is in
+[the proposal](proposals/usage-based-limits.md).
+
 ## Aggregate metrics
 
 Dianemo emits OpenTelemetry traces today, which answer _what happened to this

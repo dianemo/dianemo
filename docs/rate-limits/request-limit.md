@@ -98,7 +98,8 @@ client-level bucket and freeze state, which would be the wrong pair of keys.
 If the upstream returns a hard rate-limit response, the client's bucket is reset
 to zero and the client freezes. Recovery is probed by exactly one request across
 the fleet. See [choosing a rate limit](README.md) for the shared machinery. A
-client declaring [several limits](multiple-limits.md) does not empty its buckets.
+client declaring [several `requestLimit`s](multiple-limits.md) does not empty its
+buckets.
 
 **Two durations, not one**, and this is the type where the difference shows. The
 freeze empties the bucket, so it is floored at `interval` — a freeze that lapsed

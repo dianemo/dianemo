@@ -390,9 +390,10 @@ Three consequences worth knowing before touching that code:
 
 A client declaring exactly one `requestLimit` zeroes its bucket on a 429: the
 response is proof that the bucket's picture of the vendor was wrong, and with one
-bucket that says which one.
+bucket that says which one. `noLimit` and `concurrencyLimit` entries beside it do
+not change that, since neither is a bucket.
 
-A client with several budgets does not, and the difference is deliberate. The
+A client with several `requestLimit`s does not, and the difference is deliberate. The
 response does not say which limit was breached, so zeroing every bucket would
 destroy a per-day quota over a per-second refusal. Zeroing only the shortest adds
 nothing the freeze does not already do, since the freeze is floored at that same

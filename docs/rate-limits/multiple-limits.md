@@ -55,6 +55,10 @@ list.
 > Stop the fleet, then start it on the new version. If you cannot, do the
 > rollout inside a window where a doubled rate is acceptable, and expect the
 > one-time burst above on top.
+>
+> Template overrides stored by 1.x need nothing: their single-limit values are
+> read back as one-entry lists. Overrides passed to `addTemplateClient` from now
+> on must be lists, and are refused before anything is stored if they are not.
 
 ## What may go in the list
 
@@ -120,10 +124,12 @@ spinning.
 
 ## Freeze does not empty the buckets
 
-A single [`requestLimit`](request-limit.md) client zeroes its bucket on a 429,
-because the response proves the bucket's picture of the vendor was wrong.
+A client with a single [`requestLimit`](request-limit.md) zeroes that bucket on
+a 429, because the response proves the bucket's picture of the vendor was wrong.
+Only `requestLimit`s are counted: a `noLimit` placeholder or a `concurrencyLimit`
+beside the one bucket leaves no doubt which bucket it was.
 
-A client with several budgets does not, and this is deliberate. The response does
+A client with several `requestLimit`s does not, and this is deliberate. The response does
 not say *which* limit was breached, and zeroing a per-day bucket over a
 per-second breach would stand the client down until tomorrow. The freeze window
 is the stand-down instead: floored at the **shortest** refill interval in the
@@ -190,8 +196,29 @@ update naming a `sharedLimit` is ignored: that would be a different kind of
 client, and a broadcast cannot change which kind a client is — the rebuild path
 is what swaps one for another.
 
+A limit returned without a name keeps the name of the one limit of its type it
+replaces, so `() => [{ type: "requestLimit", ...fromHeaders }]` retunes a client's
+`per_hour` budget rather than starting a fresh `default` one. Operator overrides
+are named the same way against the limits they replace.
+
 An update whose entries are unusable is refused and logged, keeping the last
-workable configuration rather than wedging the client.
+workable configuration rather than wedging the client. So is one the backend
+cannot claim atomically, such as one limit growing to several on a backend
+without the multi-limit methods.
+
+A request releases what it claimed, not what the client's limits say now, so a
+change that drops a concurrency limit mid-flight still frees the slot. **Renaming
+a limit starts a new budget**: the name is the key. For a `concurrencyLimit`, the
+requests already in flight under the old name do not count against the new one,
+so the cap can be exceeded until they finish. Keep the name when retuning a
+limit; rename only when a fresh budget is what you want.
+
+## Limits slower than a day
+
+A budget's key lives until the bucket could have refilled from empty — at least
+a day, longer for a per-week quota or one that tops up slowly. A key that expired
+sooner would read as a full bucket, handing a spent weekly budget back after a
+day without traffic.
 
 ## Stats
 

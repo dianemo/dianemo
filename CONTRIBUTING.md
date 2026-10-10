@@ -197,8 +197,9 @@ matching the `paths` the root `tsconfig.json` already gives tsc. Both resolvers 
 and `npm test` runs on a fresh clone before anything has been built.
 
 The alias is load-bearing rather than a convenience. The Redis backend's `ops/` layer imports
-`normalizeTtlSeconds`, `parseStoredNumber`, `parsePriority`, `calculateQueueScore` and
-`REQUEST_TOMBSTONE_TTL_SECONDS` from `@dianemo/core` by name. Without it those resolve through the
+`normalizeTtlSeconds`, `normalizeTombstoneTtl`, `parseStoredNumber`, `parseFiniteStored`,
+`parsePriority`, `calculateQueueScore`, `REQUEST_TOMBSTONE_TTL_SECONDS` and
+`REDIS_MAX_TTL_SECONDS` from `@dianemo/core` by name. Without it those resolve through the
 `node_modules/@dianemo/core` symlink onto `packages/core/dist`, which a fresh clone has not built —
 so every suite fails to collect — and a *stale* `dist` is worse, because the Redis half of a run
 then reads compiled core while the memory half reads the source you just edited. The two disagree

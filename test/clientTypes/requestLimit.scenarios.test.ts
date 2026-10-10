@@ -135,6 +135,8 @@ interface Ctx {
   /** Every `requestDone` this client published, in order. */
   completions: () => RequestDoneData[];
   bucket: (grantId?: string) => Promise<{ tokens: number }>;
+  /** Hands `cost` back to the bucket under its freeze, as an unsent claim is. */
+  refund: (cost: number) => Promise<void>;
   freeze: (grantId?: string) => Promise<{
     frozenUntil: number;
     thawRequestCount: number;
@@ -282,6 +284,13 @@ async function withClient(
         raw.getTokenBucketState(
           grantPath(grantId, "rateLimit:default"),
           config
+        ),
+      refund: (cost) =>
+        raw.refundTokens!(
+          grantPath(undefined, "rateLimit:default"),
+          cost,
+          config.maxTokens,
+          grantPath(undefined, "freezeState")
         ),
       freeze: (grantId) =>
         raw.getFreezeState(grantPath(grantId, "freezeState")),
@@ -1961,6 +1970,44 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
         // Only the failed request's own token is spent: the upstream was down,
         // which says nothing about how much budget is left.
         expect((await ctx.bucket()).tokens).toBe(4);
+      }
+    );
+  }, 30_000);
+
+  it("still refunds an unsent claim while a 5xx freeze stands", async () => {
+    upstream.onlyOnce("/refund.5xx", 503);
+    await run(
+      {
+        rateLimit: { interval: 60_000, tokensToAdd: 5, maxTokens: 5 },
+        client: { retryOptions: { maxRetries: 0, retryBackoffBaseTime: 20 } },
+      },
+      async (ctx) => {
+        await sendCatching(ctx.handler, "/refund.5xx");
+        expect(await waitFor(async () => !!(await ctx.freeze()), 2_000)).toBe(
+          true
+        );
+        // The 5xx left the bucket alone, so a token handed back under it is a
+        // token the budget really has.
+        await ctx.refund(1);
+        expect((await ctx.bucket()).tokens).toBe(5);
+      }
+    );
+  }, 30_000);
+
+  it("refuses to refund into a bucket a 429 freeze emptied", async () => {
+    upstream.onlyOnce("/refund.429", 429);
+    await run(
+      {
+        rateLimit: { interval: 60_000, tokensToAdd: 5, maxTokens: 5 },
+        client: { retryOptions: { maxRetries: 0, retryBackoffBaseTime: 20 } },
+      },
+      async (ctx) => {
+        await sendCatching(ctx.handler, "/refund.429");
+        expect(
+          await waitFor(async () => (await ctx.bucket()).tokens === 0, 2_000)
+        ).toBe(true);
+        await ctx.refund(1);
+        expect((await ctx.bucket()).tokens).toBe(0);
       }
     );
   }, 30_000);

@@ -1,5 +1,4 @@
 import type { QueueStats, QueuedRequest } from "@dianemo/core";
-import { MAX_TTL_SECONDS } from "../lua/fragments.js";
 import type { Ctx } from "../context.js";
 import {
   decodeFlatHash,
@@ -8,6 +7,7 @@ import {
 } from "../requestCodec.js";
 import {
   calculateQueueScore,
+  normalizeTombstoneTtl,
   normalizeTtlSeconds,
   REQUEST_TOMBSTONE_TTL_SECONDS,
 } from "@dianemo/core";
@@ -19,18 +19,6 @@ import {
  */
 function tombstoneKey(metadataKeyPrefix: string, requestId: string): string {
   return `${metadataKeyPrefix}:${requestId}:removed`;
-}
-
-/**
- * The lifetime the tombstone is written with, for any requested value: never a
- * throw, because the removal runs on every completion and `SET ... EX` rejects
- * a fraction, a zero, a negative and a non-finite value after the entry is
- * already deleted. Twin of `normalizeTombstoneTtl` in the core package's
- * `backend/ttl.ts`, which documents the default and the clamp.
- */
-function normalizeTombstoneTtl(requested: number): number {
-  if (!(requested > 0)) return REQUEST_TOMBSTONE_TTL_SECONDS;
-  return Math.min(Math.ceil(requested), MAX_TTL_SECONDS);
 }
 
 /** Request-queue operations. Twin of the memory backend's queue section. */

@@ -132,8 +132,9 @@ export interface CreateClientData<R extends RateLimitData = RateLimitData> {
   name: string;
   /**
    * Which client's credential entry this one uses. Set internally when a
-   * sub-client is merged onto its parent; a sub-client shares the parent's
-   * authentication, so it must not file its own tokens.
+   * sub-client is merged onto its parent and declares no `authentication` of its
+   * own, so it shares the parent's tokens; one that declares its own files them
+   * under its own name.
    *
    * Not for callers to set — `generateClients` derives it.
    */

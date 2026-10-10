@@ -1,16 +1,6 @@
 import type { AcquireTokensResult, TokenBucketConfig } from "@dianemo/core";
-import { normalizeTtlSeconds, parseStoredNumber } from "@dianemo/core";
+import { normalizeTtlSeconds, parseFiniteStored } from "@dianemo/core";
 import type { Ctx } from "../context.js";
-
-/**
- * A stored number as the acquire scripts' `finiteNumber` reads it: the shared
- * parse, with a non-finite value taken as the default too. The memory twin's is
- * `parseFiniteStored`.
- */
-function finiteStored(raw: string | null, fallback: number): number {
-  const parsed = parseStoredNumber(raw ?? undefined, fallback);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
 
 /** Token-bucket operations. Twin of the memory backend's token-bucket section. */
 export function tokenBucketOps(ctx: Ctx) {
@@ -92,8 +82,11 @@ export function tokenBucketOps(ctx: Ctx) {
 
       // The shared parse, not parseFloat: it keeps a fractional balance that
       // truncation would disagree with the memory twin about.
-      let currentTokens = finiteStored(tokens, config.maxTokens);
-      let currentLastUpdate = finiteStored(lastUpdate, now);
+      let currentTokens = parseFiniteStored(
+        tokens ?? undefined,
+        config.maxTokens
+      );
+      let currentLastUpdate = parseFiniteStored(lastUpdate ?? undefined, now);
 
       const elapsed = now - currentLastUpdate;
       if (elapsed > 0 && config.interval > 0) {

@@ -1,6 +1,4 @@
-import { MAX_TTL_SECONDS } from "../packages/backend-redis/src/lua/fragments.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { REDIS_MAX_TTL_SECONDS } from "../packages/core/src/backend/ttl.js";
 import { harnesses as clientTypeHarnesses } from "./clientTypes/harness.js";
 import { memoryBackend } from "../packages/core/src/backend/memory.js";
 import { redisBackend } from "../packages/backend-redis/src/index.js";
@@ -2510,8 +2508,4 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       expect(await tokens()).toBe("9");
     });
   });
-});
-
-it("holds the Redis backend's ttl ceiling equal to the memory backend's", () => {
-  expect(MAX_TTL_SECONDS).toBe(REDIS_MAX_TTL_SECONDS);
 });

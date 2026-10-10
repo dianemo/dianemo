@@ -1,6 +1,7 @@
 import type { RequestDoneData, RequestMetadata } from "../request/types.js";
 import { ClientUnavailableError, NotOAuth2ClientError } from "../errors.js";
 import { costCeilingFor, normalizeRateLimit } from "../utils/rateLimit.js";
+import { isCredentialWriteRetired } from "./methods/authenticate.js";
 import { REQUEST_TOMBSTONE_TTL_SECONDS } from "../backend/ttl.js";
 import processRequests from "./methods/processRequests.js";
 import type { QueuedRequest } from "../backend/types.js";
@@ -296,6 +297,15 @@ abstract class BaseClient {
   }
   protected abstract handleDestroy(finalRemoval: boolean): Promise<void> | void;
 
+  /**
+   * Whether a freeze of this kind empties a bucket here, recorded on the freeze
+   * so the backends refuse a refund under it only when there is a balance to
+   * protect. Nothing here owns a bucket.
+   */
+  protected freezeEmptiesBucket(_isRateLimited: boolean): boolean {
+    return false;
+  }
+
   // ------------------------------------------------------- key helpers
 
   /** Grant-isolated clients meter each grant against its own bucket. */
@@ -545,7 +555,7 @@ abstract class BaseClient {
 
   /** Records a grant id so removal can find its credentials later. */
   public async trackGrantId(grantId: string): Promise<void> {
-    if (!grantId) return;
+    if (!grantId || isCredentialWriteRetired(this)) return;
     const key = `${this.authNamespace}:grants`;
     await this.backend.sadd(key, grantId);
     // The index outlives the hashes it points at, so without a TTL it is the one
@@ -1304,7 +1314,8 @@ abstract class BaseClient {
     const state = await this.backend.armFreeze(
       this.getFreezeStateKey(data.grantId),
       requestedUntil,
-      thawCount
+      thawCount,
+      { emptiesBucket: this.freezeEmptiesBucket(data.isRateLimited) }
     );
     const frozenUntil = state.frozenUntil;
 
@@ -1449,7 +1460,8 @@ abstract class BaseClient {
     return this.backend.hasThawRequestInProgress(
       this.getQueueKey(),
       this.getMetadataKeyPrefix(),
-      grantId
+      grantId,
+      { anyGrant: !this.usesGrantIsolation() }
     );
   }
 
@@ -1466,31 +1478,16 @@ abstract class BaseClient {
     grantId: string | undefined,
     requestId: string
   ): Promise<"started" | "exists"> {
-    let probeGrant = grantId;
-    if (!this.usesGrantIsolation()) {
-      // Every grant shares the one freeze here, but the backend matches a probe
-      // by the entry's own `grantId`, so a grant-scoped probe is invisible to the
-      // atomic claim below. This scan covers it within one controller; two
-      // controllers at once can still race it.
-      const queued = await this.backend.getAllRequests(
-        this.getQueueKey(),
-        this.getMetadataKeyPrefix()
-      );
-      const probing = queued.some(
-        (entry) =>
-          entry.requestId !== requestId &&
-          entry.status === "inProgress" &&
-          entry.isThawRequest
-      );
-      if (probing) return "exists";
-      probeGrant = undefined;
-    }
+    // Without isolation every grant shares the one freeze, so a probe of any
+    // grant holds the claim.
+    const isolated = this.usesGrantIsolation();
     return this.backend.tryStartThawRequest(
       this.getFrozenGrantsKey(),
       this.getQueueKey(),
       this.getMetadataKeyPrefix(),
       requestId,
-      probeGrant ?? ""
+      isolated ? (grantId ?? "") : "",
+      { anyGrant: !isolated }
     );
   }
 
@@ -1581,6 +1578,14 @@ abstract class BaseClient {
   ): Promise<void> {
     if (!this.authData || this.authData.type !== "oauth2") {
       throw new NotOAuth2ClientError(this.name);
+    }
+    // A removed client's credentials have been purged; writing these would
+    // leave a grant behind that no removal can find again.
+    if (isCredentialWriteRetired(this)) {
+      throw new ClientUnavailableError(
+        "client_removed",
+        `Client "${this.name}" has been removed, so grant tokens for "${grantId}" were not stored.`
+      );
     }
     const key = `${this.authNamespace}:oauth2:${grantId}`;
     // One TTL covers the whole hash, and the hash holds the refresh token, so

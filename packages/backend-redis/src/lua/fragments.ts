@@ -1,3 +1,5 @@
+import { REDIS_MAX_TTL_SECONDS } from "@dianemo/core";
+
 /**
  * Lua blocks that more than one script needs to agree on, character for
  * character.
@@ -12,14 +14,6 @@
  * block without the include site having to know how it was written. Interpolate
  * at column zero: `${redisNow()}`, not `  ${redisNow()}`.
  */
-
-/**
- * The longest TTL a key can be given, in seconds: `REDIS_MAX_TTL_SECONDS` in the
- * core package's `backend/ttl.ts`, which the memory backend clamps to. Inlined
- * because that constant is not part of the package's public surface;
- * `test/conformance.test.ts` holds the two equal.
- */
-export const MAX_TTL_SECONDS = 9_200_000_000_000_000;
 
 const indent = (text: string, prefix: string): string =>
   text
@@ -97,7 +91,7 @@ end`,
  * part of the refill hands a spent per-week budget back after a day of quiet.
  * Twin of the memory backend's `bucketTtl`.
  *
- * Clamped to {@link MAX_TTL_SECONDS}: the `EXPIRE` runs after the `HSET` that
+ * Clamped to `REDIS_MAX_TTL_SECONDS`, as the memory twin is: the `EXPIRE` runs after the `HSET` that
  * spends the token, so a refill longer than Redis can store would otherwise
  * fail every request on the bucket and still spend from it.
  *
@@ -108,7 +102,7 @@ export const bucketTtlFn = (prefix = "  "): string =>
     `local function bucketTtl(ttl, maxTokens, tokensToAdd, interval)
   local refill = math.ceil(math.ceil(maxTokens / tokensToAdd) * interval / 1000)
   if not (refill > ttl) then return ttl end
-  if refill > ${MAX_TTL_SECONDS} then return ${MAX_TTL_SECONDS} end
+  if refill > ${REDIS_MAX_TTL_SECONDS} then return ${REDIS_MAX_TTL_SECONDS} end
   return refill
 end`,
     prefix

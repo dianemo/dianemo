@@ -566,6 +566,11 @@ class MeteredClient extends BaseClient {
     return interval === undefined ? base : Math.max(interval, base);
   }
 
+  /** Only a 429, and only where there is exactly one bucket to empty. */
+  protected freezeEmptiesBucket(isRateLimited: boolean): boolean {
+    return isRateLimited && this.emptiedOnFreeze();
+  }
+
   // ------------------------------------------------------------------- stats
 
   protected async getRateLimitStats(): Promise<NamedRateLimitStats[]> {

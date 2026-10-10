@@ -72,6 +72,11 @@ export function retireCredentialWrites(client: Client): void {
   retiredClients.add(client);
 }
 
+/** Whether `client` was retired by {@link retireCredentialWrites}. */
+export function isCredentialWriteRetired(client: Client): boolean {
+  return retiredClients.has(client);
+}
+
 /** How long one replica may hold the refresh lock before others assume it died. */
 const REFRESH_LOCK_TTL_MS = 30_000;
 

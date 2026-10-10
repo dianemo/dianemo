@@ -106,9 +106,15 @@ export {
   QUEUE_RETRY_BAND,
   QUEUE_SCORE_EPOCH_MS,
 } from "./backend/queueScore.js";
-export { parsePriority, parseStoredNumber } from "./backend/parseStored.js";
 export {
+  parseFiniteStored,
+  parsePriority,
+  parseStoredNumber,
+} from "./backend/parseStored.js";
+export {
+  normalizeTombstoneTtl,
   normalizeTtlSeconds,
+  REDIS_MAX_TTL_SECONDS,
   REQUEST_TOMBSTONE_TTL_SECONDS,
 } from "./backend/ttl.js";
 export type {
@@ -1238,6 +1244,8 @@ export default class RequestHandler {
    * @throws {ClientNotFoundError} when no client of that name is registered.
    * @throws {NotOAuth2ClientError} `client_not_oauth2` for a client whose
    * authentication is not OAuth2.
+   * @throws {ClientUnavailableError} `client_removed` for a client removed while
+   * the call was in flight, whose credentials have already been purged.
    */
   public async setGrantTokens(
     clientName: string,

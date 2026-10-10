@@ -396,6 +396,62 @@ describe("a sub-client", () => {
     }
   });
 
+  it("is rebuilt onto a new agent when its config is re-added with one", async () => {
+    // Agents compare by identity: field by field, two fresh agents read as
+    // equal, and a re-add carrying a new one — a rotated client certificate,
+    // say — would leave the client on the old.
+    const upstream = await startAuthServer();
+    const counts = new Map<http.Agent, number>();
+    class CountingAgent extends http.Agent {
+      createConnection(
+        ...args: Parameters<http.Agent["createConnection"]>
+      ): ReturnType<http.Agent["createConnection"]> {
+        counts.set(this, (counts.get(this) ?? 0) + 1);
+        return super.createConnection(...args);
+      }
+    }
+    const agents = [new CountingAgent(), new CountingAgent()];
+    let current: http.Agent = agents[0];
+    const backend = memoryBackend();
+    const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "ag" });
+    await handler.registerClientTemplate(
+      "acme" as never,
+      ((c: { instanceId: string }): CreateClientData[] => [
+        {
+          name: `acme:_:${c.instanceId}`,
+          axiosOptions: { httpAgent: current },
+          requestOptions: { defaults: { baseURL: upstream.baseURL } },
+        },
+      ]) as never
+    );
+    const send = () =>
+      handler.handleRequest({
+        clientName: "acme:_:a",
+        requestName: "t",
+        method: "GET",
+        url: "/x",
+      });
+    try {
+      await handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never
+      );
+      current = agents[1];
+      await handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never
+      );
+      await send();
+
+      expect(counts.get(agents[1])).toBe(1);
+      expect(counts.has(agents[0])).toBe(false);
+    } finally {
+      await handler.stop();
+      for (const agent of agents) agent.destroy();
+      await upstream.close();
+    }
+  });
+
   it("sends its own token when it declares its own authentication", async () => {
     const upstream = await startAuthServer();
     const backend = memoryBackend();
@@ -490,6 +546,60 @@ describe("the handler API", () => {
       ).rejects.toMatchObject({ code: "invalid_client_name_segment" });
     } finally {
       await handler.stop();
+    }
+  });
+
+  it("refuses grant tokens for a client removed while the call was in flight", async () => {
+    const upstream = await startAuthServer();
+    const backend = memoryBackend();
+    const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "gt" });
+    await handler.registerClientTemplate(
+      "acme" as never,
+      ((c: { instanceId: string }): CreateClientData[] => [
+        {
+          name: `acme:_:${c.instanceId}`,
+          authentication: upstream.oauth("A"),
+          requestOptions: { defaults: { baseURL: upstream.baseURL } },
+        },
+      ]) as never
+    );
+    try {
+      await handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never
+      );
+      // The client object a call already resolved, as one in flight would hold.
+      const client = (
+        handler as unknown as {
+          clients: Map<
+            string,
+            {
+              setGrantTokens: RequestHandler["setGrantTokens"] extends (
+                n: string,
+                ...rest: infer R
+              ) => infer T
+                ? (...rest: R) => T
+                : never;
+            }
+          >;
+        }
+      ).clients.get("acme:_:a")!;
+      await handler.removeTemplateClient("acme" as never, "a");
+
+      await expect(
+        client.setGrantTokens("g1", {
+          accessToken: "at",
+          refreshToken: "rt",
+          expiresAt: Date.now() + 3_600_000,
+          refreshTokenExpiresAt: Date.now() + 86_400_000,
+        })
+      ).rejects.toMatchObject({ code: "client_removed" });
+      expect(
+        await backend.hgetall("gt:requestHandler:acme:_:a:oauth2:g1")
+      ).toEqual({});
+    } finally {
+      await handler.stop();
+      await upstream.close();
     }
   });
 

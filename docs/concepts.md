@@ -202,7 +202,10 @@ definition, and it is always the controller.
 ## Freeze and thaw
 
 When an upstream returns a hard rate-limit response, the client **freezes** —
-its bucket is reset and admission stops until the freeze lapses.
+admission stops until the freeze lapses, and a client with a single
+`requestLimit` also has its bucket emptied. A client with
+[several limits](rate-limits/multiple-limits.md#freeze-does-not-empty-the-buckets)
+keeps its buckets and relies on the freeze window alone.
 
 Recovery is not "everyone retries at once". Exactly one request across the whole
 fleet is nominated as the **thaw probe**. If it succeeds, the freeze clears; if
@@ -246,9 +249,10 @@ without a name is named `default`.
 
 `<keyPrefix>:` is absent if you did not configure one, and spaces in a client
 name become underscores. A grant-isolated client freezes each grant separately,
-so its keys carry the grant before the last segment —
-`<keyPrefix>:requestHandler:<clientName>:grant:<grantId>:freezeState`, and the
-same for the other two.
+so its keys carry `grant:<grantId>` straight after the client name —
+`<keyPrefix>:requestHandler:<clientName>:grant:<grantId>:freezeState`, and
+likewise `…:grant:<grantId>:rateLimit:<limitName>` and
+`…:grant:<grantId>:concurrency:<limitName>`.
 
 ## Cost and priority
 
@@ -346,7 +350,7 @@ if (typeof err.statusCode === "number" && typeof err.code === "string") {
 | `ClientConflictError`           | 409    | Duplicate client registration.                                                |
 | `RequestTimeoutError`           | 408    | Queued past `cleanupTimeout` without being admitted.                          |
 | `RequestAbortedError`           | 499    | The caller's `signal` fired before the request was sent.                      |
-| `RequestCostExceedsBudgetError` | 400    | A request's `cost` exceeds `maxTokens`, so it could never be satisfied.       |
+| `RequestCostExceedsBudgetError` | 400    | A request's `cost` exceeds its tightest `maxTokens` or `maxConcurrency`.      |
 | `NotOAuth2ClientError`          | 400    | Grant-token operations attempted on a client that is not OAuth2.              |
 | `GrantRefreshTokenMissingError` | 400    | An OAuth2 grant was asked to refresh but has no stored refresh token.         |
 | `NoResponseError`               | 500    | Every retry failed without a response.                                        |

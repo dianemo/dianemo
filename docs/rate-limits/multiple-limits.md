@@ -37,8 +37,9 @@ rather than a last-one-wins merge — as is any other duplicate name, and an emp
 list.
 
 > **Upgrading from 1.x — do not roll this out incrementally.** Budgets moved.
-> They used to live at the un-suffixed `<client namespace>:rateLimit`; they now
-> carry the limit's name. Two consequences, and the second is the serious one.
+> They used to live at the un-suffixed `<client namespace>:rateLimit` (and
+> `:concurrency` for a slot ledger); they now carry the limit's name. Two
+> consequences, and the second is the serious one.
 >
 > The old keys are orphaned, and a bucket that does not exist reads as **full**,
 > so the first requests after the upgrade meet a fresh budget and can burst up to
@@ -89,11 +90,11 @@ So the claim is one backend operation: a single Lua script on Redis, a single
 synchronous pass on the memory backend. Both evaluate every budget before
 committing to any.
 
-This is why a client declaring **more than one** budget needs a backend
+This is why a client declaring **more than one** limit needs a backend
 implementing `acquireMultiLimit` and `releaseMultiLimit`. Both shipped backends
 do. A backend written against an earlier version does not, and such a client
 refuses to start on it rather than silently metering against one. A client with a
-single budget is unaffected: it uses the single-key calls every backend has
+single limit is unaffected: it uses the single-key calls every backend has
 always had.
 
 ## What the tightest limit decides

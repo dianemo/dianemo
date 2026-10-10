@@ -171,10 +171,9 @@ function deepCloneWithFunctions<T>(obj: T): T {
 
 /**
  * Resets the client with the given name so a new client can take over.
- * Destroys the previous client first so its health-check interval and any
- * pending in-memory state (e.g. a concurrency client's backend-tracked slots)
- * are released — without this, every rebuild (template re-registration,
- * hot reload) leaks state that the new client can't see.
+ * Destroys the previous client first so its health-check interval and timers
+ * are released — without this, every rebuild (template re-registration, hot
+ * reload) leaks state that the new client can't see.
  */
 export async function resetClient(
   this: RequestHandler,

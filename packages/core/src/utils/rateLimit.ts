@@ -47,8 +47,7 @@ export function normalizeRateLimit(
 }
 
 /**
- * Whether a config is nothing but a `sharedLimit` — one entry, or the bare
- * single form.
+ * Whether a config is nothing but a single `sharedLimit` entry.
  *
  * Such a client owns no budget and no queue: it is constructed with the owner's
  * name, so the owner's controller drains one queue and arbitrates between every
@@ -93,10 +92,6 @@ export function assertRateLimitName(name: unknown, clientName: string): void {
 /**
  * Rejects a rate-limit config that cannot admit anything, before a client is
  * built from it.
- *
- * Single limits are validated exactly as their own client class validates them,
- * so routing an array through here cannot be more permissive than declaring the
- * same limits one at a time.
  */
 export function assertUsableRateLimits(
   config: readonly NamedRateLimitData[],

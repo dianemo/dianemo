@@ -10,7 +10,7 @@ the vendor actually publishes rather than to whichever is easiest to configure.
 | [`requestLimit`](request-limit.md)         | requests per unit of time             | `interval`, `tokensToAdd`, `maxTokens` |
 | [`concurrencyLimit`](concurrency-limit.md) | requests in flight at once            | `maxConcurrency`                       |
 | [`sharedLimit`](shared-limit.md)           | one budget across several credentials | `clientName`                           |
-| [several at once](multiple-limits.md)      | more than one of the above at once     | a `name` per limit                     |
+| [several at once](multiple-limits.md)      | more than one of the above at once    | a `name` per limit                     |
 
 ## The quick decision
 

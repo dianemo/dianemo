@@ -489,12 +489,7 @@ abstract class BaseClient {
     }
   }
 
-  /**
-   * Destroys the client and cleans up resources. Async because
-   * `ConcurrencyLimitClient.handleDestroy` needs to release backend-tracked
-   * concurrency slots before the new client takes over — without the await
-   * the new client would see the old slots still held.
-   */
+  /** Destroys the client and cleans up resources. */
   public async destroy(reason: ClientTypes.ClientDestroyReason): Promise<void> {
     await this.handleDestroy(reason === "finalRemoval");
     this.removeHealthCheckInterval();

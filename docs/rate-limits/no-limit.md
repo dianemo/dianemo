@@ -1,10 +1,10 @@
 # `noLimit`
 
 ```ts
-{
-  type: "noLimit";
-}
+rateLimit: [{ type: "noLimit" }]
 ```
+
+This is also what a client gets when it omits `rateLimit` altogether.
 
 No budget, no queue, no coordination. Every request is admitted the moment it
 arrives.

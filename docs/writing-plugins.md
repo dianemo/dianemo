@@ -222,8 +222,8 @@ Three more things worth knowing:
   a token, or a `defaultRateLimitOption` naming a plan that is not declared,
   fails the deploy that introduced it rather than the first tenant who picks it.
 - **Renaming a plan does not strand its tenants.** A stored key the template no
-  longer declares is dropped with a warning, and the client is built on the
-  template default.
+  longer declares is dropped with a warning, and the client is built from the
+  limits its builder declares — not from `defaultRateLimitOption`.
 
 `handler.getRateLimitOptions("acme")` lists the keys, for a host rendering a
 picker.

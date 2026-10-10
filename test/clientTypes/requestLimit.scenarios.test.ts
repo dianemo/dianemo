@@ -1339,8 +1339,7 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
    * `pending` — which wakes the drain loop — and then flipped it to `pending` a
    * second time. The flip landed after the loop had claimed it, un-claiming a
    * request mid-admission, and the next pass claimed and paid for the very same
-   * request again. Nothing gave that token back: `requestLimit` overrides
-   * neither `releaseAdmission` nor `handleOwnTypeRequestDone`.
+   * request again, and nothing gave that token back.
    *
    * The vendor never saw extra traffic — the leak cost throughput, not
    * politeness — but on a `tokensToAdd: 1` client every retried request quietly

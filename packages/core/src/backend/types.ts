@@ -43,9 +43,8 @@ export interface AcquireConcurrencyResult {
  */
 export type MultiLimitSpec = {
   /**
-   * The freeze governing this budget, which is not always the spender's own: a
-   * `sharedLimit` entry draws on another client's balance, and that client's
-   * freeze is what says the balance may not be spent.
+   * The freeze governing this budget — the claiming client's, or its grant's.
+   * `releaseMultiLimit` withholds a refund while it stands.
    */
   freezeKey?: string;
 } & (
@@ -256,8 +255,8 @@ export interface DianemoBackend {
     cost: number
   ): Promise<AcquireMultiLimitResult>;
   /**
-   * Hands back what `acquireMultiLimit` claimed. Token buckets are credited and
-   * concurrency slots released, so it is also the completion path for the slots.
+   * Hands back what `acquireMultiLimit` claimed for a request that was never
+   * dispatched. Token buckets are credited and concurrency slots released.
    *
    * A spec's own `freezeKey` suppresses its refund while that freeze stands,
    * matching {@link refundTokens} — a freeze empties buckets on purpose.

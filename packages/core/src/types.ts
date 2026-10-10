@@ -44,13 +44,12 @@ export interface ClientTemplateContext {
 /**
  * One plan a template offers.
  *
- * Either a limit for the root client, or a whole tree of them keyed by
+ * Either the root client's list of limits, or a whole tree of them keyed by
  * sub-client path — which is what a vendor publishing a different limit per
  * endpoint needs, since a tier changes all of them at once.
  *
- * The two are told apart by shape: an array, or an object with a string `type`,
- * is a limit; anything else is read as a path map. A sub-client path is never a
- * bare `type` string, so the two cannot be confused.
+ * The two are told apart by shape: an array is the root's limits, and anything
+ * else is read as a path map.
  */
 export type RateLimitPlan =
   DeclaredRateLimit[] | Record<string, DeclaredRateLimit[]>;
@@ -65,9 +64,9 @@ export type RateLimitPlan =
  * ```ts
  * await handler.registerClientTemplate("acme", builder, {
  *   rateLimitOptions: {
- *     free: { type: "requestLimit", interval: 1000, tokensToAdd: 2, maxTokens: 2 },
+ *     free: [{ type: "requestLimit", interval: 1000, tokensToAdd: 2, maxTokens: 2 }],
  *     pro: {
- *       "": { type: "requestLimit", interval: 1000, tokensToAdd: 20, maxTokens: 20 },
+ *       "": [{ type: "requestLimit", interval: 1000, tokensToAdd: 20, maxTokens: 20 }],
  *       reports: [
  *         { name: "per_second", type: "requestLimit", interval: 1000, tokensToAdd: 2, maxTokens: 2 },
  *         { name: "per_day", type: "requestLimit", interval: 86400000, tokensToAdd: 500, maxTokens: 500 },
@@ -80,8 +79,9 @@ export type RateLimitPlan =
  */
 export interface ClientTemplateOptions {
   /**
-   * Plans a caller may choose between, by key. Each is a limit for the root
-   * client, or a {@link RateLimitPlan} covering its sub-clients too.
+   * Plans a caller may choose between, by key. Each is a list of limits for the
+   * root client, or a path map covering its sub-clients too; see
+   * {@link RateLimitPlan}.
    */
   rateLimitOptions?: Record<string, RateLimitPlan>;
   /** Applied when a caller names none. Must be a key of `rateLimitOptions`. */
@@ -113,10 +113,10 @@ export interface TemplateClientOptions {
 
 /**
  * Rate-limit overrides keyed by sub-client path: `""` is the parent, `"rest"` its
- * sub-client of that name, `"a:b"` a nested one. An override must keep the shape of
- * the template default — the same `type`, or an array where the default is an array
- * — because the merge swaps fields within the discriminant and changing the shape
- * would change the client class. See docs/concepts.md#rate-limit-overrides.
+ * sub-client of that name, `"a:b"` a nested one. An override may change the type
+ * and number of limits freely, but not swap a client's own budgets for a
+ * `sharedLimit` or the reverse — that would change the client class, so such an
+ * override is skipped with a warning. See docs/concepts.md#rate-limit-overrides.
  *
  * This is the operator-side escape hatch and needs no permission from the template.
  * For a choice the template itself sanctions, see {@link ClientTemplateOptions}.

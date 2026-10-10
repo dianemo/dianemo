@@ -4,12 +4,14 @@ A token bucket. The common case by a wide margin, and the right answer whenever
 a vendor expresses its limit as _requests per unit of time_.
 
 ```ts
-{
-  type: "requestLimit",
-  interval: 1000,      // ms between refills
-  tokensToAdd: 100,    // tokens added each interval
-  maxTokens: 100,      // ceiling the bucket can hold
-}
+rateLimit: [
+  {
+    type: "requestLimit",
+    interval: 1000,      // ms between refills
+    tokensToAdd: 100,    // tokens added each interval
+    maxTokens: 100,      // ceiling the bucket can hold
+  },
+]
 ```
 
 A request spends `cost` tokens (default 1). If the bucket cannot cover it, the
@@ -95,7 +97,8 @@ client-level bucket and freeze state, which would be the wrong pair of keys.
 
 If the upstream returns a hard rate-limit response, the client's bucket is reset
 to zero and the client freezes. Recovery is probed by exactly one request across
-the fleet. See [choosing a rate limit](README.md) for the shared machinery.
+the fleet. See [choosing a rate limit](README.md) for the shared machinery. A
+client declaring [several limits](multiple-limits.md) does not empty its buckets.
 
 **Two durations, not one**, and this is the type where the difference shows. The
 freeze empties the bucket, so it is floored at `interval` — a freeze that lapsed

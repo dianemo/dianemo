@@ -178,7 +178,8 @@ npm run release:publish       # publishes to npm
 backends that disagree about ordering, fairness or refill timing are two different products wearing
 one name, so the token bucket, fast-path admission, concurrency slots, queue ordering, freeze/thaw
 probing, locks and pub/sub are asserted identically against both. Adding a backend means making this
-suite pass — nothing else is required, and nothing less is sufficient.
+suite pass — nothing less is sufficient — plus `test/clientTypes/multiLimit.test.ts` if it implements
+the optional multi-limit methods that clients declaring several limits need.
 
 `test/handler.integration.test.ts` runs a whole handler end to end on each backend, asserting through
 the backend interface rather than poking at storage. `test/lifecycle.integration.test.ts` covers the

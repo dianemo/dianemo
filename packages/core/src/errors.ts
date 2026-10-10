@@ -100,8 +100,9 @@ export class GrantRefreshTokenMissingError extends RequestHandlerError {
 }
 
 /**
- * A request declared a cost larger than the client's entire token budget, so
- * no amount of waiting could ever admit it.
+ * A request declared a cost larger than the client's tightest ceiling — the
+ * smallest `maxTokens` or `maxConcurrency` among its limits — so no amount of
+ * waiting could ever admit it.
  */
 export class RequestCostExceedsBudgetError extends RequestHandlerError {
   constructor(clientName: string, cost: number, maxTokens: number) {

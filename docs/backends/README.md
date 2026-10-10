@@ -75,4 +75,8 @@ every one of them must be atomic with respect to other spenders. Each backend
 satisfies that in whatever way is natural for it — Lua scripts in Redis, or
 simply being synchronous in memory.
 
-Implement the interface, then run the conformance suite against it.
+Implement the interface, then run the conformance suite against it. The
+multi-limit methods (`acquireMultiLimit`, `releaseMultiLimit`,
+`tryAdmitMultiLimit`) are optional and outside that suite: without them a client
+declaring [several limits](../rate-limits/multiple-limits.md) refuses to start,
+and `test/clientTypes/multiLimit.test.ts` is what exercises them.

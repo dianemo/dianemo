@@ -327,16 +327,16 @@ Cluster adapter exists and `redisBackend` types its parameter as `Redis`.
 
 ## One config shape, one client class
 
-`rateLimit` is declared as a single limit or an array of named ones, and is
-normalised to the array **once**, in `createClient`. Nothing past that point asks
-which shape it was handed: `BaseClient.rateLimit` is always
-`NamedRateLimitData[]`, `getClientStats().rateLimit` is always a list, and a limit
-written without a name is named `default`.
+`rateLimit` is always a list, and its names are resolved **once**, in
+`createClient`. Nothing past that point deals in an unnamed limit:
+`BaseClient.rateLimit` is always `NamedRateLimitData[]`,
+`getClientStats().rateLimit` is always a list, and a limit written without a name
+is named `default`. A bare limit object is refused there with a
+`ConfigurationError` that shows the wrapped form.
 
-That is what collapses the client types. There is no `RequestLimitClient`,
-`ConcurrencyLimitClient` or `NoLimitClient` — the only thing that varied between
-them was which backend call claimed the budget, which is a branch, not a class.
-`MeteredClient` covers every client that meters against budgets of its own, one
+That is what collapses the client types. There is no class per limit type —
+the only thing that would vary between them is which backend call claims the
+budget, which is a branch, not a class. `MeteredClient` covers every client that meters against budgets of its own, one
 of them or several, and keeps the single-key backend calls as a fast path for the
 one-budget case: same decision, one round trip instead of an encoded spec list.
 
@@ -350,12 +350,11 @@ Two things follow that are easy to get wrong:
   are getters. A cached copy is a second reading that a write can leave behind,
   and the two disagreeing would have the claim spend against one budget while the
   ceiling was checked against another.
-- **Nothing claims capacity before `tryAcquireTurn`.** Concurrency used to claim
-  in `canProcessNextRequest`, which is why the drain loop confirmed the entry was
-  still queued *before* admitting. That confirmation now sits after the claim,
-  gated on `claimsReleasableCapacity()`, and the solo-concurrency path uses
-  `acquireQueuedConcurrency` so the status check and the claim are one operation.
-  `claimsOnAdmission` and `releaseAdmission` are gone with the old ordering.
+- **Nothing claims capacity before `tryAcquireTurn`.** The drain loop's check
+  that the entry is still queued sits after the claim, gated on
+  `claimsReleasableCapacity()`, and a claim it finds stale is handed back
+  through `refundUnusedAdmission`. The solo-concurrency path uses
+  `acquireQueuedConcurrency`, so its status check and claim are one operation.
 
 ## Several budgets are claimed in one operation, or not at all
 

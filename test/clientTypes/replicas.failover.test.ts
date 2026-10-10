@@ -1,7 +1,7 @@
 import type { DianemoBackend } from "../../packages/core/src/backend/types.js";
+import { createServer, globalAgent, type ServerResponse } from "node:http";
 import type RequestHandler from "../../packages/core/src/index.js";
 import { fire, startUpstream, withReplicas } from "./harness.js";
-import { createServer, type ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
 import { Redis } from "ioredis";
 
@@ -435,8 +435,15 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
   }, 90_000);
 
   it("does not hand the survivor a fresh token budget when the controller dies", async () => {
-    const upstream = await startUpstream(0);
+    // The whole budget is admitted at once. Uncapped, its 200 connects overflow
+    // a listen backlog clamped by `kern.ipc.somaxconn` (128 on macOS) and the
+    // excess fail with ECONNRESET, each having spent a token. axios's Node
+    // adapter uses the global agent when the client configures none. The delay
+    // keeps the drain going long enough for the kill to land inside it.
+    const upstream = await startUpstream(50);
     const raw = new Redis(`${REDIS_URL}/${REDIS_DB}`);
+    const maxSockets = globalAgent.maxSockets;
+    globalAgent.maxSockets = 32;
     try {
       await withReplicas(
         {
@@ -512,6 +519,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
         }
       );
     } finally {
+      globalAgent.maxSockets = maxSockets;
       await raw.quit();
       await upstream.close();
     }

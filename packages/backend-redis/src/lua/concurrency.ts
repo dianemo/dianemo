@@ -7,6 +7,7 @@ import {
   ttlArgvWarning,
   usableConcurrencyFn,
   usableCostFn,
+  usableRequestTtlFn,
 } from "./fragments.js";
 
 /**
@@ -37,11 +38,15 @@ ${redisNow()}
 ${finiteNumberFn()}
 ${usableConcurrencyFn()}
 ${usableCostFn()}
+${usableRequestTtlFn()}
   if not usableConcurrency(maxConcurrency) then
     return cjson.encode({ acquired = false, currentConcurrency = 0, error = 'maxConcurrency must be a finite number greater than 0' })
   end
   if not usableCost(cost) then
     return cjson.encode({ acquired = false, currentConcurrency = 0, error = 'cost must be a finite number that is not negative' })
+  end
+  if not usableRequestTtl(requestTtl) then
+    return cjson.encode({ acquired = false, currentConcurrency = 0, error = 'requestTtl must be a finite number greater than 0' })
   end
 
 ${slotAccounting()}
@@ -74,6 +79,7 @@ ${redisNow()}
 ${finiteNumberFn()}
 ${usableConcurrencyFn()}
 ${usableCostFn()}
+${usableRequestTtlFn()}
   -- 0, not currentCost: an unusable ceiling makes the occupancy meaningless, and
   -- acquireConcurrency and both memory paths already report 0 here.
   if not usableConcurrency(maxConcurrency) then
@@ -81,6 +87,9 @@ ${usableCostFn()}
   end
   if not usableCost(cost) then
     return cjson.encode({ acquired = false, currentConcurrency = 0, error = 'cost must be a finite number that is not negative' })
+  end
+  if not usableRequestTtl(requestTtl) then
+    return cjson.encode({ acquired = false, currentConcurrency = 0, error = 'requestTtl must be a finite number greater than 0' })
   end
 
 ${slotAccounting()}
@@ -165,8 +174,10 @@ ${redisNow()}
 ${finiteNumberFn()}
 ${usableConcurrencyFn()}
 ${usableCostFn()}
+${usableRequestTtlFn()}
   if not usableConcurrency(maxConcurrency) then return 0 end
   if not usableCost(cost) then return 0 end
+  if not usableRequestTtl(requestTtl) then return 0 end
 
 ${queueEmptyGate()}
 

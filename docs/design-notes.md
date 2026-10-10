@@ -284,7 +284,12 @@ Three properties make the mark safe rather than a second hazard:
   cover — how long a request's own enqueue can still be outstanding when another
   process removes it — so the mark is
   `max(REQUEST_TOMBSTONE_TTL_SECONDS, cleanupTimeout)`. The constant is the floor
-  at 60s, not the value. The two used to drift apart, a fixed minute against a
+  at 60s, not the value. Both backends then read the argument through
+  `normalizeTombstoneTtl` rather than refusing it, because the removal runs on
+  every completion and has already deleted the entry by the time a `SET ... EX`
+  would reject the TTL: a fraction rounds up, a value with no lifetime (`NaN`,
+  zero, negative) takes the constant, and an unbounded `cleanupTimeout` takes
+  the longest TTL a key can hold. The two used to drift apart, a fixed minute against a
   window the consumer configured. A permanent marker would also be correct, and
   would grow one key per request forever.
 
@@ -322,7 +327,8 @@ Consequences worth knowing:
 
 Several scripts build metadata keys inside Lua from a prefix — they discover which
 keys they need from a `ZRANGE` or `SMEMBERS` at runtime, so no `numberOfKeys` could
-declare them — and two (`cleanupStaleFrozenGrants`, `getInstances`) take a key
+declare them — every slot script derives a ledger's `:costs` hash from the ledger's
+own key, and two (`cleanupStaleFrozenGrants`, `getInstances`) take a key
 prefix through `ARGV`. That breaks the `EVAL` key-declaration contract, which
 matters for anything routing by key: Redis Cluster, a proxy, an active-active
 deployment. **Dianemo supports a single logical keyspace only**, which is why no
@@ -394,9 +400,13 @@ Four consequences worth knowing before touching that code:
   key list comes from a client's configuration. `ctx.runVariadic` passes the count
   as the call's first argument, which shifts every other position by one; the
   static guards in `test/luaScripts.test.ts` know about this and hold those three
-  to the ARGV contract and to addressing `KEYS` dynamically. Every key is still
-  declared in `KEYS` — routing them through `ARGV` would work on a single node
-  and hide the problem from anything that routes by key.
+  to the ARGV contract and to addressing `KEYS` dynamically. Every budget key
+  is declared in `KEYS`, but not every key the scripts touch: a slot ledger's
+  `:costs` hash is built inside the script as `key .. ':costs'`, exactly as the
+  single-budget slot scripts build it. That is harmless under
+  [the single-keyspace rule](#the-redis-backend-requires-one-logical-keyspace),
+  and it is one more reason a Cluster adapter would need more than a key-count
+  change.
 - **The spec list travels as JSON, so a non-finite number goes as a string.**
   `JSON.stringify` writes `NaN` and `Infinity` as `null`, which `cjson` decodes
   to a value every guard lets past; as a string, `tonumber` reads it back and
@@ -494,7 +504,12 @@ reads as full, so a key that lapses before the bucket could have refilled from
 empty hands back budget that was spent — a weekly cap restored after a day of
 quiet. Both backends size the key's TTL as the longer of the usual day and
 `ceil(maxTokens / tokensToAdd) * interval`: `bucketTtl` in the memory backend,
-and its twin fragment in `lua/fragments.ts`.
+and its twin fragment in `lua/fragments.ts`. Both clamp the result to the longest
+TTL Redis accepts, `REDIS_MAX_TTL_SECONDS`. The clamp is not cosmetic: the
+scripts `HSET` the spent balance before they `EXPIRE`, so a refill longer than
+that — a valid configuration, if an odd one — would otherwise fail every request
+on the bucket and spend a token each time. A key that outlives its refill by
+~290 million years instead of forever loses nothing.
 
 The cost is that **a key that was lost is indistinguishable from one that never
 existed**. A bucket evicted mid-interval reads as a fresh full budget and the

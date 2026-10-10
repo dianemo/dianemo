@@ -8,6 +8,7 @@ import {
 } from "./concurrency.js";
 import {
   refundTokens,
+  resetTokenBucket,
   tokenBucket,
   tryAdmitImmediately,
 } from "./tokenBucket.js";
@@ -55,6 +56,7 @@ export const SCRIPTS = {
   dianemoReleaseMultiLimit: { keys: "variadic", lua: releaseMultiLimit },
   dianemoTryAdmitMultiLimit: { keys: "variadic", lua: tryAdmitMultiLimit },
   dianemoRefundTokens: { keys: 2, lua: refundTokens },
+  dianemoResetTokenBucket: { keys: 1, lua: resetTokenBucket },
   dianemoAcquireConcurrency: { keys: 1, lua: acquireConcurrency },
   dianemoAcquireQueuedConcurrency: { keys: 2, lua: acquireQueuedConcurrency },
   dianemoReleaseConcurrency: { keys: 1, lua: releaseConcurrency },

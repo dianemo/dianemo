@@ -45,10 +45,11 @@ ${finiteNumberFn()}
 
   if mode == 'max' then
     local existing = redis.call('HMGET', key, 'frozenUntil', 'thawRequestCount')
-    -- The nil test asks whether there is any state to merge with; finiteNumber then
-    -- decides what that state is worth.
-    if tonumber(existing[1]) ~= nil then
-      local existingUntil = finiteNumber(existing[1], 0)
+    -- An unusable stored deadline is no freeze state to merge with, so the probe
+    -- budget beside it is not consulted either — the reading freezeGate and
+    -- readFreezeState give it, and the memory twin's.
+    local existingUntil = finiteNumber(existing[1], nil)
+    if existingUntil ~= nil then
       -- Never shortened, and never a lower probe budget. See armFreeze.
       if existingUntil > frozenUntil then frozenUntil = existingUntil end
       local existingThaw = finiteNumber(existing[2], 0)
@@ -123,14 +124,18 @@ export const updateThawProgress = `
   local success = ARGV[2] == '1'
 ${finiteNumberFn()}
 
+  -- '%.17g' strings, not cjson.encode: cjson writes numbers at 14 significant
+  -- digits, which rounds a deadline near 2^53 to a different millisecond, and
+  -- 17 is enough for any double to read back exactly.
+  local function reply(frozenUntil, thawRequestCount)
+    return { string.format('%.17g', frozenUntil), string.format('%.17g', thawRequestCount) }
+  end
+
   if completionId ~= '' and redis.call('SISMEMBER', completionKey, completionId) == 1 then
     local duplicateState = redis.call('HMGET', key, 'frozenUntil', 'thawRequestCount')
     local duplicateUntil = finiteNumber(duplicateState[1], nil)
     if duplicateUntil == nil then return nil end
-    return cjson.encode({
-      frozenUntil = duplicateUntil,
-      thawRequestCount = finiteNumber(duplicateState[2], 0)
-    })
+    return reply(duplicateUntil, finiteNumber(duplicateState[2], 0))
   end
   if completionId ~= '' then
     redis.call('SADD', completionKey, completionId)
@@ -147,21 +152,21 @@ ${redisNow()}
   -- The one place expiry deletes the key. A read must not: see getFreezeState.
   if now >= frozenUntil and thawRequestCount <= 0 then
     redis.call('DEL', key)
-    return cjson.encode({ cleared = true })
+    return nil
   end
 
   if not success then
-    return cjson.encode({ frozenUntil = frozenUntil, thawRequestCount = thawRequestCount })
+    return reply(frozenUntil, thawRequestCount)
   end
 
   local newCount = thawRequestCount - 1
   if newCount <= 0 then
     redis.call('DEL', key)
-    return cjson.encode({ cleared = true })
+    return nil
   end
 
   redis.call('HSET', key, 'thawRequestCount', newCount)
-  return cjson.encode({ frozenUntil = frozenUntil, thawRequestCount = newCount })
+  return reply(frozenUntil, newCount)
 `;
 
 /**

@@ -107,17 +107,18 @@ export function freezeOps(ctx: Ctx) {
       success: boolean,
       completionId?: string
     ): Promise<FreezeState | null> {
-      const raw = (await ctx.run(
+      const result = (await ctx.run(
         "dianemoUpdateThawProgress",
         key,
         `${key}:thawCompletions`,
         completionId ?? "",
         success ? "1" : "0"
-      )) as string | null;
-      if (!raw) return null;
-      const parsed = JSON.parse(raw) as FreezeState | { cleared: true };
-      if ("cleared" in parsed) return null;
-      return parsed;
+      )) as [string, string] | null;
+      if (!result) return null;
+      return {
+        frozenUntil: Number(result[0]),
+        thawRequestCount: Number(result[1]),
+      };
     },
 
     /** Clear the freeze state (client is no longer frozen). */

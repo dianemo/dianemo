@@ -154,4 +154,19 @@ describe.each(harnesses(5))("requestLimit — $name", (harness) => {
       }
     );
   }, 30_000);
+
+  it("serves a budget whose refill outlasts any key ttl, spending one token each", async () => {
+    const glacial = {
+      interval: Number.MAX_SAFE_INTEGER,
+      tokensToAdd: 1,
+      maxTokens: 10_000,
+    };
+    await run(glacial, async (handler, backend) => {
+      const results = await fireMany(handler, CLIENT, 3);
+      expect(results.every((r) => r.status === 200)).toBe(true);
+      expect((await backend.getTokenBucketState(BUCKET, glacial)).tokens).toBe(
+        9_997
+      );
+    });
+  }, 30_000);
 });

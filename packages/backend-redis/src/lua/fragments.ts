@@ -13,6 +13,14 @@
  * at column zero: `${redisNow()}`, not `  ${redisNow()}`.
  */
 
+/**
+ * The longest TTL a key can be given, in seconds: `REDIS_MAX_TTL_SECONDS` in the
+ * core package's `backend/ttl.ts`, which the memory backend clamps to. Inlined
+ * because that constant is not part of the package's public surface;
+ * `test/conformance.test.ts` holds the two equal.
+ */
+export const MAX_TTL_SECONDS = 9_200_000_000_000_000;
+
 const indent = (text: string, prefix: string): string =>
   text
     .split("\n")
@@ -89,12 +97,19 @@ end`,
  * part of the refill hands a spent per-week budget back after a day of quiet.
  * Twin of the memory backend's `bucketTtl`.
  *
+ * Clamped to {@link MAX_TTL_SECONDS}: the `EXPIRE` runs after the `HSET` that
+ * spends the token, so a refill longer than Redis can store would otherwise
+ * fail every request on the bucket and still spend from it.
+ *
  * Requires: nothing. Declares `bucketTtl`. Call only with validated config.
  */
 export const bucketTtlFn = (prefix = "  "): string =>
   indent(
     `local function bucketTtl(ttl, maxTokens, tokensToAdd, interval)
-  return math.max(ttl, math.ceil(math.ceil(maxTokens / tokensToAdd) * interval / 1000))
+  local refill = math.ceil(math.ceil(maxTokens / tokensToAdd) * interval / 1000)
+  if not (refill > ttl) then return ttl end
+  if refill > ${MAX_TTL_SECONDS} then return ${MAX_TTL_SECONDS} end
+  return refill
 end`,
     prefix
   );
@@ -134,6 +149,22 @@ export const usableCostFn = (prefix = "  "): string =>
   indent(
     `local function usableCost(cost)
   return cost ~= nil and cost == cost and cost ~= math.huge and cost >= 0
+end`,
+    prefix
+  );
+
+/**
+ * Declares `usableRequestTtl(ttl)`, the one test for a slot lease that can be
+ * measured. A `nan` reaches `ZRANGEBYSCORE` as a bound Redis rejects, after
+ * nothing has been written; refusing it here returns the same result the memory
+ * twin returns instead of raising.
+ *
+ * Requires: nothing. Declares `usableRequestTtl`.
+ */
+export const usableRequestTtlFn = (prefix = "  "): string =>
+  indent(
+    `local function usableRequestTtl(ttl)
+  return ttl ~= nil and ttl == ttl and ttl ~= math.huge and ttl > 0
 end`,
     prefix
   );

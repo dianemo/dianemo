@@ -28,14 +28,15 @@ ${redisNow()}
 
 ${finiteNumberFn()}
   -- 'not (x > 0)', not 'x <= 0': a nan compares false either way round, so the
-  -- second form admits it and the division below yields a nan balance.
-  if not (tokensToAdd > 0) then
+  -- second form admits it and the division below yields a nan balance. The nil
+  -- test first, because comparing nil raises.
+  if tokensToAdd == nil or not (tokensToAdd > 0) then
     return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'tokensToAdd must be greater than 0' })
   end
   -- Reported through 'error' rather than raised: the contract says an unusable
   -- configuration is distinguishable from a merely empty bucket, and a non-finite
   -- maxTokens or cost would otherwise reach cjson.encode and throw.
-  if not (maxTokens > 0) or maxTokens == math.huge then
+  if maxTokens == nil or not (maxTokens > 0) or maxTokens == math.huge then
     return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'maxTokens must be a finite number greater than 0' })
   end
   if cost == nil or cost ~= cost or cost == math.huge or cost == -math.huge then
@@ -96,9 +97,12 @@ export const refundTokens = `
   local freezeKey = KEYS[2]
   local cost = tonumber(ARGV[1])
   local maxTokens = tonumber(ARGV[2])
+${finiteNumberFn()}
 
+  -- finiteNumber for both reads, as the memory twin's parseFiniteStored: an
+  -- unusable deadline is no freeze, as every freeze gate reads it.
   if freezeKey ~= '' then
-    local frozenUntil = tonumber(redis.call('HGET', freezeKey, 'frozenUntil')) or 0
+    local frozenUntil = finiteNumber(redis.call('HGET', freezeKey, 'frozenUntil'), 0)
 ${redisNow("    ")}
     if frozenUntil > now then return 0 end
   end
@@ -108,9 +112,22 @@ ${redisNow("    ")}
   -- 'abc' is truthy in Lua, so testing the string alone let a nil reach the addition.
   local raw = redis.call('HGET', key, 'tokens')
   if raw == false then return 0 end
-  local tokens = tonumber(raw)
-  if tokens == nil or tokens ~= tokens then tokens = 0 end
+  local tokens = finiteNumber(raw, 0)
   redis.call('HSET', key, 'tokens', math.min(maxTokens, tokens + cost))
+  return 1
+`;
+
+/**
+ * Writes a full bucket stamped with Redis's clock, in one step: reading `TIME`
+ * and then writing is two commands an acquire can land between, and its spend
+ * would be overwritten.
+ */
+export const resetTokenBucket = `
+  local key = KEYS[1]
+  local maxTokens = ARGV[1]
+${redisNow()}
+  redis.call('HSET', key, 'tokens', maxTokens, 'lastUpdate', now)
+  redis.call('EXPIRE', key, 86400)
   return 1
 `;
 
@@ -135,8 +152,8 @@ export const tryAdmitImmediately = `
 ${redisNow()}
 
 ${finiteNumberFn()}
-  if not (tokensToAdd > 0) then return 0 end
-  if not (maxTokens > 0) or maxTokens == math.huge then return 0 end
+  if tokensToAdd == nil or not (tokensToAdd > 0) then return 0 end
+  if maxTokens == nil or not (maxTokens > 0) or maxTokens == math.huge then return 0 end
   if cost == nil or cost ~= cost or cost == math.huge or cost == -math.huge then return 0 end
   if interval == nil or interval ~= interval or interval == math.huge or interval == -math.huge then return 0 end
 

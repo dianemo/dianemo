@@ -12,7 +12,12 @@ export interface TokenBucketConfig {
 export interface ConcurrencyConfig {
   /** Total cost that may be in flight at once. */
   maxConcurrency: number;
-  /** ms before a slot expires — reclaims slots held by a crashed process */
+  /**
+   * ms before a slot expires — reclaims slots held by a crashed process. Must
+   * be a finite number above 0; anything else is refused through
+   * {@link AcquireConcurrencyResult.error}, or `false` on the fast path, since
+   * a slot claimed against it would never be reaped.
+   */
   requestTtl: number;
 }
 
@@ -31,9 +36,9 @@ export interface AcquireConcurrencyResult {
   acquired: boolean;
   currentConcurrency?: number;
   /**
-   * Set when the ceiling itself is unusable, as opposed to merely full, so a
-   * `maxConcurrency` of `NaN` or `0` is not mistaken for a busy client. Mirrors
-   * `AcquireTokensResult.error`.
+   * Set when the configuration itself is unusable, as opposed to merely full,
+   * so a `maxConcurrency` or `requestTtl` of `NaN` or `0` is not mistaken for a
+   * busy client. Mirrors `AcquireTokensResult.error`.
    */
   error?: string;
 }
@@ -72,7 +77,7 @@ export interface AcquireMultiLimitResult {
   /**
    * ms to wait before retrying — the longest any declining token bucket asked
    * for. A full concurrency ledger has no deadline of its own, so a decline
-   * caused only by one may carry `0` or nothing.
+   * caused only by one carries `0`. Absent when acquired or on `error`.
    */
   waitTime?: number;
   /** Set when one of the configurations is unusable, as opposed to merely full. */
@@ -385,6 +390,8 @@ export interface DianemoBackend {
    * `REQUEST_TOMBSTONE_TTL_SECONDS`. It has to outlast the window in which an add
    * can still be outstanding, which is the caller's admission budget rather than a
    * constant, so a caller that lets a request wait longer must pass a longer value.
+   * Never refused: a fraction rounds up, a value with no lifetime (`NaN`, zero,
+   * negative) takes the default, and `Infinity` the longest TTL a key can hold.
    */
   removeRequest(
     queueKey: string,

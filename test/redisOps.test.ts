@@ -437,6 +437,58 @@ describeIfRedis("redis backend — ops layer", () => {
     });
   });
 
+  // ------------------------------------------------- single-command writes
+
+  describe("writes that must not be split", () => {
+    /** Records each call to `method` on the shared connection while `fn` runs. */
+    async function recording(
+      method: "time" | "pipeline" | "del",
+      fn: () => Promise<void>
+    ): Promise<unknown[][]> {
+      const target = redis as unknown as Record<string, unknown>;
+      const real = target[method] as (...args: unknown[]) => unknown;
+      const calls: unknown[][] = [];
+      target[method] = (...args: unknown[]) => {
+        calls.push(args);
+        return real.apply(redis, args);
+      };
+      try {
+        await fn();
+      } finally {
+        target[method] = real;
+      }
+      return calls;
+    }
+
+    it("resets a bucket in one script that reads the clock itself", async () => {
+      const backend = open();
+      const reset = () => backend.resetTokenBucket("tb:reset", 7);
+      expect(await recording("time", reset)).toEqual([]);
+      expect(await recording("pipeline", reset)).toEqual([]);
+
+      const [tokens, lastUpdate] = await redis.hmget(
+        "tb:reset",
+        "tokens",
+        "lastUpdate"
+      );
+      expect(tokens).toBe("7");
+      expect(Math.abs(Number(lastUpdate) - (await backend.now()))).toBeLessThan(
+        1000
+      );
+      expect(await redis.ttl("tb:reset")).toBeGreaterThan(86_000);
+    });
+
+    it("clears a slot ledger and its costs in one DEL", async () => {
+      const backend = open();
+      await backend.acquireConcurrency("cc:clear", 1, "a", CONCURRENCY);
+      const calls = await recording("del", () =>
+        backend.clearConcurrency("cc:clear")
+      );
+      expect(calls).toEqual([["cc:clear", "cc:clear:costs"]]);
+      expect(await redis.exists("cc:clear", "cc:clear:costs")).toBe(0);
+    });
+  });
+
   // ---------------------------------------------------------------- lifecycle
 
   describe("close", () => {

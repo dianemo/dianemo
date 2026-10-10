@@ -502,3 +502,66 @@ describe.each(harnesses(0))(
     });
   }
 );
+
+describe("memory backend: one clock sample per decision", () => {
+  let backend: DianemoBackend;
+  const DEADLINE_MS = 500;
+
+  /**
+   * Every read after the first lands past the deadline, so a decision that
+   * samples the clock twice sees the freeze lapse partway through.
+   */
+  const advanceAfterFirstRead = () => {
+    const start = Date.now();
+    let reads = 0;
+    vi.spyOn(Date, "now").mockImplementation(() =>
+      reads++ === 0 ? start : start + 2 * DEADLINE_MS
+    );
+  };
+
+  beforeEach(async () => {
+    backend = memoryBackend();
+    await backend.setFreezeState("oc:fz", Date.now() + DEADLINE_MS, 0);
+  });
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await backend.close();
+  });
+
+  it("decides canProcessRequest on the instant it read the state", async () => {
+    advanceAfterFirstRead();
+    expect(await backend.canProcessRequest("oc:fz")).toMatchObject({
+      canProcess: false,
+      isThawRequest: false,
+    });
+  });
+
+  it("decides isFrozen on the instant it read the state", async () => {
+    advanceAfterFirstRead();
+    expect(await backend.isFrozen("oc:fz")).toBe(true);
+  });
+});
+
+describe("memory backend: the frozen-grants set", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("expires a day after a probe adds to it, as the Redis twin's does", async () => {
+    const backend = memoryBackend();
+    await backend.addRequest(
+      "fg:q",
+      "fg:m",
+      queued("a", { status: "inProgress", grantId: "g" })
+    );
+    await backend.tryStartThawRequest("fg:set", "fg:q", "fg:m", "a", "g");
+    expect(await backend.smembers("fg:set")).toEqual(["g"]);
+
+    vi.setSystemTime(Date.now() + 86_401_000);
+    expect(await backend.smembers("fg:set")).toEqual([]);
+    await backend.close();
+  });
+});

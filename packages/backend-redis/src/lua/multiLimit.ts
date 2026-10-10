@@ -6,6 +6,7 @@ import {
   slotAccounting,
   usableConcurrencyFn,
   usableCostFn,
+  usableRequestTtlFn,
 } from "./fragments.js";
 
 /**
@@ -14,9 +15,9 @@ import {
  *
  * These three scripts are the only ones registered without a fixed key count,
  * because the number of budgets is a property of the client's configuration
- * rather than of the script. Every key is still declared in `KEYS` — passing
- * them through `ARGV` would work on a single node and hide the cross-slot
- * problem from Redis Cluster, which is exactly the failure worth keeping loud.
+ * rather than of the script. Every budget key is declared in `KEYS`; its
+ * `:costs` companion is derived inside the script, as every slot script derives
+ * it — see docs/design-notes.md#the-redis-backend-requires-one-logical-keyspace.
  *
  * `ARGV[1]` is the cost, `ARGV[2]` the spec list as JSON and, in the two
  * acquiring scripts, `ARGV[3]` the key TTL in seconds (a bucket's is raised to
@@ -35,8 +36,8 @@ import {
  * intervals really did elapse. Slot reaping is likewise unconditional — an
  * expired slot is expired whoever asked.
  *
- * Requires: `KEYS`, `finiteNumber`, `bucketTtl`, `usableConcurrency` and
- * `usableCost`.
+ * Requires: `KEYS`, `finiteNumber`, `bucketTtl`, `usableConcurrency`,
+ * `usableCost` and `usableRequestTtl`.
  * Declares `planMultiLimit`, `commitMultiLimit` and `persistRefills`.
  */
 const planFn = `
@@ -98,6 +99,9 @@ ${lazyRefill("      ")}
       if not usableCost(cost) then
         return { acquired = false, error = 'cost must be a finite number that is not negative' }
       end
+      if not usableRequestTtl(requestTtl) then
+        return { acquired = false, error = 'requestTtl must be a finite number greater than 0' }
+      end
 
 ${slotAccounting("      ")}
 
@@ -151,6 +155,8 @@ ${usableConcurrencyFn()}
 
 ${usableCostFn()}
 
+${usableRequestTtlFn()}
+
 ${planFn}
 
   local plan = planMultiLimit(specs, cost, now, ttl)
@@ -190,6 +196,8 @@ ${bucketTtlFn()}
 ${usableConcurrencyFn()}
 
 ${usableCostFn()}
+
+${usableRequestTtlFn()}
 
 ${planFn}
 
@@ -231,6 +239,8 @@ export const releaseMultiLimit = `
 
 ${redisNow()}
 
+${finiteNumberFn()}
+
   for _, spec in ipairs(specs) do
     local key = KEYS[spec.k]
     if spec.kind == 'concurrency' then
@@ -239,7 +249,7 @@ ${redisNow()}
     else
       local frozen = false
       if spec.fk ~= nil then
-        local frozenUntil = tonumber(redis.call('HGET', KEYS[spec.fk], 'frozenUntil')) or 0
+        local frozenUntil = finiteNumber(redis.call('HGET', KEYS[spec.fk], 'frozenUntil'), 0)
         if frozenUntil > now then frozen = true end
       end
       if not frozen then
@@ -247,8 +257,7 @@ ${redisNow()}
         -- so creating one here would invent a balance rather than restore it.
         local raw = redis.call('HGET', key, 'tokens')
         if raw ~= false then
-          local tokens = tonumber(raw)
-          if tokens == nil or tokens ~= tokens then tokens = 0 end
+          local tokens = finiteNumber(raw, 0)
           redis.call('HSET', key, 'tokens', math.min(tonumber(spec.maxTokens), tokens + cost))
         end
       end

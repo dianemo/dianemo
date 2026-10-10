@@ -66,6 +66,11 @@ Keys expire lazily: a TTL is checked on read, and a sweep once a minute removes
 expired keys nobody reads again, so they cannot pin memory forever. The sweep's
 timer is unref'd, so it never keeps a process alive on its own.
 
+A set, sorted set or hash whose last member is removed is deleted with it, as
+Redis deletes one, and an `hset` with no fields creates nothing. So an emptied
+key never answers an existence check, and whatever is added to it next does not
+inherit the old key's expiry.
+
 ## Plugins
 
 Plugins that cache state through `backend()` — a session cookie, a payment token

@@ -111,8 +111,9 @@ export function concurrencyOps(ctx: Ctx) {
      * their slots too, and the cap stops holding until they finish.
      */
     async clearConcurrency(key: string): Promise<void> {
-      const costKey = `${key}:costs`;
-      await Promise.all([ctx.redis.del(key), ctx.redis.del(costKey)]);
+      // One `DEL` naming both, so no acquire can land between the two and leave
+      // a slot whose cost entry is gone.
+      await ctx.redis.del(key, `${key}:costs`);
     },
   };
 }

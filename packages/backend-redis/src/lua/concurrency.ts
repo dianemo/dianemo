@@ -46,7 +46,7 @@ ${usableCostFn()}
 
 ${slotAccounting()}
 
-  -- Refusal on '>', in all three scripts: an admission written as the negation
+  -- Refusal on '>', in every slot script: an admission written as the negation
   -- instead puts the boundary in two places that can drift apart.
   if currentCost + cost > maxConcurrency then
     return cjson.encode({ acquired = false, currentConcurrency = currentCost })

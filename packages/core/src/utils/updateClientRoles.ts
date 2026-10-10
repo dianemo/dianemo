@@ -7,19 +7,20 @@ import type RequestHandler from "../index.js";
  * How long an instance registration survives without a heartbeat.
  *
  * Refreshed every second, so this is how many consecutive beats may be missed
- * before peers treat the replica as dead and reclaim its queued work. Three
- * seconds was one ordinary GC pause away from destroying a live replica's
- * requests; ten keeps failover responsive while tolerating a normal stall.
+ * before peers treat the replica as dead and reclaim its queued work: long
+ * enough to ride out an ordinary GC pause, short enough to keep failover
+ * responsive.
  */
 const INSTANCE_TTL_SECONDS = 10;
 
 /**
  * Elects this instance's role for each client it holds.
  *
- * A client already claimed by an older instance makes this one a "worker";
- * anything else makes it the "controller" that drains that client's queue.
- * Ordering instances consistently is what keeps exactly one controller per
- * client without a negotiation round.
+ * A client already claimed by an instance that outranks this one makes this
+ * one a "worker", as does a `sharedLimit` client always; anything else makes
+ * it the "controller" that drains that client's queue. Ordering instances
+ * consistently is what keeps exactly one controller per client without a
+ * negotiation round.
  */
 async function updateClientRoles(this: RequestHandler, isStartup = false) {
   const clientsBefore = await getClientsBefore.bind(this)();

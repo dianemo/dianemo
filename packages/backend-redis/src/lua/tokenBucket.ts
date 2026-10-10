@@ -21,8 +21,7 @@ export const tokenBucket = `
   local maxTokens = tonumber(ARGV[2])
   local tokensToAdd = tonumber(ARGV[3])
   local interval = tonumber(ARGV[4])
-  -- ARGV is positional: this moved from [6] when the dead caller clock
-  -- at [5] was removed. See acquireConcurrency in concurrency.ts for the trap.
+  -- ARGV is positional; see ttlArgvWarning in fragments.ts for the trap.
   local ttl = tonumber(ARGV[5]) or 86400
 
 ${redisNow()}
@@ -54,33 +53,28 @@ ${bucketTtlFn()}
 
   -- finiteNumber, not tonumber: a stored 'nan' passes a nil test, survives every
   -- comparison and math.min, and then fails in cjson.encode below — so one corrupt
-  -- byte made every acquire on this bucket throw, with nothing rewriting the field.
+  -- byte would make every acquire on this bucket throw, with nothing rewriting
+  -- the field.
   local tokens = finiteNumber(redis.call('HGET', key, 'tokens'), maxTokens)
   local lastUpdate = finiteNumber(redis.call('HGET', key, 'lastUpdate'), now)
 
 ${lazyRefill()}
 
-  -- Check if we have enough tokens
   if tokens >= cost then
-    -- Deduct tokens and update state
     tokens = tokens - cost
     redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate)
     redis.call('EXPIRE', key, ttl)
     return cjson.encode({ acquired = true, remainingTokens = tokens })
   else
-    -- Wait until enough tokens have accrued.
-    --
-    -- lastUpdate only advances in whole intervals, so (now - lastUpdate)
-    -- is progress already made toward the next refill and must be
-    -- subtracted. Without that a bucket 9.9s into a 10s interval reported a
-    -- full 10s wait instead of 100ms, and the caller sleeps on this value
-    -- directly, so it became a real ten-second stall.
+    -- lastUpdate only advances in whole intervals, so (now - lastUpdate) is
+    -- progress already made toward the next refill and comes off the wait. The
+    -- caller sleeps on this value directly.
     local needed = cost - tokens
     local intervalsNeeded = math.ceil(needed / tokensToAdd)
     local waitTime = intervalsNeeded * interval - (now - lastUpdate)
     if waitTime < 0 then waitTime = 0 end
 
-    -- Update state to reflect any tokens that were added
+    -- Refill progress is persisted even on refusal.
     redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate)
     redis.call('EXPIRE', key, ttl)
 
@@ -135,7 +129,7 @@ export const tryAdmitImmediately = `
   local maxTokens = tonumber(ARGV[2])
   local tokensToAdd = tonumber(ARGV[3])
   local interval = tonumber(ARGV[4])
-  -- Positional, and moved from [6]: see acquireConcurrency in concurrency.ts.
+  -- ARGV is positional; see ttlArgvWarning in fragments.ts for the trap.
   local ttl = tonumber(ARGV[5]) or 86400
 
 ${redisNow()}

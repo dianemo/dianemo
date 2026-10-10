@@ -58,6 +58,28 @@ export interface BasicCredentials extends BaseCredentialsData {
   password: string;
 }
 
+/**
+ * Recomputes a client's limits from a successful response — a vendor that
+ * reports its remaining quota in headers, say.
+ *
+ * Called with the client's current limits, every name resolved. Return the
+ * full replacement list, or `undefined` to leave the limits as they are. A
+ * returned limit without a `name` keeps the name of the one current limit of
+ * its type, so it keeps that budget's balance; with several of a type, name
+ * them. The result is broadcast to every replica, this one included, as a
+ * `dynamic` update. Receivers log and ignore one that is unusable, and ignore
+ * one that would change the client class (to or from a `sharedLimit`). A throw
+ * is logged and never fails the request.
+ *
+ * ```ts
+ * const rateLimitChange: RateLimitChange = (current, response) => {
+ *   const limit = Number(response.headers["x-ratelimit-limit"]);
+ *   if (!Number.isFinite(limit) || limit <= 0) return undefined;
+ *   const perSecond = { interval: 1000, tokensToAdd: limit, maxTokens: limit };
+ *   return [{ type: "requestLimit", ...perSecond }];
+ * };
+ * ```
+ */
 export type RateLimitChange<
   R extends RateLimitData = RateLimitData,
   N extends RateLimitData = R,
@@ -92,7 +114,19 @@ export interface ProbeRequestConfig {
   intervalMs: number;
 }
 
+/**
+ * Everything a client is built from: what a template builder returns, and what
+ * `defaultClientOptions` takes.
+ *
+ * `R` narrows the limit types this client may declare, which in turn types the
+ * `rateLimitChange` callback.
+ */
 export interface CreateClientData<R extends RateLimitData = RateLimitData> {
+  /**
+   * Unique on the handler. A template client's name must contain its
+   * `instanceId` as a `:`-separated segment — `buildClientName()` produces
+   * one — and a sub-client's is joined to its parent's with `:`.
+   */
   name: string;
   /**
    * Which client's credential entry this one uses. Set internally when a
@@ -103,17 +137,29 @@ export interface CreateClientData<R extends RateLimitData = RateLimitData> {
    */
   authOwnerName?: string;
   /**
-   * Every limit this client is metered against. Defaults to `noLimit`.
+   * Every limit this client is metered against. Defaults to
+   * `[{ type: "noLimit" }]`; a sub-client that omits it inherits its parent's.
    *
    * Always a list, even for one limit: a request is sent only when **all** of
    * them admit it, so a per-second and a per-day cap live side by side here.
    * `name` keys each limit's budget and may be omitted once per client, where it
-   * is `"default"`. See docs/rate-limits/multiple-limits.md.
+   * is `"default"`. A `sharedLimit` must be the only entry. See
+   * docs/rate-limits/multiple-limits.md.
+   *
+   * Building the client throws `ConfigurationError` for a list it cannot meter:
+   * `unknown_rate_limit_type` for a bare object, `null`, or an unknown `type`;
+   * `invalid_rate_limit` for an empty list, a duplicate name or an unusable
+   * number; `invalid_rate_limit_name`; `shared_limit_not_alone`;
+   * `shared_limit_parent_not_found` and `shared_limit_parent_is_shared` for a
+   * `sharedLimit` owner that is missing or itself shared; and
+   * `backend_missing_multi_limit` for several limits on a backend without the
+   * multi-limit methods.
    */
   rateLimit?: DeclaredRateLimit<R>[];
   /**
-   * Computes a dynamic budget update. Shared clients receive their shared-limit
-   * descriptor but update the concrete budget owned by their parent.
+   * Computes a dynamic budget update; see {@link RateLimitChange}. Shared
+   * clients receive their shared-limit descriptor but update the concrete
+   * budget owned by their parent.
    */
   rateLimitChange?: RateLimitChange<
     R,
@@ -157,13 +203,14 @@ export interface RateLimitUpdatedData {
   source: "init" | "operator" | "dynamic";
   /**
    * Instance id of the request handler that published this event. Used by
-   * persistence-side listeners so only
-   * one replica writes to the DB — every replica receives the broadcast,
-   * so without this filter we'd take N writes per dynamic event.
+   * persistence-side listeners so only one replica writes to the DB — every
+   * replica receives the broadcast, so without this filter we'd take N writes
+   * per dynamic event.
    */
   publisherInstanceId: string;
 }
 
+/** One limit, without a name: the four strategies a client can meter by. */
 export type RateLimitData =
   | RequestLimitClientOptions
   | ConcurrencyLimitClientOptions
@@ -173,10 +220,13 @@ export type RateLimitData =
 /**
  * One limit as a caller writes it.
  *
- * `name` keys the limit's budget — `<client namespace>:rateLimit:<name>` — and is
- * what makes reordering the list safe. It may be omitted, where it is
- * `"default"`, so a client with one limit never has to invent one; a second
- * unnamed limit is refused, since both would meter against one bucket.
+ * `name` keys the limit's budget — `<client namespace>:rateLimit:<name>` for a
+ * `requestLimit`, `<client namespace>:concurrency:<name>` for a
+ * `concurrencyLimit` — and is what makes reordering the list safe. It may be
+ * omitted, where it is `"default"`, so a client with one limit never has to
+ * invent one; a second unnamed limit is refused, since both would meter
+ * against one bucket. In a `rateLimitChange` result or an override, an unnamed
+ * limit instead keeps the name of the one limit of its type it replaces.
  */
 export type DeclaredRateLimit<R extends RateLimitData = RateLimitData> = R & {
   name?: string;
@@ -191,10 +241,18 @@ export type DeclaredRateLimit<R extends RateLimitData = RateLimitData> = R & {
  */
 export type NamedRateLimitData = RateLimitData & { name: string };
 
+/**
+ * Meters nothing. Requests still queue behind a freeze. See
+ * docs/rate-limits/no-limit.md.
+ */
 export interface NoLimitClientOptions {
   type: "noLimit";
 }
 
+/**
+ * A token bucket: up to `maxTokens` at once, refilled by `tokensToAdd` every
+ * `interval` ms. See docs/rate-limits/request-limit.md.
+ */
 export interface RequestLimitClientOptions {
   type: "requestLimit";
   /** Milliseconds between refills. */
@@ -205,12 +263,22 @@ export interface RequestLimitClientOptions {
   maxTokens: number;
 }
 
+/**
+ * A ceiling on the total cost in flight at once. See
+ * docs/rate-limits/concurrency-limit.md.
+ */
 export interface ConcurrencyLimitClientOptions {
   type: "concurrencyLimit";
   /** Slots in flight at once, and so the largest admissible `cost`. */
   maxConcurrency: number;
 }
 
+/**
+ * Spends another client's budgets, all of them, through that client's queue.
+ * Must be the only entry in its client's list, and the owner must be
+ * registered first and own its budgets rather than share another's. See
+ * docs/rate-limits/shared-limit.md.
+ */
 export interface SharedLimitClientOptions {
   type: "sharedLimit";
   /** The name of the client to share a rate limit with */
@@ -227,7 +295,9 @@ export type RateLimitStats =
 /** How `getClientStats` reports a limit: one entry per declared limit. */
 export type NamedRateLimitStats = RateLimitStats & { name: string };
 
+/** A `requestLimit` with its current balance, as `getClientStats` reports it. */
 export interface RequestLimitClientStats extends RequestLimitClientOptions {
+  /** Tokens available now, refill included. */
   tokens: number;
 }
 
@@ -312,11 +382,19 @@ export type ResponseInterceptor = (
   response: AxiosResponse
 ) => Promise<void> | void;
 
+/** What `RequestHandler.getClientStats` returns. */
 export interface ClientStatistics {
   clientName: string;
+  /** Inside the client-level freeze window, on the backend's clock. */
   isFrozen: boolean;
+  /** Past the freeze window with thaw probes still owed. */
   isThawing: boolean;
   thawRequestCount: number;
+  /**
+   * One entry per declared limit, in declaration order, each with its resolved
+   * `name`; a `requestLimit` carries its current `tokens`. Client-level only:
+   * an isolated grant's balance is not reported here.
+   */
   rateLimit: NamedRateLimitStats[];
   requestsInQueue: ClientRequestsStatistics;
   requestsInProgress: ClientRequestsStatistics;

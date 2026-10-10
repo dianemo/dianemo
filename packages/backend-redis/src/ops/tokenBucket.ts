@@ -98,8 +98,8 @@ export function tokenBucketOps(ctx: Ctx) {
             config.maxTokens
           );
           // Advanced with the credit, as the acquire scripts and the memory twin
-          // both do. Reporting the un-advanced value left a caller deriving the
-          // progress already made toward the next refill a whole interval out.
+          // both do, so a caller deriving progress toward the next refill from
+          // it is not a whole interval out.
           currentLastUpdate += intervalsElapsed * config.interval;
         }
       }

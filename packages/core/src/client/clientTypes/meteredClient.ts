@@ -178,9 +178,9 @@ class MeteredClient extends BaseClient {
   // --------------------------------------------------------------- admission
 
   /**
-   * Grant-scoped requests are excluded, as they are for every client type: the
-   * queue this path checks is client-level, and a grant-isolated tenant's turn is
-   * decided by the scan in `processRequests`.
+   * Grant-scoped requests on a metered client are excluded: the queue this
+   * path checks is client-level, and a grant-isolated tenant's turn is decided
+   * by the scan in `processRequests`.
    */
   protected async tryAdmitImmediately(
     request: RequestMetadata
@@ -397,9 +397,10 @@ class MeteredClient extends BaseClient {
       return;
     }
     // The backend refuses a refund while the bucket's freeze stands, because a
-    // freeze empties that bucket. Only one bucket here is emptied by a freeze
-    // (see `handleFreezeOwnTypeRequests`), so the others drop their freeze key
-    // and are refunded as any unsent request's would be.
+    // freeze empties that bucket. It does so only for a client's one
+    // `requestLimit` (see `handleFreezeOwnTypeRequests`); with several, no
+    // bucket was emptied, so they drop their freeze key and are refunded as
+    // any unsent request's would be.
     const freezeEmpties = this.emptiedOnFreeze();
     await this.backend.releaseMultiLimit?.(
       claimed.map((spec) =>
@@ -411,7 +412,7 @@ class MeteredClient extends BaseClient {
     );
   }
 
-  /** Whether a freeze empties this client's bucket; see the method below. */
+  /** Whether a freeze empties a bucket here; see `handleFreezeOwnTypeRequests`. */
   private emptiedOnFreeze(): boolean {
     return (
       this.rateLimit.filter((limit) => limit.type === "requestLimit").length ===
@@ -594,7 +595,7 @@ class MeteredClient extends BaseClient {
     this.knownGrantIds.clear();
   }
 
-  /** Grants this client has claimed a slot for, so destroy can clean up. */
+  /** Grants this client has claimed a slot for. Nothing reads it. */
   private knownGrantIds = new Set<string>();
 }
 

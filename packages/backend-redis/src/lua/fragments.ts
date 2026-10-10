@@ -42,9 +42,9 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)`,
  * The two adjacent, differently-denominated TTL arguments the concurrency scripts
  * take, included above the `requestTtl` binding.
  *
- * `acquireConcurrency` and `tryAdmitConcurrency` carry it. `acquireQueuedConcurrency`
- * takes the same `ARGV[4]`-ms / `ARGV[5]`-seconds pair and does NOT — it never had
- * the warning, and the omission is worth closing rather than copying.
+ * `acquireConcurrency`, `acquireQueuedConcurrency` and `tryAdmitConcurrency`
+ * each take the same `ARGV[4]`-ms / `ARGV[5]`-seconds pair, and each carries
+ * it.
  */
 export const ttlArgvWarning = (prefix = "  "): string =>
   indent(
@@ -102,9 +102,9 @@ end`,
 /**
  * Declares `usableConcurrency(max)`, the one test for a ceiling that can admit.
  *
- * Each of the three concurrency scripts refuses differently — two encode an `error`
- * object, one returns `0` — so this declares a predicate rather than the gate itself,
- * and the caller supplies its own refusal.
+ * The scripts that include it refuse differently — some encode an `error`
+ * object, the fast paths return `0` — so this declares a predicate rather than
+ * the gate itself, and the caller supplies its own refusal.
  *
  * Requires: nothing. Declares `usableConcurrency`.
  */

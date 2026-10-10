@@ -442,7 +442,22 @@ class RedisBackend implements DianemoBackend {
 
 /**
  * Coordinates through Redis — the right choice for anything running more than
- * one process, and a safe choice for one.
+ * one process, and a safe choice for one. Valkey and DragonflyDB connections
+ * work unchanged. Run the server with `maxmemory-policy noeviction`: an evicted
+ * bucket reads as full. See docs/backends/redis.md.
+ *
+ * Registers dianemo's Lua scripts on `redis` as custom commands, and opens one
+ * duplicate connection of its own for pub/sub on the first `subscribe`;
+ * `close()` closes only that duplicate.
+ *
+ * ```ts
+ * import { Redis } from "ioredis";
+ * import RequestHandler from "@dianemo/core";
+ * import { redisBackend } from "@dianemo/backend-redis";
+ *
+ * const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
+ * const handler = new RequestHandler({ key, backend: redisBackend(redis) });
+ * ```
  *
  * @param redis an ioredis connection you own and will close yourself
  */

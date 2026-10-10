@@ -146,6 +146,11 @@ export class ClientFrozenError extends RequestHandlerError {
   }
 }
 
+/**
+ * What a `RequestError` carries beside its code: the caller's own fields,
+ * `client`, `context`, and `originalError` — the underlying failure's message,
+ * code, status and redacted response body.
+ */
 export interface RequestErrorMetadata {
   context?: string;
   errors?: unknown[];

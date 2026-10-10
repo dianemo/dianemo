@@ -159,6 +159,39 @@ export type {
   RequestHandlerStatus,
 } from "./types.js";
 
+/**
+ * The host for every outbound client in one process, and this process's seat
+ * in the fleet that shares their budgets through `backend`.
+ *
+ * Construct one per process. It starts itself on the first request or
+ * template mutation, and stops on SIGTERM, SIGINT or SIGHUP.
+ *
+ * ```ts
+ * import RequestHandler, { memoryBackend } from "@dianemo/core";
+ *
+ * const handler = new RequestHandler({
+ *   key: "a-high-entropy-secret-from-your-secret-store",
+ *   backend: memoryBackend(),
+ *   defaultClientOptions: {
+ *     name: "default",
+ *     rateLimit: [
+ *       { name: "per_second", type: "requestLimit", interval: 1000, tokensToAdd: 20, maxTokens: 20 },
+ *       { name: "per_day", type: "requestLimit", interval: 86_400_000, tokensToAdd: 50_000, maxTokens: 50_000 },
+ *     ],
+ *   },
+ * });
+ *
+ * const res = await handler.handleRequest({
+ *   clientName: "default",
+ *   requestName: "example.get",
+ *   method: "GET",
+ *   url: "https://api.example.com/things",
+ * });
+ * ```
+ *
+ * @throws {ConfigurationError} `backend_required` without a `backend`, and
+ * `key_required` for an empty or non-string `key`.
+ */
 export default class RequestHandler {
   protected id: string;
   protected priority: number;
@@ -265,6 +298,17 @@ export default class RequestHandler {
     return Array.from(this.pluginNames);
   }
 
+  /**
+   * Subscribes to the backend, builds the default client, runs the startup
+   * hooks, rebuilds every stored template client and joins the election.
+   *
+   * Idempotent, and called for you by `handleRequest` and the template
+   * methods. Concurrent calls share one start; a call during `stop()` waits for
+   * it and starts again. One stored template client that cannot be decrypted
+   * or built is logged and skipped. Anything else that fails — a startup hook,
+   * the backend — rejects this, closes what the backend opened, and leaves the
+   * handler stopped so a later call can retry.
+   */
   public async start(): Promise<void> {
     if (this.stopPromise) await this.stopPromise;
     if (this.status === "started") return;
@@ -351,6 +395,17 @@ export default class RequestHandler {
     this.shutdownHooksRegistered = false;
   }
 
+  /**
+   * Shuts down gracefully: refuses new requests, waits up to the drain budget
+   * (10 s; see `setDrainTimeout`) for this replica's queued work, fails what is
+   * still waiting with `ClientUnavailableError` `handler_stopped`, waits up to
+   * the same budget again for requests already upstream, deregisters, and
+   * closes what the backend opened — never the connection you passed in.
+   *
+   * Idempotent; a stop during `start()` lets the start finish first. Always
+   * ends `stopped`, even when deregistration fails, though that error still
+   * rejects this.
+   */
   public async stop(): Promise<void> {
     if (
       this.status !== "started" &&
@@ -384,7 +439,10 @@ export default class RequestHandler {
    */
   private drainTimeoutMs = 10_000;
 
-  /** Overrides the shutdown drain budget. */
+  /**
+   * Overrides the shutdown drain budget, in ms. Default 10000. `stop()` may
+   * spend it twice: once on queued work and once on requests already upstream.
+   */
   public setDrainTimeout(ms: number): void {
     this.drainTimeoutMs = ms;
   }
@@ -561,7 +619,12 @@ export default class RequestHandler {
     return declared ? Object.keys(declared) : [];
   }
 
-  /** Loaded clients with their effective rate limit — template default plus overrides. */
+  /**
+   * Every client registered on this replica with its effective limits — the
+   * template default, then the chosen plan, then overrides and any
+   * `rateLimitChange` since — every name resolved. `name` is the registered
+   * name, which for a `sharedLimit` client is its own rather than its owner's.
+   */
   public getLoadedClients(): Array<{
     name: string;
     rateLimit: NamedRateLimitData[];
@@ -586,6 +649,7 @@ export default class RequestHandler {
     return this.clients.get(clientName)?.getProbeConfig();
   }
 
+  /** This replica's id, status, election priority and clients. */
   public getMetadata(this: RequestHandler): RequestHandlerMetadata {
     const metadata: RequestHandlerMetadata = {
       id: this.id,
@@ -603,6 +667,31 @@ export default class RequestHandler {
     return metadata;
   }
 
+  /**
+   * Sends one request through `config.clientName`'s budgets, waiting its turn
+   * in the fleet-wide queue, and resolves with the axios response.
+   *
+   * Starts the handler if it is not started. Retries 429s, 5xxs and network
+   * failures (`ECONNRESET`, `ETIMEDOUT`, `ECONNABORTED`) per the client's
+   * `retryOptions`, freezing the client fleet-wide on each. Rejects with:
+   *
+   * - `ClientUnavailableError` — `handler_stopping` during `stop()`,
+   *   `handler_stopped` if shutdown failed it while queued, and
+   *   `shared_limit_parent_missing` for a `sharedLimit` client whose owner is
+   *   gone.
+   * - `ClientNotFoundError` when no client of that name appears within 5 s.
+   * - `ConfigurationError` — `invalid_request_cost`,
+   *   `invalid_request_priority`, `invalid_grant_id` or
+   *   `invalid_request_signal` for an unusable field.
+   * - `RequestCostExceedsBudgetError` for a `cost` above the client's tightest
+   *   `maxTokens` or `maxConcurrency`, now or after a budget change while it
+   *   queued.
+   * - `RequestTimeoutError` when it is not admitted within the client's
+   *   `requestOptions.cleanupTimeout` (default 60 s).
+   * - `RequestAbortedError` when `config.signal` aborts before dispatch.
+   * - The axios error itself for an upstream failure that is not retried or
+   *   has run out of retries.
+   */
   public async handleRequest<TResponse = unknown, TRequestData = unknown>(
     config: RequestConfig<TRequestData>
   ): Promise<AxiosResponse<TResponse, TRequestData>> {
@@ -721,7 +810,15 @@ export default class RequestHandler {
    * Registers a template builder. The name must be declared in `ClientTemplates`
    * via module augmentation, which is what types the credentials at the call site.
    *
-   * Called after `start()`, it immediately builds any credentials already stored.
+   * `options` declares the rate-limit plans callers may choose between; see
+   * {@link ClientTemplateOptions}. The plans are copied, so mutating the object
+   * afterwards changes nothing.
+   *
+   * Called after `start()`, it immediately builds any credentials already
+   * stored, logging and skipping one whose stored settings cannot be built.
+   *
+   * @throws {ConfigurationError} `invalid_template_name` for a name containing
+   * `:`, and the codes {@link ClientTemplateOptions} lists for unusable plans.
    */
   public async registerClientTemplate<K extends keyof ClientTemplates>(
     name: K,
@@ -820,6 +917,20 @@ export default class RequestHandler {
    * `options` carries this instance's `rateLimitOption` — one of the plans the
    * template declared — and any operator `rateLimitOverrides`. A bare overrides
    * record is still accepted in that position, as the argument used to be.
+   * Re-adding an instance replaces its credentials and options; passing none
+   * clears any it had.
+   *
+   * An unregistered template is logged and skipped rather than thrown.
+   *
+   * @throws {ConfigurationError} before anything is stored:
+   * `unknown_rate_limit_option` for a plan the template does not offer,
+   * `invalid_template_client_options` for an object mixing `rateLimitOption` or
+   * `rateLimitOverrides` with path keys, the codes {@link RateLimitOverrides}
+   * lists for an unusable override, and `invalid_client_name_segment` for an
+   * `instanceId` or `organizationId` that cannot be a name segment. After the
+   * write, `template_client_name_mismatch` from a builder whose client names
+   * omit the `instanceId`.
+   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
    */
   public async addTemplateClient<K extends keyof ClientTemplates>(
     templateName: K,
@@ -847,6 +958,12 @@ export default class RequestHandler {
    * shared secret to distribute, and putting a per-replica identity on the shared bus
    * would leak it. Every replica calls this at startup and they converge without
    * pub/sub. Contrast {@link addTemplateClient}.
+   *
+   * `options` is as {@link addTemplateClient} takes it, validated the same way
+   * and with the same `ConfigurationError` codes. An unregistered template is
+   * logged and skipped.
+   *
+   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
    */
   public async addLocalTemplateClient<K extends keyof ClientTemplates>(
     templateName: K,
@@ -985,6 +1102,14 @@ export default class RequestHandler {
     );
   }
 
+  /**
+   * Removes a template instance everywhere: destroys its clients here, failing
+   * their parked requests, deletes its stored credentials, settings and OAuth
+   * tokens, and tells every replica to destroy theirs. Starts the handler if
+   * needed. A no-op for an instance that does not exist.
+   *
+   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
+   */
   public async removeTemplateClient<K extends keyof ClientTemplates>(
     templateName: K,
     instanceId: string
@@ -1027,10 +1152,27 @@ export default class RequestHandler {
     throw new ClientNotFoundError(clientName);
   }
 
+  /**
+   * A client's freeze state, the client-level balance of each declared limit
+   * (`rateLimit`, one entry per limit), and what is queued and in flight
+   * fleet-wide. See `ClientStatistics` in `@dianemo/core/client/types`.
+   *
+   * @throws {ClientNotFoundError} when no client of that name is registered
+   * on this replica.
+   */
   public async getClientStats(clientName: string) {
     return this.getClient(clientName).getStats();
   }
 
+  /**
+   * Stores a grant's OAuth2 tokens, for a host seeding them after a user
+   * completes authorization. Requests naming that `grantId` then use them, and
+   * they are refreshed through the client's `grantRefreshConfig`.
+   *
+   * @throws {ClientNotFoundError} when no client of that name is registered.
+   * @throws {NotOAuth2ClientError} `client_not_oauth2` for a client whose
+   * authentication is not OAuth2.
+   */
   public async setGrantTokens(
     clientName: string,
     grantId: string,

@@ -12,10 +12,10 @@ import { Redis } from "ioredis";
 import RequestHandler from "@dianemo/core";
 import { redisBackend } from "@dianemo/backend-redis";
 
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL!);
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY,
+  key: process.env.REQUEST_HANDLER_KEY!,
   backend: redisBackend(redis),
 });
 ```

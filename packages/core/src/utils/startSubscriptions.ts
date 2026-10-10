@@ -76,9 +76,10 @@ async function handleMessage(
     case `${this.namespace}:templateClientRemoved`:
       await handleTemplateClientRemoved.bind(this)(message);
       break;
-    // Awaited, not left to settle on their own: these three reach the backend, the
-    // wrapper below only observes `handleMessage`, and a message landing while the
-    // connection closes — ordinary at shutdown — would reject unhandled.
+    // `requestAdded` and `requestDone` are awaited, not left to settle on their
+    // own: they reach the backend, the wrapper above only observes
+    // `handleMessage`, and a message landing while the connection closes —
+    // ordinary at shutdown — would reject unhandled.
     case `${this.namespace}:requestAdded`:
       await handleRequestAdded.bind(this)(message);
       break;

@@ -19,6 +19,11 @@ configured. Dianemo coordinates through a shared backend, so N replicas draw fro
 
 - **Shared token buckets.** One budget per credential, refilled lazily and drawn down by every
   replica through the backend. Adding replicas doesn't multiply your request rate.
+- **Several limits per client.** A vendor publishing "20 a second and 50,000 a day" is one client
+  with two limits, and a request goes out only when every one admits it — claimed in one atomic
+  backend operation, so a decline never leaves the first budget spent.
+- **Rate-limit plans in templates.** A template can offer a closed menu of limits — one per
+  subscription tier — and each tenant picks one by key when its credentials are added.
 - **Cost-weighted priority queue.** A request declares a `cost` (how many tokens it consumes) and a
   `priority`, so a bulk backfill is admitted behind interactive traffic instead of starving it.
 - **Freeze and thaw with single-flight probing.** When a vendor returns a hard limit, the client
@@ -89,10 +94,10 @@ import { redisBackend } from "@dianemo/backend-redis";
 import fedex from "@dianemo/plugin-fedex";
 import ups from "@dianemo/plugin-ups";
 
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL!);
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY, // encrypts credentials at rest
+  key: process.env.REQUEST_HANDLER_KEY!, // encrypts credentials at rest
   backend: redisBackend(redis),
   logger: console, // optional; silent by default
 });
@@ -102,8 +107,8 @@ export const requests = handler.use(fedex, ups);
 // Credentials arrive separately — from a vault, a database, or env.
 await handler.addTemplateClient("fedex", {
   instanceId: "production",
-  clientId: process.env.FEDEX_CLIENT_ID,
-  clientSecret: process.env.FEDEX_CLIENT_SECRET,
+  clientId: process.env.FEDEX_CLIENT_ID!,
+  clientSecret: process.env.FEDEX_CLIENT_SECRET!,
   baseUrl: "https://apis.fedex.com",
 });
 
@@ -123,7 +128,7 @@ For a single-process program, swap two lines and drop the dependency entirely:
 import RequestHandler, { memoryBackend } from "@dianemo/core";
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY,
+  key: process.env.REQUEST_HANDLER_KEY!,
   backend: memoryBackend(), // single process only — see "Choosing a backend"
 });
 ```
@@ -139,7 +144,7 @@ npm for the vendor you need rather than assuming it is there. Nothing waits on t
 
 | Term         | Meaning                                                                                    |
 | ------------ | ------------------------------------------------------------------------------------------ |
-| **Template** | The _shape_ of an integration: rate limit, auth flow, sub-clients. Carries no credentials. |
+| **Template** | The _shape_ of an integration: rate limits, auth flow, sub-clients. Carries no credentials. |
 | **Client**   | A template plus one set of credentials, named `<template>:<orgId \| _>:<alias>`.           |
 | **Plugin**   | A template plus the request functions that use it, packaged together.                      |
 | **Grant**    | An independently rate-limited credential within a client.                                  |

@@ -1,16 +1,22 @@
+/** A token bucket as the backend meters it: a `requestLimit` without its name. */
 export interface TokenBucketConfig {
+  /** Bucket ceiling; a bucket with no stored state reads as this full. */
   maxTokens: number;
+  /** Tokens credited per whole `interval` elapsed. */
   tokensToAdd: number;
   /** ms between token additions */
   interval: number;
 }
 
+/** A slot ledger as the backend meters it. */
 export interface ConcurrencyConfig {
+  /** Total cost that may be in flight at once. */
   maxConcurrency: number;
   /** ms before a slot expires — reclaims slots held by a crashed process */
   requestTtl: number;
 }
 
+/** What {@link DianemoBackend.acquireTokens} reports. */
 export interface AcquireTokensResult {
   acquired: boolean;
   remainingTokens?: number;
@@ -20,21 +26,23 @@ export interface AcquireTokensResult {
   error?: string;
 }
 
+/** What {@link DianemoBackend.acquireConcurrency} reports. */
 export interface AcquireConcurrencyResult {
   acquired: boolean;
   currentConcurrency?: number;
   /**
-   * Set when the ceiling itself is unusable, as opposed to merely full.
-   *
-   * Without this the two cases were indistinguishable to the caller, so a
-   * `maxConcurrency` of `NaN` or `0` looked exactly like a busy client and
-   * wedged it silently. Mirrors `AcquireTokensResult.error`.
+   * Set when the ceiling itself is unusable, as opposed to merely full, so a
+   * `maxConcurrency` of `NaN` or `0` is not mistaken for a busy client. Mirrors
+   * `AcquireTokensResult.error`.
    */
   error?: string;
 }
 
 /**
- * One budget a request must claim, named by the key it lives under.
+ * One budget a request must claim, named by the key it lives under: a token
+ * bucket at `<client namespace>:rateLimit:<name>` or a slot ledger at
+ * `<client namespace>:concurrency:<name>`, each with `:grant:<grantId>` after
+ * the namespace for an isolated grant.
  *
  * A client with several limits presents the whole list to the backend at once,
  * because claiming them one at a time is not the same operation: a peer can
@@ -58,16 +66,26 @@ export type MultiLimitSpec = {
     }
 );
 
+/** What {@link DianemoBackend.acquireMultiLimit} reports. */
 export interface AcquireMultiLimitResult {
   acquired: boolean;
-  /** ms to wait before retrying — the longest any declining budget asked for. */
+  /**
+   * ms to wait before retrying — the longest any declining token bucket asked
+   * for. A full concurrency ledger has no deadline of its own, so a decline
+   * caused only by one may carry `0` or nothing.
+   */
   waitTime?: number;
   /** Set when one of the configurations is unusable, as opposed to merely full. */
   error?: string;
-  /** Key of the budget that declined, for logs. Unset when every one admitted. */
+  /**
+   * Key of a budget that declined, for logs: the bucket with the longest wait,
+   * or the first full slot ledger when no bucket declined. Unset when every one
+   * admitted.
+   */
   blockedBy?: string;
 }
 
+/** A queue entry as the backend stores it. */
 export interface QueuedRequest {
   requestId: string;
   clientName: string;
@@ -82,11 +100,15 @@ export interface QueuedRequest {
   ownerId: string;
 }
 
+/** A client's or grant's freeze, as stored under its freeze key. */
 export interface FreezeState {
+  /** Epoch ms on the backend's clock — see {@link DianemoBackend.now}. */
   frozenUntil: number;
+  /** Successful probes still owed before the client runs at full rate again. */
   thawRequestCount: number;
 }
 
+/** Queue depth by status, and the total cost queued. */
 export interface QueueStats {
   pending: number;
   inProgress: number;
@@ -246,9 +268,14 @@ export interface DianemoBackend {
    * Claims every listed budget, or none of them.
    *
    * Optional so a backend written against an earlier version still satisfies the
-   * interface; a client declaring several limits refuses to start without it,
-   * rather than silently metering against one budget. All-or-nothing is the whole
-   * contract: a partial claim leaks budget that no completion path hands back.
+   * interface. A client declaring more than one limit is refused at
+   * construction — `ConfigurationError` `backend_missing_multi_limit` — by a
+   * backend lacking this or `releaseMultiLimit`, rather than silently metering
+   * against one budget. All-or-nothing is the whole contract: a partial claim
+   * leaks budget that no completion path hands back.
+   *
+   * An unusable configuration is reported through `error` rather than thrown,
+   * as {@link acquireTokens} does.
    */
   acquireMultiLimit?(
     specs: MultiLimitSpec[],
@@ -259,12 +286,16 @@ export interface DianemoBackend {
    * dispatched. Token buckets are credited and concurrency slots released.
    *
    * A spec's own `freezeKey` suppresses its refund while that freeze stands,
-   * matching {@link refundTokens} — a freeze empties buckets on purpose.
+   * matching {@link refundTokens} — a freeze empties buckets on purpose. Slots
+   * are released regardless.
    */
   releaseMultiLimit?(specs: MultiLimitSpec[], cost: number): Promise<void>;
   /**
    * The no-queue fast path for several budgets: admit only if nothing is queued,
-   * none of `freezeKeys` stands, and every budget can be claimed at once.
+   * none of `freezeKeys` stands or owes thaw probes, and every budget can be
+   * claimed at once. `ttl` is the key lifetime in seconds, default 86400.
+   *
+   * Optional; without it a client with several limits always queues.
    */
   tryAdmitMultiLimit?(
     queueKey: string,

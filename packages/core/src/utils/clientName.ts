@@ -7,6 +7,11 @@ import { ConfigurationError } from "../errors.js";
  *
  * Positional, so a cross-service consumer can parse it with {@link parseClientName}
  * without knowing template specifics. See docs/concepts.md#client-names.
+ *
+ * Returns the root name; a sub-client's path is appended by the handler.
+ *
+ * @throws {ConfigurationError} `invalid_client_name_segment` for an
+ * `instanceId` or `organizationId` that {@link assertNameSegment} refuses.
  */
 export function buildClientName(
   templateName: string,
@@ -29,7 +34,9 @@ export const GLOBAL_ORGANIZATION_SEGMENT = "_";
  * cache key — so `org "a"` + `instance "b:c"` and `org "a:b"` + `instance "c"`
  * would resolve to one client holding one set of credentials. Whitespace is
  * rejected too, since namespaces normalize it to `_`.
- * `registerClientTemplate` applies the same rule to the template name.
+ * `registerClientTemplate` applies the colon rule to the template name.
+ *
+ * @throws {ConfigurationError} `invalid_client_name_segment`.
  */
 export function assertNameSegment(value: string, field: string): void {
   if (typeof value !== "string" || value.length === 0) {
@@ -62,6 +69,7 @@ export function assertNameSegment(value: string, field: string): void {
   }
 }
 
+/** A client name split into its positional segments by `parseClientName`. */
 export interface ParsedClientName {
   templateName: string;
   organizationId: string | null;

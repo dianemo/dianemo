@@ -17,6 +17,11 @@ configured. Dianemo coordinates through a shared backend, so N replicas draw fro
 
 - **Shared token buckets.** One budget per credential, refilled lazily and drawn down by every
   replica through the backend. Adding replicas doesn't multiply your request rate.
+- **Several limits per client.** A vendor publishing "20 a second and 50,000 a day" is one client
+  with two limits, and a request goes out only when every one admits it — claimed in one atomic
+  backend operation, so a decline never leaves the first budget spent.
+- **Rate-limit plans in templates.** A template can offer a closed menu of limits — one per
+  subscription tier — and each tenant picks one by key when its credentials are added.
 - **Priority queue with cost-weighted spending.** A request declares a `priority`, so a bulk backfill
   at priority 1 is admitted behind interactive traffic at priority 5 instead of starving it, and a
   `cost` for how many tokens it consumes. Ordering is by priority, then retry count, then arrival —
@@ -53,8 +58,8 @@ import { redisBackend } from "@dianemo/backend-redis";
 import fedex from "@dianemo/plugin-fedex";
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY, // encrypts stored credentials
-  backend: redisBackend(new Redis(process.env.REDIS_URL)),
+  key: process.env.REQUEST_HANDLER_KEY!, // encrypts stored credentials
+  backend: redisBackend(new Redis(process.env.REDIS_URL!)),
   logger: console, // optional; silent by default
 });
 
@@ -63,8 +68,8 @@ export const requests = handler.use(fedex);
 // Credentials arrive separately — from a vault, a database, or env.
 await handler.addTemplateClient("fedex", {
   instanceId: "production",
-  clientId: process.env.FEDEX_CLIENT_ID,
-  clientSecret: process.env.FEDEX_CLIENT_SECRET,
+  clientId: process.env.FEDEX_CLIENT_ID!,
+  clientSecret: process.env.FEDEX_CLIENT_SECRET!,
   baseUrl: "https://apis.fedex.com",
 });
 

@@ -1,3 +1,9 @@
+/** One log level, in Pino's two call shapes: `log(obj, msg)` and `log(msg)`. */
+export interface LogFn {
+  (obj: unknown, msg?: string, ...args: unknown[]): void;
+  (msg: string, ...args: unknown[]): void;
+}
+
 /**
  * The logging surface the handler needs, narrowed to four levels and Pino's
  * two call shapes — `log(obj, msg)` and `log(msg)`.
@@ -6,11 +12,6 @@
  * `new RequestHandler({ logger: pino() })`. Anything else with these four
  * methods works too, including `console`.
  */
-export interface LogFn {
-  (obj: unknown, msg?: string, ...args: unknown[]): void;
-  (msg: string, ...args: unknown[]): void;
-}
-
 export interface Logger {
   debug: LogFn;
   info: LogFn;

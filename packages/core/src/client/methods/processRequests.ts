@@ -112,9 +112,7 @@ async function processRequests(this: BaseClient) {
         // Booked above all three exits below, not beside the `break`: two are
         // `continue`s taken by grant-scoped and grant-isolated requests, so booking
         // only before the `break` leaves exactly the isolated-grant tenants
-        // recovering on the health tick. A refusal that is not a freeze carries no
-        // deadline and books nothing — a concurrency client's occupied slot is woken
-        // by the release instead.
+        // recovering on the health tick.
         await this.scheduleDrainForFreeze(res.frozenUntil, grantId);
 
         if (grantId) {

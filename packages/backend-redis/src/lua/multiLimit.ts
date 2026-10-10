@@ -18,10 +18,13 @@ import {
  * them through `ARGV` would work on a single node and hide the cross-slot
  * problem from Redis Cluster, which is exactly the failure worth keeping loud.
  *
- * `ARGV[2]` carries the spec list as JSON: one object per budget, holding the
- * kind, the 1-based `KEYS` index it lives at, and the configuration to meter it
- * against. A positional ARGV per field would renumber every slot whenever a
- * budget was added — see `ttlArgvWarning` in `fragments.ts`.
+ * `ARGV[1]` is the cost, `ARGV[2]` the spec list as JSON and, in the two
+ * acquiring scripts, `ARGV[3]` the key TTL in seconds (a bucket's is raised to
+ * outlive its refill by `bucketTtl`). A spec is one object per budget, holding
+ * the kind, the 1-based `KEYS` index it lives at, and the configuration to
+ * meter it against; `tryAdmitMultiLimit` wraps the list as
+ * `{ specs, freezeKeys }`. A positional ARGV per field would renumber every
+ * slot whenever a budget was added — see `ttlArgvWarning` in `fragments.ts`.
  */
 
 /**

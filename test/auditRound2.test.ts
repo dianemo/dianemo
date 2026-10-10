@@ -252,12 +252,6 @@ async function withCustomHandler(
 
 for (const harness of harnesses(9)) {
   describe(`audit round 2 — '${harness.name}'`, () => {
-    /**
-     * `waitForTurn` used to sleep for the refill inside `processingLock`. The
-     * costly head was selected, then held the lock until its tokens arrived and
-     * spent them all — so a higher-priority arrival could not be considered
-     * until the window after the one it should have run in.
-     */
     it("admits a higher-priority arrival ahead of a costly queued head", async () => {
       const upstream = await startUpstream(0);
       try {

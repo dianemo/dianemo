@@ -25,17 +25,6 @@ import type {
   TokenBucketConfig,
 } from "./types.js";
 
-/**
- * In-process coordination, for a deployment that is exactly one process.
- *
- * **Every process running this gets its own private copy of every limit**, so two
- * processes send twice the agreed rate and nothing reports it. See
- * docs/backends/memory.md before choosing it.
- *
- * Every operation here is synchronous, which is what makes it atomic — a function
- * body runs to completion before anything else does — so there is no locking below.
- */
-
 interface Entry {
   expiresAt?: number;
   hash?: Map<string, string>;
@@ -140,6 +129,16 @@ function unusableBudget(
   return undefined;
 }
 
+/**
+ * In-process coordination, for a deployment that is exactly one process.
+ *
+ * **Every process running this gets its own private copy of every limit**, so two
+ * processes send twice the agreed rate and nothing reports it. See
+ * docs/backends/memory.md before choosing it.
+ *
+ * Every operation here is synchronous, which is what makes it atomic — a function
+ * body runs to completion before anything else does — so there is no locking below.
+ */
 class MemoryBackend implements DianemoBackend {
   readonly kind = "memory";
   readonly distributed = false;
@@ -793,7 +792,7 @@ class MemoryBackend implements DianemoBackend {
         acquired = false;
         // No deadline of its own: a slot is freed by a completion, and the
         // caller decides what to fall back on. Recorded only if nothing with a
-        // real wait already claimed the slot.
+        // real wait already claimed the report.
         if (blockedBy === undefined) blockedBy = spec.key;
         continue;
       }
@@ -1521,8 +1520,15 @@ class MemoryBackend implements DianemoBackend {
  * Coordinates in local memory — **single process only**.
  *
  * Each process gets its own copy of every rate limit, so running two of them
- * doubles what the vendor sees. Use {@link redisBackend} for anything that
- * scales past one process. See {@link MemoryBackend} for the full trade-offs.
+ * doubles what the vendor sees. Use `redisBackend` from
+ * `@dianemo/backend-redis` for anything that scales past one process. See
+ * {@link MemoryBackend} for the full trade-offs.
+ *
+ * ```ts
+ * import RequestHandler, { memoryBackend } from "@dianemo/core";
+ *
+ * const handler = new RequestHandler({ key, backend: memoryBackend() });
+ * ```
  */
 export function memoryBackend(): DianemoBackend {
   return new MemoryBackend();

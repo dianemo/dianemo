@@ -172,8 +172,9 @@ abstract class BaseClient {
   /**
    * Returns capacity claimed for an attempt that will not be dispatched.
    *
-   * Nothing is claimed before `tryAcquireTurn`, so this is the only path that
-   * gives capacity back outside of completion.
+   * Capacity is claimed only by `tryAcquireTurn` and the `tryAdmitImmediately`
+   * fast path, so this is the only path that gives it back outside of
+   * completion.
    */
   protected async refundUnusedAdmission(
     _request: RequestMetadata
@@ -1281,12 +1282,9 @@ abstract class BaseClient {
   // ---------------------------------------------- freeze state helpers
 
   /**
-   * Whether the next queued request may proceed now. With an isolated grant,
-   * the freeze state consulted is that grant's own.
-   *
-   * Takes the whole request because subclasses decide on more than the grant:
-   * a concurrency-limited client claims its slot here, so that a request which
-   * cannot proceed leaves the admission loop free instead of blocking it.
+   * Whether the next queued request may proceed now, judged on freeze state
+   * alone. With an isolated grant, the freeze state consulted is that grant's
+   * own. Claims nothing: every budget is claimed later, by `tryAcquireTurn`.
    */
   protected async canProcessNextRequest(request: RequestMetadata): Promise<{
     canProcess: boolean;
@@ -1324,11 +1322,9 @@ abstract class BaseClient {
         .canProcessRequest(this.getFreezeStateKey(grantId))
         .catch(() => undefined);
       // Only a freeze that still refuses carries a wake-up. `frozenUntil` is
-      // reported whenever freeze state exists at all, so a client whose freeze has
-      // lapsed with probes open reports a deadline in the past — and a refusal there
-      // came from something else, an occupied concurrency slot, which its release
-      // wakes. Booking on that past deadline instead made every pass re-decline and
-      // re-book against `scheduleDrain`'s 1ms floor.
+      // reported whenever freeze state exists at all, so a freeze that has
+      // lapsed reports a deadline in the past, and booking on it would
+      // re-decline and re-book every pass against `scheduleDrain`'s 1ms floor.
       if (!state || state.canProcess) return;
       deadline = state.frozenUntil;
     }
@@ -1339,10 +1335,6 @@ abstract class BaseClient {
     this.scheduleDrain(deadline - now);
   }
 
-  /**
-   * Whether the client is frozen right now. Unlike `canProcessNextRequest` this
-   * claims nothing, so it is safe to call repeatedly from inside a wait loop.
-   */
   /** Public view of {@link getFreezeStateKey}, for a client spending this budget. */
   public getFreezeStateKeyFor(grantId?: string): string {
     return this.getFreezeStateKey(grantId);
@@ -1353,6 +1345,11 @@ abstract class BaseClient {
     return this.isFrozen(grantId);
   }
 
+  /**
+   * Whether the client, or with an isolated grant that grant, is frozen right
+   * now. Claims nothing, so it is safe to call repeatedly from inside a wait
+   * loop.
+   */
   protected async isFrozen(grantId?: string): Promise<boolean> {
     const { canProcess } = await this.backend.canProcessRequest(
       this.getFreezeStateKey(grantId)

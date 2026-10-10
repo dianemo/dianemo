@@ -8,14 +8,15 @@ import type {
 } from "../client/types.js";
 
 /**
- * Shape a multi-limit entry's `name` must take.
+ * Shape every limit's `name` must take.
  *
- * The name becomes a backend key segment — `<namespace>:rateLimit:<name>` — so it
- * is held to the narrowest thing that never needs quoting or normalising: a colon
- * splits the segment the way it splits a client name, whitespace is normalised to
- * `_` when namespaces are derived, and two entries differing only by case would be
- * two names for what an operator reads as one bucket. `assertNameSegment` is the
- * client-name twin of this rule.
+ * The name becomes a backend key segment — `<namespace>:rateLimit:<name>` or
+ * `<namespace>:concurrency:<name>` — so it is held to the narrowest thing that
+ * never needs quoting or normalising: a colon splits the segment the way it
+ * splits a client name, whitespace is normalised to `_` when namespaces are
+ * derived, and two entries differing only by case would be two names for what
+ * an operator reads as one bucket. `assertNameSegment` is the client-name twin
+ * of this rule.
  */
 const RATE_LIMIT_NAME = /^[a-z0-9_]{1,64}$/;
 
@@ -23,9 +24,9 @@ const RATE_LIMIT_NAME = /^[a-z0-9_]{1,64}$/;
  * The name a client's limit takes when it declares one without naming it.
  *
  * Every limit is named internally, so there is one key shape and one config
- * shape rather than two of each; a caller writing the single form is simply
- * given this. It reads as a name because it becomes one, in the key and in
- * `getClientStats`.
+ * shape rather than two of each; a caller who declares one limit without a
+ * name is simply given this. It reads as a name because it becomes one, in the
+ * key and in `getClientStats`.
  */
 export const DEFAULT_RATE_LIMIT_NAME = "default";
 
@@ -36,11 +37,12 @@ export const DEFAULT_RATE_LIMIT_NAME = "default";
  * took the default are a duplicate, and reporting that is the whole reason the
  * default is a real name and not a blank.
  *
- * With `previous`, the list replacing it, an unnamed limit keeps the name of
- * the one limit of its type there, provided nothing else here claims that name.
- * A name is the budget's key, so taking the default instead would start a full
- * bucket and forget what the old one had spent — and `() => [{ type, ...fromHeaders }]`
- * is the natural way to write a `rateLimitChange` for a client with one limit.
+ * With `previous`, the list `config` replaces, an unnamed limit keeps the name
+ * of the one limit of its type there, provided nothing else in `config` claims
+ * that name; otherwise it is the default. A name is the budget's key, so
+ * taking the default instead would start a full bucket and forget what the old
+ * one had spent — and `() => [{ type, ...fromHeaders }]` is the natural way to
+ * write a `rateLimitChange` for a client with one limit.
  */
 export function normalizeRateLimit(
   config: readonly DeclaredRateLimit[],

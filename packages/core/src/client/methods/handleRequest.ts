@@ -48,9 +48,6 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
       },
     },
     async (span) => {
-      // A cost above the ceiling can never be admitted, so reject it here — to
-      // the caller — rather than letting it occupy the queue until it times out
-      // on whichever replica happens to be the controller.
       await this.assertReadyToQueue();
       // Constructed before the ceiling test, because its constructor validates the
       // shape of `cost`, `priority` and `grantId`. Testing the ceiling first makes
@@ -62,6 +59,9 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
         this.instanceId,
         this.requestOptions
       );
+      // A cost above the ceiling can never be admitted, so reject it here — to
+      // the caller — rather than letting it occupy the queue until it times out
+      // on whichever replica happens to be the controller.
       const ceiling = this.getCostCeiling();
       if (ceiling !== undefined && (config.cost ?? 1) > ceiling) {
         throw new RequestCostExceedsBudgetError(
@@ -196,13 +196,11 @@ async function publishAbandoned(
   // mechanism that makes queue/slot state correct.
   void this.finalizeOwnedRequest(data).catch(() => undefined);
   try {
-    // Bounded, because this runs on the path that has ALREADY decided to give
-    // up. An unbounded await here held the caller's `RequestTimeoutError` behind
-    // a publish that never settled — so the admission deadline fired correctly
-    // and then could not escape, which is the whole point of having one. A Redis
-    // that is up but not answering (saturated, swapping, paused) leaves the
-    // command in ioredis's queue indefinitely rather than rejecting it, so only
-    // a deadline gets the caller its answer.
+    // Bounded, because this runs on a path that has already given up, and the
+    // caller's `RequestTimeoutError` waits behind it. A Redis that is up but
+    // not answering (saturated, swapping, paused) leaves the command in
+    // ioredis's queue indefinitely rather than rejecting it, so only a deadline
+    // gets the caller its answer.
     await withDeadline(
       this.backend.publish(
         `${this.handlerNamespace}:requestDone`,
@@ -558,8 +556,8 @@ async function handleRetry(
   };
   // Classify the failure before deciding whether to retry. The freeze is a
   // fleet-wide statement about the upstream, and a 429 says the same thing on
-  // the last permitted attempt as on the first — checking the retry budget
-  // first meant `maxRetries: 0` never armed the back-off for anyone.
+  // the last permitted attempt as on the first, so `maxRetries: 0` still arms
+  // the back-off.
   const outOfRetries = request.retries >= this.retryOptions.maxRetries;
 
   if (status && status === 429 && retry429s) {
@@ -602,8 +600,7 @@ async function handleRetry(
   if (!data.retry) {
     // A freeze still needs a duration even though this request is finished
     // retrying: the freeze is about the upstream, not about this attempt, and
-    // `handleRequestDone` ignores a freeze with no wait time — so the last
-    // attempt's 429 armed nothing at all.
+    // `handleRequestDone` ignores a freeze with no duration.
     if (data.freezeClient) handleBackoff.bind(this)(request, data);
     return data;
   }

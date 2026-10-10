@@ -27,8 +27,8 @@ const buildLocks = new Map<string, Promise<void>>();
 /**
  * Entries already present in `templateClientMap` (i.e. built earlier in the
  * same `start()` by a startup hook calling `addTemplateClient`) are skipped,
- * so we don't tear them down and re-create them — `resetClient` doesn't
- * destroy(), so a rebuild leaks the old client's healthCheckInterval.
+ * so a client built moments ago is not torn down and rebuilt from the same
+ * record.
  */
 export async function loadTemplateClientsFromBackend(
   this: RequestHandler
@@ -56,10 +56,10 @@ export async function loadTemplateClientsFromBackend(
     );
     if (!encrypted) continue;
 
-    // One undecryptable entry used to reject `start()` outright, which also
-    // skipped every later template in this loop. Ciphertext written under a
-    // previous handler key is an expected, recoverable state — the OAuth token
-    // path already treats it that way — so it is logged and stepped over.
+    // Ciphertext written under a previous handler key is an expected,
+    // recoverable state — the OAuth token path treats it that way too — so it
+    // is logged and stepped over rather than failing `start()` and every later
+    // template in this loop.
     let credentials: unknown;
     try {
       credentials = decryptCredentials(encrypted, this.key);

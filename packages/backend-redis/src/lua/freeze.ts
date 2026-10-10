@@ -181,7 +181,7 @@ export const tryStartThawRequest = `
   -- individual grants, and a client-level freeze blocks everything anyway.
   if grantId ~= '' then
     redis.call('SADD', frozenGrantsKey, grantId)
-    -- The 24 hours every other key in the system is sized to. Membership is
+    -- The 24 hours most keys in the system are sized to. Membership is
     -- normally dropped by cleanupStaleFrozenGrants, which only runs while a
     -- controller does; without an expiry a fleet that stops holds the set, and
     -- getNextRequest skips those grants for as long as it survives.

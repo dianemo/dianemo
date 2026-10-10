@@ -3,8 +3,21 @@ import type { DianemoBackend } from "./backend/types.js";
 import type RequestHandler from "./index.js";
 import type { Logger } from "./logger.js";
 
+/** Lifecycle state, as `getMetadata` reports it; a stopping handler reads as `stopped`. */
 export type RequestHandlerStatus = "stopped" | "starting" | "started";
 
+/**
+ * Turns one instance's credentials into the client or clients it needs.
+ *
+ * Runs on every replica that builds the instance, on every rebuild, so it
+ * should be a pure function of its arguments. Every client it returns must carry the
+ * credentials' `instanceId` as a segment of its `name` — `buildClientName()`
+ * does this — or the build throws `ConfigurationError`
+ * `template_client_name_mismatch`.
+ *
+ * `context` carries the rate-limit plan the instance chose, when the template
+ * declared any; see {@link ClientTemplateContext}. A builder may ignore it.
+ */
 export type ClientTemplateBuilder<T = unknown> = (
   credentials: T,
   context: ClientTemplateContext
@@ -13,10 +26,12 @@ export type ClientTemplateBuilder<T = unknown> = (
 /**
  * What a template builder is told beyond the credentials.
  *
- * Every field is set only when the caller chose one of the rate-limit options
- * the template declared, and all are absent otherwise — including when a
+ * Every field is set only when the instance is on one of the rate-limit options
+ * the template declared — chosen by the caller, or the template's
+ * `defaultRateLimitOption` — and all are absent otherwise, including when a
  * template declares no options at all, which is how a builder that ignores this
- * argument keeps behaving exactly as it did.
+ * argument keeps behaving exactly as it did. Each build gets its own copy, so
+ * a builder may modify it.
  *
  * A builder does not have to place any of this. The chosen plan is applied to the
  * client tree by path after the builder returns, so a builder that only declares
@@ -25,7 +40,10 @@ export type ClientTemplateBuilder<T = unknown> = (
  * to decide whether a sub-client should exist at all, say.
  */
 export interface ClientTemplateContext {
-  /** The chosen plan's limit for the root client: its `""` path. */
+  /**
+   * The chosen plan's limits for the root client: its `""` path. Absent when
+   * the plan is a path map with no `""` entry.
+   */
   rateLimit?: DeclaredRateLimit[];
   /**
    * The whole chosen plan, keyed by sub-client path the way
@@ -49,7 +67,8 @@ export interface ClientTemplateContext {
  * endpoint needs, since a tier changes all of them at once.
  *
  * The two are told apart by shape: an array is the root's limits, and anything
- * else is read as a path map.
+ * else is read as a path map. A path matching no client the builder returns is
+ * logged and not applied.
  */
 export type RateLimitPlan =
   DeclaredRateLimit[] | Record<string, DeclaredRateLimit[]>;
@@ -60,6 +79,13 @@ export type RateLimitPlan =
  * The limits are the template's own, named by keys the caller picks from: there
  * is no way for a caller to supply a limit the plugin did not write. A template
  * declaring no options accepts no choice, and `addTemplateClient` rejects one.
+ *
+ * Validated by `registerClientTemplate`, which throws `ConfigurationError`:
+ * `unknown_rate_limit_type` for a plan or path that is not a list, the codes
+ * `CreateClientData.rateLimit` lists for an unusable limit, and
+ * `unknown_rate_limit_option` for a `defaultRateLimitOption` that names no
+ * plan. A chosen plan replaces whatever limits the builder declared on the
+ * paths it covers; an operator's {@link RateLimitOverrides} apply on top.
  *
  * ```ts
  * await handler.registerClientTemplate("acme", builder, {
@@ -116,7 +142,14 @@ export interface TemplateClientOptions {
  * sub-client of that name, `"a:b"` a nested one. An override may change the type
  * and number of limits freely, but not swap a client's own budgets for a
  * `sharedLimit` or the reverse — that would change the client class, so such an
- * override is skipped with a warning. See docs/concepts.md#rate-limit-overrides.
+ * override is skipped with a warning. An unnamed limit in an override keeps the
+ * name, and so the budget, of the one limit of its type it replaces. A
+ * sub-client with no limits of its own inherits its parent's after the
+ * parent's override. See docs/concepts.md#rate-limit-overrides.
+ *
+ * `addTemplateClient` validates overrides before storing them, throwing
+ * `ConfigurationError` `unknown_rate_limit_type` for a value that is not a
+ * list and the codes `CreateClientData.rateLimit` lists for an unusable limit.
  *
  * This is the operator-side escape hatch and needs no permission from the template.
  * For a choice the template itself sanctions, see {@link ClientTemplateOptions}.
@@ -139,6 +172,7 @@ export type RateLimitOverrides = Record<string, DeclaredRateLimit[]>;
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type
 export interface ClientTemplates {}
 
+/** Runs inside `start()`; see `RequestHandler.registerStartupHook`. */
 export type StartupHook = (handler: RequestHandler) => Promise<void> | void;
 
 export interface RequestHandlerConstructorOptions {
@@ -173,10 +207,15 @@ export interface RequestHandlerConstructorOptions {
   priority?: number;
 }
 
+/** A snapshot of one handler, from `RequestHandler.getMetadata`. */
 export interface RequestHandlerMetadata {
+  /** This replica's instance id. */
   id: string;
   status: RequestHandlerStatus;
+  /** Election weight, from the constructor's `priority`. */
   priority: number;
+  /** Every client registered on this replica. */
   registeredClients: string[];
+  /** The clients this replica is the queue controller for. */
   ownedClients: string[];
 }

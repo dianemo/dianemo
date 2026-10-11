@@ -486,6 +486,35 @@ class MeteredClient extends BaseClient {
     }
   }
 
+  public async keepAttemptAlive(request: RequestMetadata): Promise<void> {
+    const slotId = this.getSlotId(request);
+    const specs = this.getLimitSpecs(
+      request.grantId,
+      slotId,
+      request.cost,
+      true
+    );
+    for (const spec of specs) {
+      if (!wasClaimed(request, spec.key)) continue;
+      if (spec.kind === "concurrency") {
+        await this.backend.touchConcurrency?.(spec.key, slotId, 86400);
+        continue;
+      }
+      const mark = this.markFor(request, spec.config);
+      if (mark) {
+        await this.backend.touchClaimMark?.(spec.key, mark.id, mark.ttlSeconds);
+      }
+    }
+  }
+
+  /**
+   * A third of the slot TTL, so two ticks can be lost before the reaper takes
+   * the slot.
+   */
+  public streamKeepAliveMs(): number {
+    return this.requestTtl / 3;
+  }
+
   /**
    * Hands back a claim, by the call matching the one that made it.
    *

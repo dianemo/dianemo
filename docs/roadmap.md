@@ -17,8 +17,9 @@ and for a streamed response not until the stream ends.
 Built: a cost per limit rather than one for all of them,
 [settled](rate-limits/settlement.md) against what the response reports, a
 floor from the vendor's `retry-after`, and `classifyError` for failures the
-built-in rules misjudge. Planned: settling streamed responses, and syncing from
-the vendor's rate-limit headers. The design is in
+built-in rules misjudge, and [streamed responses](rate-limits/streaming.md)
+held, kept alive and settled until the stream ends. Planned: syncing from the
+vendor's rate-limit headers. The design is in
 [the proposal](proposals/usage-based-limits.md).
 
 ## Aggregate metrics

@@ -615,6 +615,42 @@ abstract class BaseClient {
   }
 
   /**
+   * Streamed responses this replica is still relaying, each counted in
+   * `inFlightRequests` until it ends. Kept so shutdown can name them and close
+   * them.
+   */
+  private openStreams = new Map<
+    string,
+    { close: () => void; finished: Promise<unknown> }
+  >();
+
+  public registerStream(
+    requestId: string,
+    stream: { close: () => void; finished: Promise<unknown> }
+  ): void {
+    this.openStreams.set(requestId, stream);
+  }
+
+  public unregisterStream(requestId: string): void {
+    this.openStreams.delete(requestId);
+  }
+
+  /** Requests whose streamed response is still open here. */
+  public openStreamIds(): string[] {
+    return [...this.openStreams.keys()];
+  }
+
+  /**
+   * Closes every stream still open, for shutdown, and waits for each to
+   * release its slot — which needs the backend still open.
+   */
+  public async closeStreams(): Promise<void> {
+    const streams = [...this.openStreams.values()];
+    for (const stream of streams) stream.close();
+    await Promise.all(streams.map((stream) => stream.finished));
+  }
+
+  /**
    * Whether admission has been stopped for shutdown. Read by `processRequests`.
    */
   public admissionHalted = false;
@@ -902,6 +938,22 @@ abstract class BaseClient {
   ): Promise<void> {
     const owner = this.getBudgetOwnerClient?.();
     if (owner && owner !== this) await owner.settleAttempt(request, settled);
+  }
+
+  /**
+   * Keeps a streaming attempt's claims alive: its slots from the reaper, its
+   * claim marks from expiry. Called every `streamKeepAliveMs` while the stream
+   * is open; a crashed process stops calling, so crash recovery is unchanged.
+   */
+  public async keepAttemptAlive(request: RequestMetadata): Promise<void> {
+    const owner = this.getBudgetOwnerClient?.();
+    if (owner && owner !== this) await owner.keepAttemptAlive(request);
+  }
+
+  /** How often a streaming attempt's claims are kept alive. */
+  public streamKeepAliveMs(): number {
+    const owner = this.getBudgetOwnerClient?.();
+    return owner && owner !== this ? owner.streamKeepAliveMs() : 60_000;
   }
 
   /**
@@ -1210,6 +1262,17 @@ abstract class BaseClient {
 
   private async handleRequestDone(pending: PendingRequestDone) {
     const { data } = pending;
+    // A streamed response announces twice. The headers settle the queue entry
+    // and the thaw probe, since the vendor has accepted the request — a probe
+    // holding its claim for a half-hour generation would hold the whole fleet's
+    // recovery. The end releases the slot, and freezes on a mid-stream error.
+    if (data.phase === "headers") {
+      pending.ownTypeHandled = true;
+      pending.freezeHandled = true;
+    } else if (data.phase === "end") {
+      pending.queueHandled = true;
+      pending.thawHandled = true;
+    }
     const isRetry = data.responseStatus === "retry";
 
     // A retry keeps its entry at pending status; success or failure removes it.
@@ -1705,7 +1768,8 @@ abstract class BaseClient {
 
 /** One attempt's outcome: a retry and the attempt after it are different. */
 function completionIdOf(data: RequestDoneData): string {
-  return `${data.requestId}:${data.retries}:${data.responseStatus}`;
+  const id = `${data.requestId}:${data.retries}:${data.responseStatus}`;
+  return data.phase ? `${id}:${data.phase}` : id;
 }
 
 /**

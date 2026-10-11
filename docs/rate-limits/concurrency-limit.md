@@ -54,7 +54,9 @@ is deliberately not `cleanupTimeout`: reclaiming a slot whose request is still i
 flight hands it to someone else, and the effective cap becomes
 `maxConcurrency × ceil(requestDuration / slotTtl)`. The two knobs want opposite
 values — short admission timeouts, long slot TTLs — which is why they are
-separate.
+separate. A [streamed response](streaming.md) is the exception: its slot is
+refreshed while the stream is open, so the TTL need only cover the wait for its
+headers.
 
 Three things about that TTL are easy to get wrong.
 

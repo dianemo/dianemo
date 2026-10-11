@@ -1,6 +1,6 @@
 # Proposal: usage-based limits
 
-**Status:** accepted; sections 1–4 are implemented, streaming is not yet. Targets the same major version as
+**Status:** accepted; sections 1–4 and 6 are implemented. Header sync, section 5, is for a later release. Targets the same major version as
 the multi-limit work. Once built, the user-facing parts move into
 `docs/rate-limits/` and the invariants into `docs/design-notes.md`, and this
 file is deleted.
@@ -261,6 +261,13 @@ The existing `rateLimitChange` hook replaces configuration, not balance, and
 stays as it is.
 
 ## 6. Streaming
+
+*Implemented; see [streamed responses](../rate-limits/streaming.md). Two
+departures from the sketch below: the headers settle the queue entry as well as
+the thaw probe, by a first `requestDone` announcement carrying
+`phase: "headers"`, and `settle` on a stream runs at the end rather than at the
+headers. The heartbeat refreshes claim marks through a second backend method,
+`touchClaimMark`.*
 
 `responseType: "stream"` already reaches axios, but dianemo publishes
 `requestDone` when the headers arrive. The slot is freed mid-generation,

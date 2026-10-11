@@ -78,6 +78,34 @@ export class RequestTimeoutError extends RequestHandlerError {
 }
 
 /**
+ * A streamed response stayed open past the client's `streamTimeout`, so it was
+ * closed and its slot released. The caller's stream is destroyed with this.
+ */
+export class StreamTimeoutError extends RequestHandlerError {
+  constructor(requestId: string, timeoutMs: number) {
+    super(
+      504,
+      "stream_timeout",
+      `Streamed response for request ${requestId} was still open after ${timeoutMs}ms`
+    );
+  }
+}
+
+/**
+ * The handler stopped while a streamed response was still open, so the stream
+ * was closed. The caller's stream is destroyed with this.
+ */
+export class StreamClosedError extends RequestHandlerError {
+  constructor(requestId: string) {
+    super(
+      503,
+      "stream_closed_on_shutdown",
+      `Streamed response for request ${requestId} was closed because the handler stopped`
+    );
+  }
+}
+
+/**
  * The retry loop ended without a response or an error to rethrow.
  *
  * When retries run out normally the last axios error is rethrown instead, so
@@ -202,14 +230,17 @@ function quoteList(names: readonly string[]): string {
  * Raised instead of letting the request wait for capacity it will never use,
  * or spend a token or a concurrency slot on a request axios would then refuse.
  * An abort once the request is upstream reaches axios and rejects with its
- * own cancellation error.
+ * own cancellation error, except while a streamed response is being read: the
+ * caller's stream is then destroyed with this, `whileStreaming` set.
  */
 export class RequestAbortedError extends RequestHandlerError {
-  constructor(requestId: string) {
+  constructor(requestId: string, whileStreaming = false) {
     super(
       499,
       "request_aborted",
-      `Request ${requestId} was aborted before it was sent`
+      whileStreaming
+        ? `Request ${requestId} was aborted while its response streamed`
+        : `Request ${requestId} was aborted before it was sent`
     );
   }
 }

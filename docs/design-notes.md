@@ -586,6 +586,14 @@ each completion it announced until a controller says it has applied it:
   completion would never be re-announced, and a remembered one could be stored
   again from a late echo.
 
+A [streamed response](rate-limits/streaming.md) announces twice, `phase:
+"headers"` and then `phase: "end"`, and the phase is part of the completion id,
+so each is applied and acknowledged on its own. The controller applies only its
+own half of each: the queue entry and thaw progress at the headers, the slot
+release and any freeze at the end. Split rather than delayed whole, because a
+thaw probe's claim lives in its queue entry, and a probe streaming for half an
+hour would hold the fleet's recovery for as long.
+
 ## One queue per budget, so one arbiter orders it
 
 A `sharedLimit` client is constructed with the owner's name. Its queue, bucket,

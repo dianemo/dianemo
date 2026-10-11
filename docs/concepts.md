@@ -418,6 +418,8 @@ if (typeof err.statusCode === "number" && typeof err.code === "string") {
 | `ClientConflictError`           | 409    | Duplicate client registration.                                                             |
 | `RequestTimeoutError`           | 408    | Queued past `cleanupTimeout` without being admitted.                                       |
 | `RequestAbortedError`           | 499    | The caller's `signal` fired before the request was sent.                                   |
+| `StreamTimeoutError`            | 504    | A streamed response stayed open past `streamTimeout`; the caller's stream is destroyed.    |
+| `StreamClosedError`             | 503    | The handler stopped with a streamed response still open.                                   |
 | `RequestCostExceedsBudgetError` | 400    | A request's `cost` exceeds a limit's `maxTokens` or `maxConcurrency`.                      |
 | `RequestCostMismatchError`      | 400    | A per-limit `cost` does not name exactly the limits the client meters.                     |
 | `NotOAuth2ClientError`          | 400    | Grant-token operations attempted on a client that is not OAuth2.                           |

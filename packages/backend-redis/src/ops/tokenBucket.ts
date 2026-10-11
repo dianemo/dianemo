@@ -199,6 +199,17 @@ export function tokenBucketOps(ctx: Ctx) {
       return specs.map((spec, i) => ({ key: spec.key, ...parsed[i] }));
     },
 
+    async touchClaimMark(
+      bucketKey: string,
+      markId: string,
+      ttlSeconds: number
+    ): Promise<boolean> {
+      const ttl = normalizeTtlSeconds(ttlSeconds);
+      return (
+        (await ctx.redis.expire(claimMarkKey(bucketKey, markId), ttl)) === 1
+      );
+    },
+
     /**
      * Returns budget claimed for a request that was never dispatched.
      *

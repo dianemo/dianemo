@@ -480,6 +480,35 @@ export interface DianemoBackend {
    */
   settleTokens?(specs: SettleSpec[]): Promise<SettleResult[]>;
 
+  // --------------------------------------------------------------- streaming
+
+  /**
+   * Restamps a held slot as claimed now, so a request still streaming its
+   * response is not reaped by `requestTtl` while it is alive. A slot that is
+   * gone stays gone. `ttlSeconds` re-arms the ledger key's expiry.
+   *
+   * Optional so an earlier backend still satisfies the interface; without it a
+   * stream that outlives `concurrencySlotTtl` loses its slot to the reaper.
+   *
+   * @returns Whether the slot was still held.
+   */
+  touchConcurrency?(
+    key: string,
+    slotId: string,
+    ttlSeconds: number
+  ): Promise<boolean>;
+  /**
+   * Extends a claim mark's lifetime, so a stream that outlives its
+   * `settleWindow` can still settle. A mark that is gone stays gone.
+   *
+   * @returns Whether the mark still existed.
+   */
+  touchClaimMark?(
+    bucketKey: string,
+    markId: string,
+    ttlSeconds: number
+  ): Promise<boolean>;
+
   // ------------------------------------------------------------ several budgets
 
   /**

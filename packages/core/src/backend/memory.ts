@@ -1228,6 +1228,32 @@ class MemoryBackend implements DianemoBackend {
     this.dropIfEmpty(`${key}:costs`);
   }
 
+  async touchConcurrency(
+    key: string,
+    slotId: string,
+    ttlSeconds: number
+  ): Promise<boolean> {
+    const ttl = normalizeTtlSeconds(ttlSeconds);
+    const slots = this.live(key)?.zset;
+    if (!slots?.has(slotId)) return false;
+    slots.set(slotId, Date.now());
+    this.expire(key, ttl);
+    if (this.live(`${key}:costs`)) this.expire(`${key}:costs`, ttl);
+    return true;
+  }
+
+  async touchClaimMark(
+    bucketKey: string,
+    markId: string,
+    ttlSeconds: number
+  ): Promise<boolean> {
+    const ttl = normalizeTtlSeconds(ttlSeconds);
+    const markKey = claimMarkKey(bucketKey, markId);
+    if (!this.live(markKey)) return false;
+    this.expire(markKey, ttl);
+    return true;
+  }
+
   async getConcurrencyState(
     key: string,
     requestTtl: number

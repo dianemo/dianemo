@@ -95,6 +95,15 @@ export function concurrencyOps(ctx: Ctx) {
       await ctx.run("dianemoReleaseConcurrency", key, requestId);
     },
 
+    async touchConcurrency(
+      key: string,
+      slotId: string,
+      ttlSeconds: number
+    ): Promise<boolean> {
+      const ttl = normalizeTtlSeconds(ttlSeconds);
+      return (await ctx.run("dianemoTouchConcurrency", key, slotId, ttl)) === 1;
+    },
+
     async getConcurrencyState(
       key: string,
       requestTtl: number

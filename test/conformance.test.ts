@@ -272,6 +272,47 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
 
   // ------------------------------------------------------------- settlement
 
+  describe("a streaming request's keep-alive", () => {
+    const SLOTS = "ka:slots";
+    const slots = { maxConcurrency: 1, requestTtl: 300 };
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    it("keeps a touched slot from being reaped", async () => {
+      await backend.acquireConcurrency(SLOTS, 1, "s1", slots);
+      await sleep(200);
+      expect(await backend.touchConcurrency!(SLOTS, "s1", 60)).toBe(true);
+      await sleep(200);
+      expect(
+        (await backend.acquireConcurrency(SLOTS, 1, "s2", slots)).acquired
+      ).toBe(false);
+    });
+
+    it("leaves a slot that is gone absent", async () => {
+      expect(await backend.touchConcurrency!(SLOTS, "s1", 60)).toBe(false);
+      expect(
+        (await backend.getConcurrencyState(SLOTS, 60_000)).activeRequests
+      ).toEqual([]);
+    });
+
+    it("keeps a touched claim mark past its first lifetime", async () => {
+      const config = { maxTokens: 100, tokensToAdd: 100, interval: 60_000 };
+      await backend.acquireTokens("ka:bucket", 10, config, {
+        id: "m1",
+        ttlSeconds: 1,
+      });
+      expect(await backend.touchClaimMark!("ka:bucket", "m1", 60)).toBe(true);
+      await sleep(1_200);
+      const [result] = await backend.settleTokens!([
+        { key: "ka:bucket", markId: "m1", actual: 30, config, maxDebt: 0 },
+      ]);
+      expect(result.settled).toBe(true);
+    });
+
+    it("reports a claim mark that is gone", async () => {
+      expect(await backend.touchClaimMark!("ka:bucket", "m1", 60)).toBe(false);
+    });
+  });
+
   describe("settlement", () => {
     const KEY = "st:rateLimit";
     // A refill interval long enough that nothing refills unless a test moves

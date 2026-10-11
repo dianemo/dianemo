@@ -146,6 +146,7 @@ abstract class BaseClient {
       // and cancels the probe budget a 429 was owed.
       thawRequestCount: usableThawRequestCount(retryOptions?.thawRequestCount),
       retryHandler: retryOptions?.retryHandler,
+      classifyError: retryOptions?.classifyError,
     };
     this.authData = data.client.authentication;
     this.key = data.key;

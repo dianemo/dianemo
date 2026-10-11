@@ -1,5 +1,5 @@
+import type { AxiosError, AxiosResponse, CreateAxiosDefaults } from "axios";
 import type { RequestConfig, RequestMetadata } from "../request/types.js";
-import type { AxiosResponse, CreateAxiosDefaults } from "axios";
 import type { DianemoBackend } from "../backend/types.js";
 import type { Logger } from "../logger.js";
 import type EventEmitter from "events";
@@ -385,6 +385,16 @@ export interface RetryOptions {
   /** Default: true. */
   retry5xxs: boolean;
   retryHandler?: RetryHandler;
+  /**
+   * Classifies a failure before the built-in rules do, deciding whether it is
+   * retried and whether it freezes the fleet. Return `undefined` to leave a
+   * failure to the built-in rules. Runs for every failed attempt, the last one
+   * included, since a freeze is about the upstream rather than this request.
+   *
+   * A throw is logged and the built-in rules decide. See
+   * docs/rate-limits/README.md#classifying-failures.
+   */
+  classifyError?: ErrorClassifier;
   /** Retried without freezing the fleet, unlike a 429 or 5xx. */
   retryStatusCodes: number[];
   /**
@@ -408,6 +418,22 @@ export type BackoffType = "exponential" | "linear";
  * classify itself. A retry granted here does not freeze the fleet.
  */
 export type RetryHandler = (error: unknown) => Promise<boolean> | boolean;
+
+/** What `classifyError` decides about a failed attempt. */
+export type ErrorDecision =
+  /** Terminal: the caller gets the error now, and nothing is frozen. */
+  | { action: "fail" }
+  /** Retry this request, within `maxRetries`, without freezing the fleet. */
+  | { action: "retry"; freeze?: false }
+  /**
+   * Retry this request and freeze the fleet. `freezeMs` is a floor on the
+   * freeze and the retry wait, like `retry-after`: the longer wins.
+   */
+  | { action: "retry"; freeze: true; freezeMs?: number };
+
+export type ErrorClassifier = (
+  error: AxiosError
+) => ErrorDecision | undefined | Promise<ErrorDecision | undefined>;
 
 /**
  * Last chance to change a request before it is sent. **Must return a config

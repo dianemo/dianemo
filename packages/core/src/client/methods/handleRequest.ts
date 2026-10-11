@@ -1,4 +1,5 @@
 import { trace, SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import { clampDelay, retryAfterMs } from "../../utils/retryAfter.js";
 import type { AxiosError, AxiosResponse } from "axios";
 import type * as ClientTypes from "../types.js";
 import authenticate from "./authenticate.js";
@@ -618,8 +619,23 @@ async function handleRetry(
   // the last permitted attempt as on the first, so `maxRetries: 0` still arms
   // the back-off.
   const outOfRetries = request.retries >= this.retryOptions.maxRetries;
+  // The vendor's own word on when to come back, which no back-off may undercut.
+  let floorMs = retryAfterMs(error?.response?.headers) ?? 0;
 
-  if (status && status === 429 && retry429s) {
+  const decision = await classifyError.bind(this)(request, error);
+  if (decision?.action === "fail") {
+    data.message += "Classified as terminal";
+    data.retry = false;
+  } else if (decision?.action === "retry") {
+    data.message += "Classified as retryable";
+    if (decision.freeze) {
+      data.freezeClient = true;
+      // Still a rate limit only if the upstream said so: it is what empties a
+      // bucket and owes the freeze its thaw probes.
+      data.isRateLimited = status === 429;
+      floorMs = Math.max(floorMs, clampDelay(decision.freezeMs ?? 0));
+    }
+  } else if (status && status === 429 && retry429s) {
     data.message += "Rate Limited";
     data.isRateLimited = true;
     data.freezeClient = true;
@@ -660,26 +676,71 @@ async function handleRetry(
     // A freeze still needs a duration even though this request is finished
     // retrying: the freeze is about the upstream, not about this attempt, and
     // `handleRequestDone` ignores a freeze with no duration.
-    if (data.freezeClient) handleBackoff.bind(this)(request, data);
+    if (data.freezeClient) handleBackoff.bind(this)(request, data, floorMs);
     return data;
   }
   request.incrementRetries();
-  return handleBackoff.bind(this)(request, data);
+  return handleBackoff.bind(this)(request, data, floorMs);
 }
 
-/** How long to wait before the next attempt. */
+/**
+ * Runs the client's `classifyError`, if it has one. Like `retryHandler`, it runs
+ * before the failure is logged or announced, so a throw is caught here and the
+ * built-in rules decide rather than the slot being stranded.
+ */
+async function classifyError(
+  this: BaseClient,
+  request: Request,
+  error: AxiosError
+): Promise<ClientTypes.ErrorDecision | undefined> {
+  const classify = this.retryOptions.classifyError;
+  if (!classify) return undefined;
+  try {
+    const decision = await classify(error);
+    if (
+      decision === undefined ||
+      decision?.action === "fail" ||
+      decision?.action === "retry"
+    ) {
+      return decision;
+    }
+    this.logger.error(
+      { decision },
+      `Request ID: ${request.id} | classifyError returned an unknown decision; the built-in rules decide`
+    );
+  } catch (classifierError) {
+    this.logger.error(
+      { error: classifierError },
+      `Request ID: ${request.id} | classifyError threw; the built-in rules decide`
+    );
+  }
+  return undefined;
+}
+
+/**
+ * How long to wait before the next attempt, and how long a freeze lasts.
+ * `floorMs` lengthens both and shortens neither, so repeated failures still
+ * stretch a freeze past it.
+ */
 function handleBackoff(
   this: BaseClient,
   request: Request,
-  data: RequestRetryData
+  data: RequestRetryData,
+  floorMs = 0
 ) {
   const power = this.retryOptions.retryBackoffMethod === "exponential" ? 2 : 1;
   // At least one attempt's worth. `retries` is 0 on a first failure, and zero
   // times anything is a wait of zero — which reads as "no freeze" downstream.
   const attempt = Math.max(1, request.retries);
   const multiplier = Math.pow(attempt, power);
-  data.waitTime = multiplier * this.getRetryBackoffBaseTime(data.isRateLimited);
-  data.freezeTime = multiplier * this.getFreezeBaseTime(data.isRateLimited);
+  data.waitTime = Math.max(
+    floorMs,
+    multiplier * this.getRetryBackoffBaseTime(data.isRateLimited)
+  );
+  data.freezeTime = Math.max(
+    floorMs,
+    multiplier * this.getFreezeBaseTime(data.isRateLimited)
+  );
   data.message += ` | Will retry...`;
   return data;
 }

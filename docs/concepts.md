@@ -255,6 +255,11 @@ refill interval, and on a client that owns its budgets so is the 429's retry
 wait. See
 [a zero back-off does not disarm it](rate-limits/README.md#a-zero-back-off-does-not-disarm-it).
 
+A response's `retry-after` sets the minimum for the freeze, and
+`retryOptions.classifyError` can fail a 429 without freezing anything or freeze
+on a status the built-in rules would not; see
+[classifying failures](rate-limits/README.md#classifying-failures).
+
 A claim handed back unsent — an aborted or abandoned request — is refunded even
 while a freeze stands, unless that freeze emptied the bucket, which only a 429
 on a client with exactly one `requestLimit` does.

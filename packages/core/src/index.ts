@@ -171,6 +171,8 @@ export type {
   SharedLimitClientOptions,
   RateLimitStats,
   NamedRateLimitStats,
+  ErrorClassifier,
+  ErrorDecision,
 } from "./client/types.js";
 export type {
   RequestHandlerConstructorOptions,

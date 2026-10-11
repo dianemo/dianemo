@@ -1,6 +1,6 @@
 # Proposal: usage-based limits
 
-**Status:** accepted, not yet implemented. Targets the same major version as
+**Status:** accepted; sections 1–4 are implemented, streaming is not yet. Targets the same major version as
 the multi-limit work. Once built, the user-facing parts move into
 `docs/rate-limits/` and the invariants into `docs/design-notes.md`, and this
 file is deleted.
@@ -192,11 +192,15 @@ Per-limit and opt-in:
 Debt is the expected configuration for an output-token limit: reserve an
 estimate rather than `max_tokens`, and let settlement charge the rest.
 
-New backend method: optional `settleMultiLimit(specs, attemptId)`, one atomic
-operation across every bucket. A client configured to settle refuses to start on
-a backend without it, as `assertBackendCanClaim` does today.
+New backend methods: optional `settleTokens(specs)`, one atomic operation
+across every bucket, and `emptyTokenBucket(key, config)`, which a freeze uses so
+the generation moves on. A request that settles is refused when it is made on a
+backend without `settleTokens`.
 
 ## 3. `retry-after`
+
+*Implemented; see
+[`retry-after` sets the minimum](../rate-limits/README.md#retry-after-sets-the-minimum).*
 
 Nothing reads `retry-after` today. A 429's wait comes from `handleBackoff` —
 the retry multiplier times the shortest refill interval — and with several
@@ -210,16 +214,19 @@ benefits, not just AI ones.
 
 ## 4. `classifyError`
 
+*Implemented as `retryOptions.classifyError`; see
+[classifying failures](../rate-limits/README.md#classifying-failures).*
+
 Every 429 is retried and freezes the fleet. `retryHandler` cannot intervene,
 because it only runs for statuses dianemo does not classify, and
 `retry429s: false` gives up on rate limits entirely. A spend-cap 429, or
 OpenAI's `insufficient_quota`, therefore burns through `maxRetries` and
 refreezes the fleet on every request until next month.
 
-A client option that runs before the built-in rules:
+A retry option that runs before the built-in rules:
 
 ```ts
-classifyError?: (error: AxiosError) => ErrorDecision | undefined; // undefined: built-in rules
+classifyError?: (error: AxiosError) => ErrorDecision | undefined | Promise<…>; // undefined: built-in rules
 
 type ErrorDecision =
   | { action: "fail" } // terminal: no retry, no freeze
@@ -330,10 +337,11 @@ an observer, core cannot see a mid-stream error and records success.
 ## Rollout
 
 Breaking, and part of the same major version as the multi-limit work; the
-version plan already declares the bump. The upgrade note gains one hazard:
-during a rolling deploy, a replica on the previous version reads an object
-`cost` from the shared queue and refuses it as `invalid_request_cost`. That
-fails the request rather than mis-metering it.
+version plan already declares the bump. The upgrade note gains one hazard: a
+replica built before per-limit costs reads an object `cost` from the shared
+queue as `parseFloat` does, falls back to 1, and charges 1 against every limit —
+under-charging a token limit. The major version already requires stopping the
+fleet, which avoids it.
 
 ## Open questions
 

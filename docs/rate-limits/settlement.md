@@ -109,3 +109,6 @@ arriving after the window applies nothing.
 - A `sharedLimit` client settles against its owner's limits, by their names.
 - Streamed responses are not settled yet: `settle` runs when the headers
   arrive, before the usage is known.
+- A spend-cap 429 is retried and freezes the fleet like any other 429. To fail
+  it at once instead, see
+  [classifying failures](README.md#classifying-failures).

@@ -14,9 +14,11 @@ APIs most visibly, which limit input and output tokens per minute alongside
 requests. The cost of such a request is not known until its response arrives,
 and for a streamed response not until the stream ends.
 
-Planned: a cost per limit rather than one for all of them, settled against what
-the response reports, carried through streamed responses, and respecting the
-vendor's `retry-after`. The design is in
+Built: a cost per limit rather than one for all of them,
+[settled](rate-limits/settlement.md) against what the response reports, a
+floor from the vendor's `retry-after`, and `classifyError` for failures the
+built-in rules misjudge. Planned: settling streamed responses, and syncing from
+the vendor's rate-limit headers. The design is in
 [the proposal](proposals/usage-based-limits.md).
 
 ## Aggregate metrics

@@ -1,4 +1,5 @@
 import type { RequestMetadata } from "../../request/types.js";
+import type { QueuedRequest } from "../../backend/types.js";
 import type BaseClient from "../index.js";
 import {
   ClientFrozenError,
@@ -153,6 +154,18 @@ async function processRequests(this: BaseClient) {
         requestMetadata.isThawRequest = true;
       }
 
+      // A probe that does not go out must give the mark back: left set, it reads
+      // as a competing probe, and its eventual completion would be counted
+      // against whichever freeze is standing by then.
+      const returnToQueue = async () => {
+        const updates: Partial<QueuedRequest> = { status: "pending" };
+        if (requestMetadata.isThawRequest) {
+          updates.isThawRequest = false;
+          requestMetadata.isThawRequest = false;
+        }
+        await this.updateRequestInQueue(requestId, updates);
+      };
+
       // Between the claim above and the notification below the request exists
       // only in this loop — `getNextRequest` already marked it `inProgress`, so
       // no other controller reconsiders it and orphan cleanup skips it while its
@@ -160,7 +173,7 @@ async function processRequests(this: BaseClient) {
       try {
         const turn = await this.tryAcquireTurn(requestMetadata);
         if (!turn.acquired) {
-          await this.updateRequestInQueue(requestId, { status: "pending" });
+          await returnToQueue();
           // Coming back later is the whole point: sleeping here would hold the
           // lock and stall every other grant and every cheaper or
           // higher-priority request behind this one.
@@ -223,9 +236,7 @@ async function processRequests(this: BaseClient) {
           );
         }
       } catch (error) {
-        await this.updateRequestInQueue(requestId, {
-          status: "pending",
-        }).catch(() => {});
+        await returnToQueue().catch(() => {});
 
         // A ceiling lowered while this request sat in the queue makes its cost
         // impossible. Stepping over it is what keeps everything behind it

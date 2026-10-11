@@ -395,20 +395,10 @@ class MeteredClient extends BaseClient {
       await this.backend.releaseConcurrency(claimed[0].key, slotId);
       return;
     }
-    // The backend refuses a refund while the bucket's freeze stands, because a
-    // freeze empties that bucket. It does so only for a client's one
-    // `requestLimit` (see `handleFreezeOwnTypeRequests`); with several, no
-    // bucket was emptied, so they drop their freeze key and are refunded as
-    // any unsent request's would be.
-    const freezeEmpties = this.emptiedOnFreeze();
-    await this.backend.releaseMultiLimit?.(
-      claimed.map((spec) =>
-        spec.kind === "tokenBucket" && !freezeEmpties
-          ? { ...spec, freezeKey: undefined }
-          : spec
-      ),
-      cost
-    );
+    // The freeze key always goes along: whether the standing freeze emptied
+    // the buckets is recorded on the freeze itself (`emptiesBucket`), and the
+    // limits in force now may not be the ones in force when it was armed.
+    await this.backend.releaseMultiLimit?.(claimed, cost);
   }
 
   /** Whether a freeze empties a bucket here; see `handleFreezeOwnTypeRequests`. */

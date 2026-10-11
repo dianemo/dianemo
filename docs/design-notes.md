@@ -474,10 +474,12 @@ each completion it announced until a controller says it has applied it:
   as on the controller, so a late echo of a re-announcement is not stored again.
   Without that the owner's own echo re-armed it, and `requestDone` — which
   consumers meter — carried one completion on every tick, forever.
-- A non-owner keeps its copy only until its next tick. It matters when that
-  replica is promoted first, and the owner's re-announcement covers the rest —
-  which is also what carries a completion past a controller that died with it
-  unapplied.
+- A non-owner never applies its copy: it drops it on its next tick, and on
+  promotion before applying anything else. Applied on promotion, it would
+  replay a completion the previous controller had already applied — re-arming
+  a freeze whose probe had lifted it. The owner's re-announcement is what
+  reaches a new controller, and it is also what carries a completion past a
+  controller that died with it unapplied.
 
 ## One queue per budget, so one arbiter orders it
 

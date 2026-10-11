@@ -448,6 +448,7 @@ export async function withReplicas(
                 concurrencySlotTtl: options.concurrencySlotTtl,
                 defaults: { baseURL: options.baseURL },
               },
+              ...(spec.retryOptions ? { retryOptions: spec.retryOptions } : {}),
               ...(spec.healthCheckIntervalMs
                 ? { healthCheckIntervalMs: spec.healthCheckIntervalMs }
                 : {}),

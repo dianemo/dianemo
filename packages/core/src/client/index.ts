@@ -753,6 +753,7 @@ abstract class BaseClient {
     const wasWorker = this.role === "worker";
     this.role = role;
     if (wasWorker && role === "controller") {
+      this.dropRetainedCopies();
       await this.flushPendingRequestDone();
       await this.cleanupOrphanedRequests();
       await this.cleanupStaleFrozenGrants();
@@ -1098,14 +1099,9 @@ abstract class BaseClient {
       return;
     }
 
+    this.dropRetainedCopies();
     const now = Date.now();
     for (const [completionId, pending] of this.pendingRequestDone) {
-      // Only the owner re-announces. A copy retained here for anyone else is
-      // dropped: that owner is still announcing it until it is acknowledged.
-      if (pending.data.ownerId !== this.instanceId) {
-        this.pendingRequestDone.delete(completionId);
-        continue;
-      }
       if (now < pending.forwardDueAt) continue;
       if (pending.forwards >= MAX_COMPLETION_FORWARDS) {
         this.logger.warn(
@@ -1121,6 +1117,19 @@ abstract class BaseClient {
         `${this.handlerNamespace}:requestDone`,
         JSON.stringify(pending.data)
       );
+    }
+  }
+
+  /**
+   * Drops the copies of other replicas' completions this one retained; their
+   * owners re-announce them. See docs/design-notes.md#completion-hand-off.
+   */
+  private dropRetainedCopies(): void {
+    if (this.getBudgetOwnerClient) return;
+    for (const [completionId, pending] of this.pendingRequestDone) {
+      if (pending.data.ownerId !== this.instanceId) {
+        this.pendingRequestDone.delete(completionId);
+      }
     }
   }
 

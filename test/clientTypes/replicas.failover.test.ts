@@ -1291,6 +1291,78 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
     }
   }, 60_000);
 
+  it("does not re-apply a completion the old controller applied when a worker takes over", async () => {
+    let answered = 0;
+    const upstream = createServer((_req, res) => {
+      res.writeHead(answered++ === 0 ? 429 : 200).end("{}");
+    });
+    await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
+    const address = upstream.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    try {
+      await withReplicas(
+        {
+          count: 2,
+          baseURL: `http://127.0.0.1:${port}`,
+          clients: [
+            {
+              name: "fo11",
+              rateLimit: [
+                {
+                  name: "per_second",
+                  type: "requestLimit",
+                  interval: 1000,
+                  tokensToAdd: 10,
+                  maxTokens: 10,
+                },
+              ],
+              retryOptions: {
+                maxRetries: 0,
+                retryBackoffBaseTime: 100,
+                thawRequestCount: 1,
+              },
+              // Longer than the test, so the worker still holds its copy of
+              // the 429's completion when it is promoted.
+              healthCheckIntervalMs: 30_000,
+            },
+          ],
+          redisDb: REDIS_DB,
+          keyPrefix: "fo11",
+        },
+        async ({ controllerFor, workersFor }) => {
+          const client = "fo11:_:a";
+          const controller = controllerFor(client);
+          expect(controller).toBeDefined();
+          if (!controller) return;
+          const worker = workersFor(client)[0];
+
+          await fire(controller, client).catch(() => undefined);
+          await sleep(1_300);
+          expect((await fire(controller, client)).status).toBe(200);
+          await waitFor(
+            "the probe to thaw the client",
+            async () => !(await worker.getClientStats(client)).isFrozen
+          );
+
+          await controller.stop();
+          await waitFor("the worker to take the controller role", () =>
+            worker.getMetadata().ownedClients.includes(client)
+          );
+          await sleep(200);
+
+          const stats = await worker.getClientStats(client);
+          expect({
+            isFrozen: stats.isFrozen,
+            thawRequestCount: stats.thawRequestCount,
+          }).toEqual({ isFrozen: false, thawRequestCount: 0 });
+        }
+      );
+    } finally {
+      upstream.closeAllConnections();
+      await new Promise<void>((r) => upstream.close(() => r()));
+    }
+  }, 60_000);
+
   it("fails a stopping replica's queued work with a reason and lets the controller reclaim it", async () => {
     const upstream = await startUpstream(0);
     const raw = new Redis(`${REDIS_URL}/${REDIS_DB}`);

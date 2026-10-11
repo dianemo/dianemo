@@ -184,7 +184,6 @@ describe.each(harnesses(0))(
         harness,
         { rateLimit: [A] },
         async (handler, backend) => {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const client = (handler as any).clients.get(NAME);
           const BUCKET = `${NS}:rateLimit:per_min`;
           const FREEZE = `${NS}:freezeState`;

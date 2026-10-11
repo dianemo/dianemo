@@ -1,5 +1,6 @@
 import type { AcquireMultiLimitResult, MultiLimitSpec } from "@dianemo/core";
 import { normalizeTtlSeconds } from "@dianemo/core";
+import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 
 /**
@@ -20,7 +21,11 @@ export function multiLimitOps(ctx: Ctx) {
         JSON.stringify(payload),
         86400
       );
-      return JSON.parse(result as string) as AcquireMultiLimitResult;
+      const parsed = JSON.parse(result as string) as AcquireMultiLimitResult;
+      if (parsed.waitTime !== undefined) {
+        parsed.waitTime = parseLuaNumber(parsed.waitTime);
+      }
+      return parsed;
     },
 
     async releaseMultiLimit(

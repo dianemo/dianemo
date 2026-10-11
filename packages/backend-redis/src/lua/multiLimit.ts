@@ -1,5 +1,6 @@
 import {
   bucketTtlFn,
+  exactFn,
   finiteNumberFn,
   lazyRefill,
   redisNow,
@@ -59,8 +60,8 @@ local function planMultiLimit(specs, cost, now, ttl)
       if maxTokens == nil or not (maxTokens > 0) or maxTokens == math.huge then
         return { acquired = false, error = 'maxTokens must be a finite number greater than 0' }
       end
-      if cost == nil or cost ~= cost or cost == math.huge or cost == -math.huge then
-        return { acquired = false, error = 'cost must be a finite number' }
+      if not usableCost(cost) then
+        return { acquired = false, error = 'cost must be a finite number that is not negative' }
       end
       if interval == nil or interval ~= interval or interval == math.huge or interval == -math.huge then
         return { acquired = false, error = 'interval must be a finite number' }
@@ -157,6 +158,8 @@ ${usableCostFn()}
 
 ${usableRequestTtlFn()}
 
+${exactFn()}
+
 ${planFn}
 
   local plan = planMultiLimit(specs, cost, now, ttl)
@@ -165,7 +168,7 @@ ${planFn}
   end
   if not plan.acquired then
     persistRefills(plan)
-    return cjson.encode({ acquired = false, waitTime = plan.waitTime or 0, blockedBy = plan.blockedBy })
+    return cjson.encode({ acquired = false, waitTime = exact(plan.waitTime or 0), blockedBy = plan.blockedBy })
   end
   commitMultiLimit(plan, cost, now, ttl)
   return cjson.encode({ acquired = true })
@@ -239,12 +242,16 @@ ${redisNow()}
 
 ${finiteNumberFn()}
 
+${usableCostFn()}
+
+  local creditable = usableCost(cost)
+
   for _, spec in ipairs(specs) do
     local key = KEYS[spec.k]
     if spec.kind == 'concurrency' then
       redis.call('ZREM', key, spec.slotId)
       redis.call('HDEL', key .. ':costs', spec.slotId)
-    else
+    elseif creditable then
       local frozen = false
       if spec.fk ~= nil then
         -- The gate refundTokens applies, read identically.

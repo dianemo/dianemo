@@ -1,4 +1,5 @@
 import {
+  exactFn,
   finiteNumberFn,
   freezeGate,
   queueEmptyGate,
@@ -69,12 +70,19 @@ ${redisNow()}
     end
   end
 
-  -- Clamped after the merge, so a deadline already stored beyond the ceiling is
-  -- brought down rather than carried forward by "take the larger". 2^53-1 is
-  -- where an integer reply stops surviving the trip back into the caller's
-  -- Number; past it string.format('%d') clamps to 2^63-1 instead of raising,
-  -- and this is also what keeps the ttl below within EXPIRE's range.
-  if frozenUntil > 9007199254740991 then frozenUntil = 9007199254740991 end
+  -- After the merge, so a stored value that won it is written back in range
+  -- rather than carried forward by "take the larger". 2^53-1 is where an
+  -- integer reply stops surviving the trip into the caller's Number; past it
+  -- string.format('%d') saturates at 2^63-1 instead of raising. It also keeps
+  -- the ttl below within EXPIRE's range. Twin of the memory backend's storable.
+  local function storable(value, min)
+    if value >= 0 then value = math.floor(value) else value = math.ceil(value) end
+    if value < min then return min end
+    if value > 9007199254740991 then return 9007199254740991 end
+    return value
+  end
+  frozenUntil = storable(frozenUntil, -9007199254740991)
+  thawRequestCount = storable(thawRequestCount, 0)
 
   -- Derived above the writes because EXPIRE is what rejects an out-of-range
   -- ttl, and it runs second.
@@ -107,6 +115,7 @@ export const readFreezeState = `
   local key = KEYS[1]
   local state = redis.call('HMGET', key, 'frozenUntil', 'thawRequestCount')
 ${finiteNumberFn()}
+${exactFn()}
   -- An unusable deadline counts as no freeze state at all. A nan parses through
   -- tonumber and then survives every comparison, which reported a client frozen
   -- with zero probes owed and no deadline any wake-up could be booked against.
@@ -122,7 +131,9 @@ ${redisNow()}
   -- endpoint. updateThawProgress is the only place that deletes.
   if now >= frozenUntil and thawRequestCount <= 0 then return nil end
 
-  return { frozenUntil, thawRequestCount, (now < frozenUntil) and 1 or 0 }
+  -- Strings, because an integer reply truncates a stored fraction and
+  -- saturates a stored 1e300 where the memory twin reads both exactly.
+  return { exact(frozenUntil), exact(thawRequestCount), (now < frozenUntil) and 1 or 0 }
 `;
 
 export const updateThawProgress = `

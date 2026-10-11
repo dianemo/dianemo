@@ -25,9 +25,15 @@ export interface ConcurrencyConfig {
 export interface AcquireTokensResult {
   acquired: boolean;
   remainingTokens?: number;
-  /** ms to wait before retrying, when not acquired */
+  /**
+   * ms to wait before retrying, when not acquired. `Infinity` when no number of
+   * refills can cover the cost, such as a `tokensToAdd` too small to add up.
+   */
   waitTime?: number;
-  /** set when the configuration itself is unusable */
+  /**
+   * Set when the configuration itself is unusable. A cost that is negative or
+   * not finite is reported here too.
+   */
   error?: string;
 }
 
@@ -77,7 +83,9 @@ export interface AcquireMultiLimitResult {
   /**
    * ms to wait before retrying — the longest any declining token bucket asked
    * for. A full concurrency ledger has no deadline of its own, so a decline
-   * caused only by one carries `0`. Absent when acquired or on `error`.
+   * caused only by one carries `0`. `Infinity` when a bucket can never cover
+   * the cost, as in {@link AcquireTokensResult.waitTime}. Absent when acquired
+   * or on `error`.
    */
   waitTime?: number;
   /** Set when one of the configurations is unusable, as opposed to merely full. */
@@ -266,6 +274,9 @@ export interface DianemoBackend {
    * one armed without `emptiesBucket: false`, see {@link armFreeze}. A freeze
    * that left the bucket alone refuses nothing, since the token was never taken
    * from the budget the freeze is protecting.
+   *
+   * A cost that is negative or not finite credits nothing, as
+   * {@link acquireTokens} refuses to spend one.
    */
   refundTokens?(
     key: string,
@@ -298,8 +309,8 @@ export interface DianemoBackend {
    * dispatched. Token buckets are credited and concurrency slots released.
    *
    * A spec's own `freezeKey` suppresses its refund while a freeze that emptied
-   * the bucket stands, matching {@link refundTokens}. Slots are released
-   * regardless.
+   * the bucket stands, matching {@link refundTokens}, as does a cost that is
+   * negative or not finite. Slots are released regardless.
    */
   releaseMultiLimit?(specs: MultiLimitSpec[], cost: number): Promise<void>;
   /**
@@ -468,6 +479,10 @@ export interface DianemoBackend {
    * reading every freeze had before the option existed. The merge keeps `true`
    * if either side has it, but only from a stored freeze that still stands: a
    * lapsed one's bucket has been refilling since.
+   *
+   * After the merge both values are truncated toward zero and clamped —
+   * `frozenUntil` to ±(2^53-1), `thawRequestCount` to 0 through 2^53-1 — so
+   * the state returned is exactly the state stored.
    */
   armFreeze(
     key: string,

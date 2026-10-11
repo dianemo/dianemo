@@ -2508,4 +2508,233 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       expect(await tokens()).toBe("9");
     });
   });
+
+  // ------------------------------------------- an unusable token-bucket cost
+
+  describe("an unusable token-bucket cost", () => {
+    const bucket = { maxTokens: 5, tokensToAdd: 1, interval: 600_000 };
+    const COST_ERROR = "cost must be a finite number that is not negative";
+    const drained = async (key: string) => {
+      await backend.acquireTokens(key, 5, bucket);
+      expect((await backend.hgetall(key)).tokens).toBe("0");
+    };
+    const tokens = async (key: string) => (await backend.hgetall(key)).tokens;
+    const specs = (key: string): MultiLimitSpec[] => [
+      { kind: "tokenBucket", key, config: bucket },
+    ];
+    const costs: Array<[string, number]> = [
+      ["NaN", NaN],
+      ["negative", -5],
+    ];
+
+    it.each(costs)(
+      "refuses a %s cost on acquire and leaves a drained bucket at 0",
+      async (label, cost) => {
+        const key = `uk:acq:${label}`;
+        await drained(key);
+        expect(await backend.acquireTokens(key, cost, bucket)).toMatchObject({
+          acquired: false,
+          error: COST_ERROR,
+        });
+        expect(await tokens(key)).toBe("0");
+      }
+    );
+
+    it.each(costs)(
+      "credits nothing for a refund of a %s cost",
+      async (label, cost) => {
+        const key = `uk:ref:${label}`;
+        await drained(key);
+        await backend.refundTokens!(key, cost, 5);
+        expect(await tokens(key)).toBe("0");
+      }
+    );
+
+    it.each(costs)(
+      "refuses a %s cost across several budgets and leaves a drained bucket at 0",
+      async (label, cost) => {
+        const key = `uk:ml:${label}`;
+        await drained(key);
+        expect(await backend.acquireMultiLimit!(specs(key), cost)).toEqual({
+          acquired: false,
+          error: COST_ERROR,
+        });
+        expect(
+          await backend.tryAdmitMultiLimit!("uk:q", [], specs(key), cost)
+        ).toBe(false);
+        expect(await tokens(key)).toBe("0");
+      }
+    );
+
+    it.each(costs)(
+      "credits nothing when several budgets are released at a %s cost",
+      async (label, cost) => {
+        const key = `uk:rel:${label}`;
+        await drained(key);
+        await backend.releaseMultiLimit!(specs(key), cost);
+        expect(await tokens(key)).toBe("0");
+      }
+    );
+  });
+
+  // ------------------------------------- fast path on an unusable multi-limit
+
+  it("writes no bucket when the multi-limit fast path refuses a config error", async () => {
+    const specs: MultiLimitSpec[] = [
+      {
+        kind: "tokenBucket",
+        key: "e:bucket",
+        config: { maxTokens: 5, tokensToAdd: 1, interval: 1000 },
+      },
+      {
+        kind: "concurrency",
+        key: "e:slots",
+        config: { maxConcurrency: NaN, requestTtl: 60_000 },
+        slotId: "a",
+      },
+    ];
+    expect(await backend.tryAdmitMultiLimit!("e:q", [], specs, 1)).toBe(false);
+    expect(await backend.hgetall("e:bucket")).toEqual({});
+  });
+
+  // ----------------------------------------- freeze values out of range
+
+  describe("a freeze armed or stored out of range", () => {
+    const MAX = Number.MAX_SAFE_INTEGER;
+
+    it("clamps a deadline and probe budget above 2^53-1 to it", async () => {
+      expect(await backend.armFreeze("or:hi", 1e20, 1e20)).toEqual({
+        frozenUntil: MAX,
+        thawRequestCount: MAX,
+      });
+      expect(await backend.getFreezeState("or:hi")).toEqual({
+        frozenUntil: MAX,
+        thawRequestCount: MAX,
+      });
+      expect(await backend.hgetall("or:hi")).toMatchObject({
+        frozenUntil: String(MAX),
+        thawRequestCount: String(MAX),
+      });
+    });
+
+    it("clamps a deadline below -(2^53-1) and a negative probe budget", async () => {
+      expect(await backend.armFreeze("or:lo", -1e300, -5)).toEqual({
+        frozenUntil: -MAX,
+        thawRequestCount: 0,
+      });
+      expect(await backend.hgetall("or:lo")).toMatchObject({
+        frozenUntil: String(-MAX),
+        thawRequestCount: "0",
+      });
+    });
+
+    it("truncates a fractional stored deadline that wins the merge", async () => {
+      const now = await backend.now();
+      await backend.hset("or:frac", {
+        frozenUntil: String(now + 60_000.5),
+        thawRequestCount: "1",
+      });
+      const expected = { frozenUntil: now + 60_000, thawRequestCount: 1 };
+      expect(await backend.armFreeze("or:frac", now + 1_000, 0)).toEqual(
+        expected
+      );
+      expect(await backend.getFreezeState("or:frac")).toEqual(expected);
+      expect((await backend.hgetall("or:frac")).frozenUntil).toBe(
+        String(now + 60_000)
+      );
+    });
+
+    it("reads a fractional or huge stored freeze back exactly", async () => {
+      const now = await backend.now();
+      await backend.hset("or:read", {
+        frozenUntil: String(now + 60_000.5),
+        thawRequestCount: "2.5",
+      });
+      expect(await backend.getFreezeState("or:read")).toEqual({
+        frozenUntil: now + 60_000.5,
+        thawRequestCount: 2.5,
+      });
+      await backend.hset("or:huge", {
+        frozenUntil: "1e300",
+        thawRequestCount: "0",
+      });
+      expect(await backend.getFreezeState("or:huge")).toEqual({
+        frozenUntil: 1e300,
+        thawRequestCount: 0,
+      });
+      expect(await backend.canProcessRequest("or:huge")).toEqual({
+        canProcess: false,
+        isThawRequest: false,
+        frozenUntil: 1e300,
+      });
+    });
+  });
+
+  // ------------------------------------------------ reported token numbers
+
+  it("reports a fractional remaining balance to full precision", async () => {
+    const config = { maxTokens: 10, tokensToAdd: 1, interval: 600_000 };
+    await backend.acquireTokens("fp:b", 0.1, config);
+    await backend.acquireTokens("fp:b", 0.1, config);
+    expect(await backend.acquireTokens("fp:b", 0.1, config)).toEqual({
+      acquired: true,
+      remainingTokens: 10 - 0.1 - 0.1 - 0.1,
+    });
+  });
+
+  describe("a wait no refill can cover", () => {
+    const tiny = { maxTokens: 1, tokensToAdd: 1e-320, interval: 1000 };
+    const plain = { maxTokens: 10, tokensToAdd: 1, interval: 1000 };
+    const plant = async (key: string) =>
+      backend.hset(key, {
+        tokens: "-1e308",
+        lastUpdate: String(await backend.now()),
+      });
+    const one = (key: string, config: typeof plain): MultiLimitSpec[] => [
+      { kind: "tokenBucket", key, config },
+    ];
+
+    it("reports an infinite wait for a refill too small to measure", async () => {
+      await backend.acquireTokens("iw:tiny", 1, tiny);
+      expect(await backend.acquireTokens("iw:tiny", 1, tiny)).toEqual({
+        acquired: false,
+        waitTime: Infinity,
+        remainingTokens: 0,
+      });
+    });
+
+    it("reports an infinite wait across several budgets for a refill too small to measure", async () => {
+      await backend.acquireMultiLimit!(one("iw:mtiny", tiny), 1);
+      expect(
+        await backend.acquireMultiLimit!(one("iw:mtiny", tiny), 1)
+      ).toEqual({
+        acquired: false,
+        waitTime: Infinity,
+        blockedBy: "iw:mtiny",
+      });
+      expect(
+        await backend.tryAdmitMultiLimit!("iw:q", [], one("iw:mtiny", tiny), 1)
+      ).toBe(false);
+    });
+
+    it("reports an infinite wait for a stored balance of -1e308", async () => {
+      await plant("iw:neg");
+      expect(await backend.acquireTokens("iw:neg", 1, plain)).toEqual({
+        acquired: false,
+        waitTime: Infinity,
+        remainingTokens: -1e308,
+      });
+    });
+
+    it("reports an infinite wait across several budgets for a stored balance of -1e308", async () => {
+      await plant("iw:mneg");
+      expect(
+        await backend.acquireMultiLimit!(one("iw:mneg", plain), 1)
+      ).toEqual({
+        acquired: false,
+        waitTime: Infinity,
+        blockedBy: "iw:mneg",
+      });
+    });
+  });
 });

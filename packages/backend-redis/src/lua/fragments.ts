@@ -85,6 +85,24 @@ end`,
   );
 
 /**
+ * Declares `exact(n)`, a number as a `'%.17g'` string for a reply.
+ *
+ * `cjson.encode` writes numbers at 14 significant digits and raises "Cannot
+ * serialise number" on a non-finite one, and an integer reply truncates. A
+ * string carries every double exactly, `inf` included; `parseLuaNumber` in
+ * `luaNumber.ts` reads it back.
+ *
+ * Requires: nothing. Declares `exact`.
+ */
+export const exactFn = (prefix = "  "): string =>
+  indent(
+    `local function exact(n)
+  return string.format('%.17g', n)
+end`,
+    prefix
+  );
+
+/**
  * Declares `bucketTtl(ttl, maxTokens, tokensToAdd, interval)`, a bucket's key
  * lifetime in seconds: `ttl`, or longer for a bucket that takes longer than that
  * to refill from empty. An expired bucket reads as full, so a key outliving only

@@ -1,5 +1,6 @@
 import type { AcquireTokensResult, TokenBucketConfig } from "@dianemo/core";
 import { normalizeTtlSeconds, parseFiniteStored } from "@dianemo/core";
+import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 
 /** Token-bucket operations. Twin of the memory backend's token-bucket section. */
@@ -50,7 +51,14 @@ export function tokenBucketOps(ctx: Ctx) {
         86400 // TTL for the key
       );
 
-      return JSON.parse(result as string) as AcquireTokensResult;
+      const parsed = JSON.parse(result as string) as AcquireTokensResult;
+      if (parsed.remainingTokens !== undefined) {
+        parsed.remainingTokens = parseLuaNumber(parsed.remainingTokens);
+      }
+      if (parsed.waitTime !== undefined) {
+        parsed.waitTime = parseLuaNumber(parsed.waitTime);
+      }
+      return parsed;
     },
 
     async getTokenBucketState(

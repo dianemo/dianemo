@@ -3,6 +3,7 @@ import { memoryBackend } from "../packages/core/src/backend/memory.js";
 import { harnesses } from "./clientTypes/harness.js";
 import type {
   DianemoBackend,
+  MultiLimitSpec,
   QueuedRequest,
 } from "../packages/core/src/backend/types.js";
 
@@ -112,6 +113,41 @@ describe("memory backend: a decision does not straddle a suspension", () => {
 
     queueMicrotask(() => blockFor(400));
     expect(await backend.isFrozen(key)).toBe(true);
+  });
+});
+
+describe("memory backend: releasing several budgets", () => {
+  let backend: DianemoBackend;
+
+  beforeEach(() => {
+    backend = memoryBackend();
+  });
+  afterEach(async () => {
+    await backend.close();
+  });
+
+  it("releases every budget before a claim that starts after it can run", async () => {
+    const specs = (slotId: string): MultiLimitSpec[] => [
+      {
+        kind: "concurrency",
+        key: "r:slots",
+        config: { maxConcurrency: 1, requestTtl: 60_000 },
+        slotId,
+      },
+      {
+        kind: "tokenBucket",
+        key: "r:bucket",
+        config: { maxTokens: 1, tokensToAdd: 1, interval: 600_000 },
+      },
+    ];
+    expect(await backend.acquireMultiLimit!(specs("a"), 1)).toEqual({
+      acquired: true,
+    });
+    const [, claim] = await Promise.all([
+      backend.releaseMultiLimit!(specs("a"), 1),
+      backend.acquireMultiLimit!(specs("b"), 1),
+    ]);
+    expect(claim).toEqual({ acquired: true });
   });
 });
 

@@ -1,10 +1,12 @@
 import {
   bucketTtlFn,
+  exactFn,
   finiteNumberFn,
   freezeGate,
   lazyRefill,
   queueEmptyGate,
   redisNow,
+  usableCostFn,
 } from "./fragments.js";
 
 /**
@@ -27,6 +29,8 @@ export const tokenBucket = `
 ${redisNow()}
 
 ${finiteNumberFn()}
+${usableCostFn()}
+${exactFn()}
   -- 'not (x > 0)', not 'x <= 0': a nan compares false either way round, so the
   -- second form admits it and the division below yields a nan balance. The nil
   -- test first, because comparing nil raises.
@@ -39,8 +43,8 @@ ${finiteNumberFn()}
   if maxTokens == nil or not (maxTokens > 0) or maxTokens == math.huge then
     return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'maxTokens must be a finite number greater than 0' })
   end
-  if cost == nil or cost ~= cost or cost == math.huge or cost == -math.huge then
-    return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'cost must be a finite number' })
+  if not usableCost(cost) then
+    return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'cost must be a finite number that is not negative' })
   end
   -- Guarded even though the refill below tolerates it: waitTime is derived from
   -- interval, and a non-finite one clears the '< 0' clamp on the way to
@@ -65,7 +69,7 @@ ${lazyRefill()}
     tokens = tokens - cost
     redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate)
     redis.call('EXPIRE', key, ttl)
-    return cjson.encode({ acquired = true, remainingTokens = tokens })
+    return cjson.encode({ acquired = true, remainingTokens = exact(tokens) })
   else
     -- lastUpdate only advances in whole intervals, so (now - lastUpdate) is
     -- progress already made toward the next refill and comes off the wait. The
@@ -79,7 +83,7 @@ ${lazyRefill()}
     redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate)
     redis.call('EXPIRE', key, ttl)
 
-    return cjson.encode({ acquired = false, waitTime = waitTime, remainingTokens = tokens })
+    return cjson.encode({ acquired = false, waitTime = exact(waitTime), remainingTokens = exact(tokens) })
   end
 `;
 
@@ -99,6 +103,9 @@ export const refundTokens = `
   local cost = tonumber(ARGV[1])
   local maxTokens = tonumber(ARGV[2])
 ${finiteNumberFn()}
+${usableCostFn()}
+
+  if not usableCost(cost) then return 0 end
 
   -- Refused only under a standing freeze that emptied the bucket; an absent
   -- emptiesBucket is a freeze from before the field existed, and those all did.
@@ -155,9 +162,10 @@ export const tryAdmitImmediately = `
 ${redisNow()}
 
 ${finiteNumberFn()}
+${usableCostFn()}
   if tokensToAdd == nil or not (tokensToAdd > 0) then return 0 end
   if maxTokens == nil or not (maxTokens > 0) or maxTokens == math.huge then return 0 end
-  if cost == nil or cost ~= cost or cost == math.huge or cost == -math.huge then return 0 end
+  if not usableCost(cost) then return 0 end
   if interval == nil or interval ~= interval or interval == math.huge or interval == -math.huge then return 0 end
 
 ${bucketTtlFn()}

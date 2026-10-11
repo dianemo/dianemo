@@ -112,6 +112,12 @@ undercounts is worse than no list, because walking it feels like coverage. So:
   client rather than defaulting the one corrupt field. Use the `finiteNumber`
   fragment there. `parseStoredNumber` already reads a `NaN` as the default, so
   this is what makes the two sides agree.
+- **A computed number goes back to the caller as a string.** `cjson.encode`
+  writes numbers at 14 significant digits and raises on a non-finite one, and an
+  integer reply truncates — so a fractional balance would read differently from
+  the memory backend, and a wait that overflows to `inf` would raise after the
+  script's writes had landed. The `exact` fragment formats with `'%.17g'`, and
+  `parseLuaNumber` in `luaNumber.ts` reads it back, `inf` included.
 - **In TypeScript**, the only implementation is `parseStoredNumber` /
   `parsePriority` / `parseFiniteStored` in
   `packages/core/src/backend/parseStored.ts`. Both backends go through it. A new

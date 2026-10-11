@@ -116,6 +116,15 @@ function usableDeadline(raw: string | undefined): number | undefined {
 }
 
 /**
+ * A freeze field as both backends store and return it exactly: truncated toward
+ * zero, as Lua 5.1's `string.format('%d')` truncates, and clamped to
+ * `[min, 2^53-1]`. Twin of the Lua `storable` in `lua/freeze.ts`.
+ */
+function storable(value: number, min: number): number {
+  return Math.min(Math.max(Math.trunc(value), min), Number.MAX_SAFE_INTEGER);
+}
+
+/**
  * A bucket key's lifetime in seconds: `ttlSeconds`, or longer for a bucket that
  * takes longer than that to refill from empty. An expired bucket reads as full,
  * so a key outliving only part of the refill hands a spent per-week budget back
@@ -149,7 +158,9 @@ function unusableBudget(
   if (!Number.isFinite(config.maxTokens) || config.maxTokens <= 0) {
     return "maxTokens must be a finite number greater than 0";
   }
-  if (!Number.isFinite(cost)) return "cost must be a finite number";
+  if (!usableCost(cost)) {
+    return "cost must be a finite number that is not negative";
+  }
   // Guarded even though `refill` tolerates it — its `interval > 0` test is false
   // for a NaN, so the bucket simply never refills. The waiting caller is what
   // breaks: `waitTime` is derived from `interval` and clears the `>= 0` clamp.
@@ -629,6 +640,21 @@ class MemoryBackend implements DianemoBackend {
     maxTokens: number,
     freezeKey?: string
   ): Promise<void> {
+    this.creditTokens(key, cost, maxTokens, freezeKey);
+  }
+
+  /**
+   * The body of {@link refundTokens}, synchronous so that
+   * {@link releaseMultiLimit} can hand back a whole claim without suspending,
+   * for the reason {@link writeString} carries.
+   */
+  private creditTokens(
+    key: string,
+    cost: number,
+    maxTokens: number,
+    freezeKey?: string
+  ) {
+    if (!usableCost(cost)) return;
     if (freezeKey && this.freezeEmptiedBucket(freezeKey, Date.now())) return;
     const hash = this.live(key)?.hash;
     if (!hash) return;
@@ -729,15 +755,10 @@ class MemoryBackend implements DianemoBackend {
   ): Promise<void> {
     for (const spec of specs) {
       if (spec.kind === "concurrency") {
-        await this.releaseConcurrency(spec.key, spec.slotId);
+        this.releaseSlot(spec.key, spec.slotId);
         continue;
       }
-      await this.refundTokens(
-        spec.key,
-        cost,
-        spec.config.maxTokens,
-        spec.freezeKey
-      );
+      this.creditTokens(spec.key, cost, spec.config.maxTokens, spec.freezeKey);
     }
   }
 
@@ -757,7 +778,8 @@ class MemoryBackend implements DianemoBackend {
     }
 
     const planned = this.planMultiLimit(specs, cost, now);
-    if (planned.error || !planned.acquired) {
+    if (planned.error) return false;
+    if (!planned.acquired) {
       for (const bucket of planned.buckets) {
         this.writeBucket(
           bucket.key,
@@ -1045,6 +1067,11 @@ class MemoryBackend implements DianemoBackend {
   }
 
   async releaseConcurrency(key: string, requestId: string): Promise<void> {
+    this.releaseSlot(key, requestId);
+  }
+
+  /** The body of {@link releaseConcurrency}; see {@link creditTokens}. */
+  private releaseSlot(key: string, requestId: string) {
     this.live(key)?.zset?.delete(requestId);
     this.live(`${key}:costs`)?.hash?.delete(requestId);
     this.dropIfEmpty(key);
@@ -1382,12 +1409,6 @@ class MemoryBackend implements DianemoBackend {
     // so the merge kept it and cancelled the probe budget a 429 was owed.
     if (!Number.isFinite(frozenUntil)) frozenUntil = 0;
     if (!Number.isFinite(thawRequestCount)) thawRequestCount = 0;
-    // Truncated toward zero, which is what the Lua's `string.format('%d', ...)`
-    // does to both fields on Lua 5.1 — a deadline in milliseconds is integral and
-    // a probe budget is a count, so the two backends must round them the same way
-    // or a merge against a stored value compares different numbers.
-    frozenUntil = Math.trunc(frozenUntil);
-    thawRequestCount = Math.trunc(thawRequestCount);
     if (mode === "max") {
       // An unusable stored deadline is no freeze state to merge with, so the
       // probe budget beside it is not consulted either — the reading every
@@ -1405,14 +1426,12 @@ class MemoryBackend implements DianemoBackend {
         if (existingThaw > thawRequestCount) thawRequestCount = existingThaw;
       }
     }
-    // Clamped after the merge, so a deadline already stored past the ceiling is
-    // brought back down rather than carried forward by "keep the larger" — which
-    // is what lets a poisoned key heal. `Number.MAX_SAFE_INTEGER` is the 2^53-1
-    // the Lua twin inlines, and it is also what holds the TTL below inside the
+    // After the merge, so a stored value that won it is written back in range
+    // rather than carried forward by "keep the larger", and what is returned is
+    // what was stored. The 2^53-1 ceiling also holds the TTL below inside the
     // range `normalizeTtlSeconds` accepts.
-    if (frozenUntil > Number.MAX_SAFE_INTEGER) {
-      frozenUntil = Number.MAX_SAFE_INTEGER;
-    }
+    frozenUntil = storable(frozenUntil, -Number.MAX_SAFE_INTEGER);
+    thawRequestCount = storable(thawRequestCount, 0);
     // Derived and validated before the fields are set, as `writeHash` validates
     // its own: `expire` raises, and would otherwise leave the freeze half-written.
     const ttl = normalizeTtlSeconds(

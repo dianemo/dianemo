@@ -1,4 +1,5 @@
 import type { FreezeState } from "@dianemo/core";
+import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 
 /**
@@ -36,11 +37,11 @@ async function readFreezeState(
   inFreezeWindow: boolean;
 } | null> {
   const result = (await ctx.run("dianemoReadFreezeState", key)) as
-    [number, number, number] | null;
+    [string, string, number] | null;
   if (!result) return null;
   return {
-    frozenUntil: result[0],
-    thawRequestCount: result[1],
+    frozenUntil: parseLuaNumber(result[0]),
+    thawRequestCount: parseLuaNumber(result[1]),
     inFreezeWindow: result[2] === 1,
   };
 }

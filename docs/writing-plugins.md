@@ -169,6 +169,10 @@ Three things worth noting:
 - **The builder returns an array.** One credential set may produce several
   clients — a vendor with separate rate limits per region, or a
   [`sharedLimit`](rate-limits/shared-limit.md) child alongside its parent.
+- **What it returns is copied before core writes to it.** Plans and overrides
+  are placed on the copy, so a builder may return a module-level sub-client list
+  or a config it keeps per tenant. Its credentials arrive as JSON reads them
+  back from the backend: a `Date` is an ISO string by then.
 
 Pick the rate limit from what the vendor publishes — see
 [choosing a rate limit](rate-limits/README.md), and note that granularity

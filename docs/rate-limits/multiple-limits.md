@@ -56,9 +56,16 @@ list.
 > rollout inside a window where a doubled rate is acceptable, and expect the
 > one-time burst above on top.
 >
-> Template overrides stored by 1.x need nothing: their single-limit values are
-> read back as one-entry lists. Overrides passed to `addTemplateClient` from now
-> on must be lists, and are refused before anything is stored if they are not.
+> Template overrides stored by 1.x are read back as one-entry lists, with one
+> change in what they do. 1.x skipped an override whose `type` differed from the
+> template default's; that override now applies, so a stored `noLimit` over a
+> `requestLimit` default removes the cap on the first start after the upgrade.
+> Only an override swapping a `sharedLimit` for budgets of its own, or the
+> reverse, is still skipped. 1.x logged each record it skipped as `has type "…"
+> but template default is "…" — skipping override`; find those tenants in your
+> logs and re-add them with the limits you mean before upgrading. Overrides
+> passed to `addTemplateClient` from now on must be lists, and are refused
+> before anything is stored if they are not.
 
 ## What may go in the list
 

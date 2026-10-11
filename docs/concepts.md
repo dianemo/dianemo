@@ -202,7 +202,9 @@ Overrides are checked before anything is stored. A path given a bare limit
 rather than a list, a limit that cannot be built, or path keys mixed in beside
 `rateLimitOption` or `rateLimitOverrides` is a `ConfigurationError` from
 `addTemplateClient`, and nothing is written. Overrides stored by 1.x, which held
-single limits rather than lists, are read back as lists.
+single limits rather than lists, are read back as lists — and one of a different
+`type` from the template default's, which 1.x skipped, now applies. See the
+[upgrade note](rate-limits/multiple-limits.md#names).
 
 A tenant whose stored settings cannot be built — at startup, or when its template
 is registered late — is logged and skipped, and the tenants after it still load.

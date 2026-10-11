@@ -60,21 +60,40 @@ function handleBasic(authData: AuthDataBasic) {
  */
 const inFlightRefreshes = new Map<string, Promise<string>>();
 
-/** Clients removed rather than rebuilt, which must not write credentials again. */
-const retiredClients = new WeakSet<Client>();
+/**
+ * One flag per line of rebuilds: a client and every client it replaced share
+ * it, so a removal retires the predecessors whose refreshes are still in flight
+ * along with the client it found registered.
+ */
+const credentialLines = new WeakMap<Client, { retired: boolean }>();
+
+function lineOf(client: Client): { retired: boolean } {
+  let line = credentialLines.get(client);
+  if (!line) {
+    line = { retired: false };
+    credentialLines.set(client, line);
+  }
+  return line;
+}
 
 /**
- * Stops `client` writing OAuth credentials from now on. For a client being
- * removed: a refresh still in flight would otherwise write its tokens back after
- * the removal purged them, under a key nothing will look up again.
+ * Stops `client`, and every client it replaced, writing OAuth credentials from
+ * now on. For a client being removed: a refresh still in flight would otherwise
+ * write its tokens back after the removal purged them, under a key nothing will
+ * look up again.
  */
 export function retireCredentialWrites(client: Client): void {
-  retiredClients.add(client);
+  lineOf(client).retired = true;
 }
 
 /** Whether `client` was retired by {@link retireCredentialWrites}. */
 export function isCredentialWriteRetired(client: Client): boolean {
-  return retiredClients.has(client);
+  return credentialLines.get(client)?.retired === true;
+}
+
+/** Puts `next`, which replaces `previous`, on the same line of rebuilds. */
+export function inheritCredentialLine(previous: Client, next: Client): void {
+  credentialLines.set(next, lineOf(previous));
 }
 
 /** How long one replica may hold the refresh lock before others assume it died. */
@@ -532,7 +551,7 @@ async function saveOAuthData(
 
   // Checked after the last await before the write: a removal retires the
   // client before purging, so nothing written past this point outlives it.
-  if (retiredClients.has(this)) {
+  if (isCredentialWriteRetired(this)) {
     this.logger.debug(
       `Client ${this.name} | removed while refreshing; discarding the new token`
     );
@@ -558,7 +577,9 @@ async function saveOAuthData(
     },
     credentialTtlSeconds(expires_in, hasRefreshToken, refreshTtlSeconds)
   );
-  if (grantId && !retiredClients.has(this)) await this.trackGrantId(grantId);
+  if (grantId && !isCredentialWriteRetired(this)) {
+    await this.trackGrantId(grantId);
+  }
 }
 
 export default authenticate;

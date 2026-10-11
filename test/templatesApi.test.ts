@@ -1,4 +1,5 @@
 import type { CreateClientData } from "../packages/core/src/client/types.js";
+import type { DianemoBackend } from "../packages/core/src/backend/types.js";
 import type { RequestHandlerPlugin } from "../packages/core/src/plugin.js";
 import { memoryBackend } from "../packages/core/src/backend/memory.js";
 import { ConfigurationError } from "../packages/core/src/errors.js";
@@ -350,6 +351,40 @@ describe("a rebuild whose new config cannot be built", () => {
       await upstream.close();
     }
   });
+
+  it("refuses credentials that build only before they are stored as JSON, storing nothing", async () => {
+    const backend = memoryBackend();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend,
+      keyPrefix: "rbjson",
+    });
+    await handler.registerClientTemplate(
+      "acme" as never,
+      ((c: { instanceId: string; since: Date }) => [
+        {
+          name: `acme:_:${c.instanceId}`,
+          metadata: { since: c.since.toISOString() },
+        },
+      ]) as never
+    );
+    try {
+      await expect(
+        handler.addTemplateClient(
+          "acme" as never,
+          { instanceId: "a", since: new Date(0) } as never
+        )
+      ).rejects.toBeInstanceOf(TypeError);
+      expect(await backend.smembers("rbjson:requestHandler:templates")).toEqual(
+        []
+      );
+      expect(handler.getLoadedClients().map((c) => c.name)).toEqual([
+        "default",
+      ]);
+    } finally {
+      await handler.stop();
+    }
+  });
 });
 
 // ---- sub-clients
@@ -522,6 +557,34 @@ describe("the handler API", () => {
     }
   });
 
+  it("registers a plugin's template once when use() is called during start()", async () => {
+    const backend = memoryBackend();
+    const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "ha" });
+    let registrations = 0;
+    try {
+      const starting = handler.start();
+      handler.use({
+        name: "acme",
+        registerTemplate: async (h) => {
+          registrations++;
+          await h.registerClientTemplate(
+            "acme" as never,
+            ((c: { instanceId: string }) => [
+              { name: `acme:_:${c.instanceId}` },
+            ]) as never
+          );
+        },
+        createRequests: () => ({}),
+      });
+      await starting;
+      await sleep(100);
+      expect(registrations).toBe(1);
+      expect(handler.getRegisteredTemplates()).toContain("acme");
+    } finally {
+      await handler.stop();
+    }
+  });
+
   it("rejects an addLocalTemplateClient instanceId that cannot be a name segment", async () => {
     const backend = memoryBackend();
     const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "ha" });
@@ -678,6 +741,59 @@ for (const harness of harnesses(8)) {
       }
     }, 10_000);
 
+    it("are not written back by a refresh on a client a rebuild replaced, when the instance is removed", async () => {
+      const upstream = await startAuthServer();
+      upstream.setTokenDelay(300);
+      const { backend, cleanup } = await harness.create();
+      const prefix = uniquePrefix("purgeprev");
+      const handler = new RequestHandler({
+        key: KEY,
+        backend,
+        keyPrefix: prefix,
+      });
+      await handler.registerClientTemplate(
+        "acme" as never,
+        ((c: { instanceId: string; secret: string }): CreateClientData[] => [
+          {
+            name: `acme:_:${c.instanceId}`,
+            authentication: { ...upstream.oauth("A"), clientSecret: c.secret },
+            requestOptions: { defaults: { baseURL: upstream.baseURL } },
+          },
+        ]) as never
+      );
+      try {
+        await handler.addTemplateClient(
+          "acme" as never,
+          { instanceId: "a", secret: "v1" } as never
+        );
+        const request = handler
+          .handleRequest({
+            clientName: "acme:_:a",
+            requestName: "t",
+            method: "GET",
+            url: "/x",
+          })
+          .catch(() => undefined);
+        await sleep(100);
+        await handler.addTemplateClient(
+          "acme" as never,
+          { instanceId: "a", secret: "v2" } as never
+        );
+        await handler.removeTemplateClient("acme" as never, "a");
+        await sleep(500);
+        await request;
+
+        expect(upstream.tokenCalls).toEqual(["A"]);
+        expect(
+          await backend.hgetall(`${prefix}:requestHandler:acme:_:a:oauth2`)
+        ).toEqual({});
+      } finally {
+        await handler.stop();
+        await cleanup();
+        await upstream.close();
+      }
+    }, 10_000);
+
     it("serves a token still valid when its early renewal fails", async () => {
       const upstream = await startAuthServer();
       // A 3s token renews from 1s on (the 2s floor on the margin) and is
@@ -791,5 +907,109 @@ for (const harness of harnesses(8)) {
         await upstream.close();
       }
     }, 15_000);
+  });
+
+  describe(`a peer hearing of a removal (${harness.name})`, () => {
+    const builder = ((c: { instanceId: string }): CreateClientData[] => [
+      { name: `acme:_:${c.instanceId}` },
+    ]) as never;
+
+    /** `backend` with `method` held up by 200ms on the keys `slow` picks. */
+    const slowed = (
+      backend: DianemoBackend,
+      method: "sadd" | "smembers",
+      slow: (key: string) => boolean
+    ): DianemoBackend =>
+      new Proxy(backend, {
+        get(object, property, receiver) {
+          const value = Reflect.get(object, property, receiver);
+          if (typeof value !== "function") return value;
+          if (property !== method) return value.bind(object);
+          return async (key: string, ...rest: unknown[]) => {
+            if (slow(key)) await sleep(200);
+            return value.call(object, key, ...rest);
+          };
+        },
+      });
+
+    async function pair(peerBackend: (b: DianemoBackend) => DianemoBackend) {
+      const { backend, cleanup } = await harness.create();
+      const prefix = uniquePrefix("peerrm");
+      const a = new RequestHandler({ key: KEY, backend, keyPrefix: prefix });
+      const b = new RequestHandler({
+        key: KEY,
+        backend: peerBackend(backend),
+        keyPrefix: prefix,
+      });
+      await a.registerClientTemplate("acme" as never, builder);
+      await b.registerClientTemplate("acme" as never, builder);
+      await a.start();
+      await b.start();
+      return {
+        a,
+        b,
+        backend,
+        prefix,
+        loadedOnB: () => b.getLoadedClients().map((c) => c.name),
+        stop: async () => {
+          await b.stop();
+          await a.stop();
+          await cleanup();
+        },
+      };
+    }
+
+    it("does not keep a client its rebuild registers after the removal arrived", async () => {
+      const rig = await pair((backend) =>
+        slowed(backend, "sadd", (key) => key.includes(":templateClients:"))
+      );
+      try {
+        await rig.a.addTemplateClient(
+          "acme" as never,
+          { instanceId: "x" } as never
+        );
+        await sleep(50);
+        await rig.a.removeTemplateClient("acme" as never, "x");
+        await sleep(600);
+
+        expect(
+          await rig.backend.smembers(`${rig.prefix}:requestHandler:templates`)
+        ).toEqual([]);
+        expect(rig.loadedOnB()).not.toContain("acme:_:x");
+      } finally {
+        await rig.stop();
+      }
+    }, 10_000);
+
+    it("keeps the names of a re-add that lands while it is still destroying", async () => {
+      let slow = false;
+      const rig = await pair((backend) =>
+        slowed(backend, "smembers", (key) => slow && key.endsWith(":templates"))
+      );
+      try {
+        await rig.a.addTemplateClient(
+          "acme" as never,
+          { instanceId: "x" } as never
+        );
+        await rig.b.awaitClient("acme:_:x", { timeoutMs: 5000 });
+        slow = true;
+        await rig.a.removeTemplateClient("acme" as never, "x");
+        await rig.a.addTemplateClient(
+          "acme" as never,
+          { instanceId: "x" } as never
+        );
+        await sleep(500);
+        slow = false;
+
+        expect(rig.loadedOnB()).toContain("acme:_:x");
+        expect(rig.b.getTemplateClientNames("acme", "x")).toEqual(["acme:_:x"]);
+
+        await rig.a.removeTemplateClient("acme" as never, "x");
+        await sleep(200);
+        expect(rig.loadedOnB()).not.toContain("acme:_:x");
+      } finally {
+        await rig.stop();
+      }
+    }, 10_000);
   });
 }

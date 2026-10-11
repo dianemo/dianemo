@@ -22,6 +22,7 @@ import {
   normalizeTemplateClientOptions,
   serializeTemplateClientOptions,
   readTemplateClientOptions,
+  templateEntryGeneration,
 } from "./utils/templateClients.js";
 import type {
   CreateClientData,
@@ -232,6 +233,8 @@ export default class RequestHandler {
     new Map();
   protected localTemplateClients: Set<string> = new Set();
   protected startupHooks: StartupHook[] = [];
+  /** Whether the current start has passed its loop over `startupHooks`. */
+  private startupHooksRan = false;
   protected startPromise: Promise<void> | null = null;
   protected stopPromise: Promise<void> | null = null;
   protected shutdownHooksRegistered = false;
@@ -315,7 +318,11 @@ export default class RequestHandler {
       namespaces[plugin.name] = plugin.createRequests(ctx);
       const hook = () => plugin.registerTemplate(this);
       this.registerStartupHook(hook);
-      if (this.status !== "stopped") this.runLateStartupHook(plugin.name, hook);
+      // A start still short of its hook loop runs this hook from the list.
+      const queued = this.status === "starting" && !this.startupHooksRan;
+      if (this.status !== "stopped" && !queued) {
+        this.runLateStartupHook(plugin.name, hook);
+      }
     }
 
     return namespaces as MergedNamespaces<P>;
@@ -326,9 +333,10 @@ export default class RequestHandler {
    *
    * Called synchronously, so a plugin whose `registerTemplate` reaches
    * `registerClientTemplate` before its first `await` has its template in place
-   * when `use()` returns. During a start it waits for the start instead: the
-   * startup hooks may already have run, and a template registered before
-   * `started` would not build its stored tenants.
+   * when `use()` returns. During a start that has passed its startup hooks it
+   * waits for the start instead, since a template registered before `started`
+   * would not build its stored tenants. Not called during a start that has
+   * yet to reach them: that start runs the hook itself.
    */
   private runLateStartupHook(pluginName: string, hook: StartupHook): void {
     const report = (error: unknown) => {
@@ -400,6 +408,7 @@ export default class RequestHandler {
 
   private async doStart(): Promise<void> {
     this.status = "starting";
+    this.startupHooksRan = false;
     await startSubscriptions.bind(this)();
 
     // `generateClients`, not `createClient`: the latter builds exactly one
@@ -409,6 +418,7 @@ export default class RequestHandler {
     await generateClients.bind(this)([this.defaultClient]);
 
     for (const hook of this.startupHooks) await hook(this);
+    this.startupHooksRan = true;
 
     await loadTemplateClientsFromBackend.bind(this)();
 
@@ -980,6 +990,10 @@ export default class RequestHandler {
    * For credentials one writer distributes to many readers; use
    * {@link addLocalTemplateClient} for per-replica ones.
    *
+   * Credentials are stored as JSON, and every build — this one included — is
+   * handed them as JSON reads them back: a `Date` arrives as its ISO string, a
+   * `Map` as an empty object, and an `undefined` field not at all.
+   *
    * `options` carries this instance's `rateLimitOption` — one of the plans the
    * template declared — and any operator `rateLimitOverrides`. A bare overrides
    * record is still accepted in that position, as the argument used to be.
@@ -1107,11 +1121,12 @@ export default class RequestHandler {
     assertInstanceSegments(credentials);
     // Before the write, so credentials whose clients cannot be built are refused
     // with nothing stored, and the running clients and every restart keep the
-    // record that works.
+    // record that works. Checked as they will be read back: every build after
+    // this one decodes them from JSON, which turns a `Date` into a string.
     assertTemplateClientBuildable.bind(this)(
       templateName,
       instanceId,
-      credentials,
+      JSON.parse(JSON.stringify(credentials)),
       settings
     );
     const entry = `${templateName}::${instanceId}`;
@@ -1160,6 +1175,11 @@ export default class RequestHandler {
     instanceId: string
   ): Promise<void> {
     const entry = `${templateName}::${instanceId}`;
+    const generation = templateEntryGeneration.call(
+      this,
+      templateName,
+      instanceId
+    );
     const encrypted = await this.backend.get(
       `${this.namespace}:template:${entry}`
     );
@@ -1170,7 +1190,8 @@ export default class RequestHandler {
       templateName,
       instanceId,
       credentials,
-      settings
+      settings,
+      generation
     );
   }
 

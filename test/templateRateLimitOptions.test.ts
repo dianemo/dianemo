@@ -916,3 +916,125 @@ describe("plans a template cannot be trusted with", () => {
     }
   });
 });
+
+/**
+ * Builders are plugin code, and plugin code returns whatever is convenient: a
+ * module-level sub-client list, or a config it built once per instance and
+ * keeps. Core places plans and overrides on what the builder returns, so it
+ * must not do that in the builder's own objects.
+ */
+describe("a builder that returns objects it keeps", () => {
+  const limit = (n: number) => [
+    {
+      type: "requestLimit" as const,
+      interval: 1000,
+      tokensToAdd: n,
+      maxTokens: n,
+    },
+  ];
+  const PLANS = {
+    pro: { "": limit(50), orders: limit(40) },
+    free: limit(2),
+  };
+
+  async function sharing(
+    builder: (creds: { instanceId: string }) => unknown
+  ): Promise<{
+    handler: RequestHandler;
+    maxTokensOf: (name: string) => number | undefined;
+    stop: () => Promise<void>;
+  }> {
+    const backend = memoryBackend();
+    const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "tro" });
+    await handler.registerClientTemplate("acme" as never, builder as never, {
+      rateLimitOptions: PLANS,
+    });
+    await handler.start();
+    return {
+      handler,
+      maxTokensOf: (name) =>
+        (
+          handler.getLoadedClients().find((c) => c.name === name)
+            ?.rateLimit[0] as { maxTokens?: number } | undefined
+        )?.maxTokens,
+      stop: async () => {
+        await handler.stop();
+        await backend.close();
+      },
+    };
+  }
+
+  const SUB_CLIENTS = [{ name: "orders" }];
+  const sharedSubClients = (creds: { instanceId: string }) => [
+    { name: `acme:_:${creds.instanceId}`, subClients: SUB_CLIENTS },
+  ];
+
+  it("keeps one tenant's plan out of another tenant's shared sub-client", async () => {
+    const rig = await sharing(sharedSubClients);
+    try {
+      await rig.handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never,
+        { rateLimitOption: "pro" }
+      );
+      await rig.handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "b" } as never,
+        { rateLimitOption: "free" }
+      );
+
+      expect(rig.maxTokensOf("acme:_:a:orders")).toBe(40);
+      expect(rig.maxTokensOf("acme:_:b:orders")).toBe(2);
+      expect(SUB_CLIENTS).toEqual([{ name: "orders" }]);
+    } finally {
+      await rig.stop();
+    }
+  });
+
+  it("keeps one tenant's override out of another tenant's shared sub-client", async () => {
+    const rig = await sharing(sharedSubClients);
+    try {
+      await rig.handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never,
+        { rateLimitOption: "free", rateLimitOverrides: { orders: limit(1000) } }
+      );
+      await rig.handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "b" } as never,
+        { rateLimitOption: "free" }
+      );
+
+      expect(rig.maxTokensOf("acme:_:a:orders")).toBe(1000);
+      expect(rig.maxTokensOf("acme:_:b:orders")).toBe(2);
+    } finally {
+      await rig.stop();
+    }
+  });
+
+  it("moves a tenant to a new plan when the builder hands back the config it cached", async () => {
+    const cache = new Map<string, unknown>();
+    const rig = await sharing((creds) => {
+      if (!cache.has(creds.instanceId)) {
+        cache.set(creds.instanceId, [{ name: `acme:_:${creds.instanceId}` }]);
+      }
+      return cache.get(creds.instanceId);
+    });
+    try {
+      await rig.handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never,
+        { rateLimitOption: "free" }
+      );
+      await rig.handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never,
+        { rateLimitOption: "pro" }
+      );
+
+      expect(rig.maxTokensOf("acme:_:a")).toBe(50);
+    } finally {
+      await rig.stop();
+    }
+  });
+});

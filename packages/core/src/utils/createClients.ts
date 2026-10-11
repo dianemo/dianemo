@@ -1,4 +1,5 @@
 import SharedLimitClient from "../client/clientTypes/sharedLimitClient.js";
+import { inheritCredentialLine } from "../client/methods/authenticate.js";
 import { ClientConflictError, ConfigurationError } from "../errors.js";
 import MeteredClient from "../client/clientTypes/meteredClient.js";
 import type BaseClient from "../client/index.js";
@@ -95,6 +96,9 @@ export function prepareClients(
   return async () => {
     for (const next of replacements) {
       const previous = await resetClient.bind(this)(next.getName());
+      // Linked so that removing `next` also stops a refresh `previous` still
+      // has in flight from writing the tokens the removal purges.
+      if (previous) inheritCredentialLine(previous, next);
       await registerClient.bind(this)(next);
       // The replacement takes over the requests the old client had parked, so
       // it can still fail them with a reason if the rebuilt budget cannot serve
@@ -208,12 +212,13 @@ function isPlainData(value: object): boolean {
 }
 
 /**
- * Copies plain objects and arrays, so a child writing into its merged config
- * cannot reach its parent's. Anything else is passed by reference: an
+ * Copies plain objects and arrays, so writing into the copy cannot reach the
+ * original: a child's merged config, or a template builder's output that a
+ * plan is placed on. Anything else is passed by reference: an
  * `http.Agent`, a `Buffer` or a `Date` copied key by key loses its prototype,
  * and Node's http module refuses an agent that is not an `Agent`.
  */
-function deepCloneWithFunctions<T>(obj: T): T {
+export function deepCloneWithFunctions<T>(obj: T): T {
   if (obj === null || typeof obj !== "object") return obj;
   if (Array.isArray(obj)) {
     return obj.map((item) => deepCloneWithFunctions(item)) as T;

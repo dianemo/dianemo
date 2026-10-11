@@ -1,10 +1,14 @@
 import type { CreateClientData, DeclaredRateLimit } from "../client/types.js";
 import { retireCredentialWrites } from "../client/methods/authenticate.js";
-import { collectClientNames, prepareClients } from "./createClients.js";
 import { noopLogger, type Logger } from "../logger.js";
 import { encrypt, decrypt } from "./encryption.js";
 import { ConfigurationError } from "../errors.js";
 import type RequestHandler from "../index.js";
+import {
+  collectClientNames,
+  deepCloneWithFunctions,
+  prepareClients,
+} from "./createClients.js";
 import {
   assertUsableRateLimits,
   isSharedLimitOnly,
@@ -19,12 +23,63 @@ import type {
 } from "../types.js";
 
 /**
- * Serializes concurrent rebuilds of one `(templateName, instanceId)`. A local writer
- * races its own `templateClientAdded` broadcast, and two interleaved rebuilds both
- * pass the destroy phase, so the second registration throws and both write the same
- * `templateClientMap` entry. Keyed by handler, so two in one process stay independent.
+ * Serializes the builds and removals of one `(templateName, instanceId)`, per
+ * handler, so two in one process stay independent. A local writer races its
+ * own `templateClientAdded` broadcast, and a removal can arrive while a rebuild
+ * sits between reading the record and registering its clients.
  */
-const buildLocks = new Map<string, Promise<void>>();
+const entryLocks = new WeakMap<RequestHandler, Map<string, Promise<void>>>();
+
+/**
+ * Bumped by every removal, so a build holding a record read before one can
+ * tell that the record is gone and register nothing.
+ */
+const entryGenerations = new WeakMap<RequestHandler, Map<string, number>>();
+
+function generationsOf(handler: RequestHandler): Map<string, number> {
+  let generations = entryGenerations.get(handler);
+  if (!generations) {
+    generations = new Map();
+    entryGenerations.set(handler, generations);
+  }
+  return generations;
+}
+
+/**
+ * How many removals this entry has seen. Read it before reading the record a
+ * build will use, and hand it to {@link buildAndRegisterTemplateClients}.
+ */
+export function templateEntryGeneration(
+  this: RequestHandler,
+  templateName: string,
+  instanceId: string
+): number {
+  return generationsOf(this).get(`${templateName}::${instanceId}`) ?? 0;
+}
+
+async function underEntryLock(
+  handler: RequestHandler,
+  entry: string,
+  fn: () => Promise<void>
+): Promise<void> {
+  let locks = entryLocks.get(handler);
+  if (!locks) {
+    locks = new Map();
+    entryLocks.set(handler, locks);
+  }
+  const previous = locks.get(entry);
+  const run = (async () => {
+    // A failed predecessor does not stop this one.
+    if (previous) await previous.catch(() => undefined);
+    await fn();
+  })();
+  locks.set(entry, run);
+  try {
+    await run;
+  } finally {
+    if (locks.get(entry) === run) locks.delete(entry);
+  }
+}
 
 /**
  * Entries already present in `templateClientMap` (i.e. built earlier in the
@@ -53,6 +108,11 @@ export async function loadTemplateClientsFromBackend(
     }
     if (this.templateClientMap.get(templateName)?.has(instanceId)) continue;
 
+    const generation = templateEntryGeneration.call(
+      this,
+      templateName,
+      instanceId
+    );
     const encrypted = await this.backend.get(
       `${this.namespace}:template:${entry}`
     );
@@ -80,7 +140,8 @@ export async function loadTemplateClientsFromBackend(
         templateName,
         instanceId,
         credentials,
-        settings
+        settings,
+        generation
       );
     } catch (error) {
       this.logger.error(
@@ -268,41 +329,32 @@ export function assertTemplateOptions(
 }
 
 /**
- * Serialized per `(templateName, instanceId)` so concurrent triggers can't
- * interleave their destroy/create phases (see `buildLocks` doc above).
+ * Builds and registers an instance's clients from a record the caller read.
+ * `generation` is {@link templateEntryGeneration} as it stood before that
+ * read: when a removal has happened since, the record is stale and nothing is
+ * registered.
  */
 export async function buildAndRegisterTemplateClients(
   this: RequestHandler,
   templateName: string,
   instanceId: string,
   credentials: unknown,
-  settings?: TemplateClientOptions
+  settings?: TemplateClientOptions,
+  generation = templateEntryGeneration.call(this, templateName, instanceId)
 ): Promise<void> {
-  const lockKey = `${templateName}::${instanceId}`;
-  const existing = buildLocks.get(lockKey);
-  const run = (async () => {
-    if (existing) {
-      try {
-        await existing;
-      } catch {
-        // Prior attempt failed — we still want to try our own rebuild.
-      }
-    }
+  const superseded = () =>
+    templateEntryGeneration.call(this, templateName, instanceId) !== generation;
+  await underEntryLock(this, `${templateName}::${instanceId}`, async () => {
+    if (superseded()) return;
     await doBuildAndRegister.call(
       this,
       templateName,
       instanceId,
       credentials,
+      superseded,
       settings
     );
-  })();
-  buildLocks.set(lockKey, run);
-  try {
-    await run;
-  } finally {
-    // Only clear if this is still the latest run for this key.
-    if (buildLocks.get(lockKey) === run) buildLocks.delete(lockKey);
-  }
+  });
 }
 
 async function doBuildAndRegister(
@@ -310,6 +362,7 @@ async function doBuildAndRegister(
   templateName: string,
   instanceId: string,
   credentials: unknown,
+  superseded: () => boolean,
   settings?: TemplateClientOptions
 ): Promise<void> {
   const build = planTemplateBuild.call(
@@ -363,6 +416,9 @@ async function doBuildAndRegister(
     await this.backend.sadd(namesKey, name).catch(() => {});
   }
 
+  // After the last await: a removal arriving during one is queued on this
+  // lock, and would find nothing registered to destroy.
+  if (superseded()) return;
   await commit();
 }
 
@@ -405,7 +461,8 @@ function retiringNames(
 }
 
 /**
- * Runs the builder and places the plan and overrides on what it returns.
+ * Runs the builder and places the plan and overrides on a copy of what it
+ * returns.
  * `undefined` when the template is not registered here.
  */
 function planTemplateBuild(
@@ -428,9 +485,11 @@ function planTemplateBuild(
     settings
   );
   const result = template.builder(credentials, context);
-  const clientDataList: CreateClientData[] = Array.isArray(result)
-    ? result
-    : [result];
+  // Copied before the plan and overrides are written in: a builder may return
+  // objects it shares between tenants or keeps from one build to the next.
+  const clientDataList: CreateClientData[] = (
+    Array.isArray(result) ? result : [result]
+  ).map((client) => deepCloneWithFunctions(client));
 
   // The plan first, then the overrides on top: the plan is what the template
   // says this tenant is entitled to, and an override is the operator overruling
@@ -663,6 +722,9 @@ function describeShapeMismatch(
  * longer lists the instance, its credentials are purged here as well: a peer's
  * refresh can land between the removing replica's purge and this replica
  * hearing of it.
+ *
+ * Runs under the same per-instance lock as a build, and makes any build that
+ * read its record before this call register nothing.
  */
 export async function destroyTemplateClients(
   this: RequestHandler,
@@ -676,10 +738,24 @@ export async function destroyTemplateClients(
   purgeCredentials = false
 ): Promise<void> {
   const entry = `${templateName}::${instanceId}`;
-  const names =
-    this.templateClientMap.get(templateName)?.get(instanceId) ??
-    new Set<string>();
-  const clients = [...names].flatMap((name) => {
+  // Before the lock is awaited, so a build already holding it sees the bump.
+  const generations = generationsOf(this);
+  generations.set(entry, (generations.get(entry) ?? 0) + 1);
+  await underEntryLock(this, entry, () =>
+    doDestroy.call(this, templateName, instanceId, purgeCredentials)
+  );
+}
+
+async function doDestroy(
+  this: RequestHandler,
+  templateName: string,
+  instanceId: string,
+  purgeCredentials: boolean
+): Promise<void> {
+  const entry = `${templateName}::${instanceId}`;
+  const instances = this.templateClientMap.get(templateName);
+  const names = instances?.get(instanceId);
+  const clients = [...(names ?? [])].flatMap((name) => {
     const client = this.clients.get(name);
     return client ? [{ name, client }] : [];
   });
@@ -688,7 +764,7 @@ export async function destroyTemplateClients(
     // Either way this client is going away with no replacement, so its parked
     // requests are failed with a reason instead of waiting out `cleanupTimeout`.
     await client.destroy(purgeCredentials ? "finalRemoval" : "removal");
-    this.clients.delete(name);
+    if (this.clients.get(name) === client) this.clients.delete(name);
   }
 
   const purge =
@@ -717,7 +793,9 @@ export async function destroyTemplateClients(
         );
       });
   }
-  this.templateClientMap.get(templateName)?.delete(instanceId);
+  if (names && instances?.get(instanceId) === names) {
+    instances.delete(instanceId);
+  }
   this.localTemplateClients.delete(entry);
 }
 

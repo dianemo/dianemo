@@ -1,4 +1,5 @@
 import type { QueueStats, QueuedRequest } from "@dianemo/core";
+import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 import {
   decodeFlatHash,
@@ -165,7 +166,8 @@ export function queueOps(ctx: Ctx) {
         metadataKeyPrefix
       );
 
-      return JSON.parse(result as string) as QueueStats;
+      const stats = JSON.parse(result as string) as QueueStats;
+      return { ...stats, totalCost: parseLuaNumber(stats.totalCost) };
     },
 
     async getAllRequests(

@@ -2256,6 +2256,30 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       ).toBe(2);
     });
 
+    it("reports slot costs that sum past the largest number as Infinity", async () => {
+      const config = { maxConcurrency: 3, requestTtl: 60_000 };
+      await backend.acquireConcurrency("inf:sum", 1, "a", config);
+      await backend.acquireConcurrency("inf:sum", 1, "b", config);
+      await backend.hset("inf:sum:costs", { a: "1e308", b: "1e308" });
+      expect(
+        await backend.acquireConcurrency("inf:sum", 1, "c", config)
+      ).toEqual({ acquired: false, currentConcurrency: Infinity });
+      expect(
+        (await backend.getConcurrencyState("inf:sum", 60_000))
+          .currentConcurrency
+      ).toBe(Infinity);
+    });
+
+    it("reports queue costs that sum past the largest number as Infinity", async () => {
+      await backend.addRequest("inf:qs", "inf:ms", queued("a"));
+      await backend.addRequest("inf:qs", "inf:ms", queued("b"));
+      await backend.hset("inf:ms:a", { cost: "1e308" });
+      await backend.hset("inf:ms:b", { cost: "1e308" });
+      expect((await backend.getQueueStats("inf:qs", "inf:ms")).totalCost).toBe(
+        Infinity
+      );
+    });
+
     it("counts a 1e400 queue cost as the default", async () => {
       await backend.addRequest("inf:q", "inf:m", queued("a"));
       await backend.hset("inf:m:a", { cost: "1e400" });

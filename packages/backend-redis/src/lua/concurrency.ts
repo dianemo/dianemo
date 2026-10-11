@@ -1,4 +1,5 @@
 import {
+  exactFn,
   finiteNumberFn,
   freezeGate,
   queueEmptyGate,
@@ -36,6 +37,7 @@ ${redisNow()}
   local keyTtl = tonumber(ARGV[5]) or 86400
 
 ${finiteNumberFn()}
+${exactFn()}
 ${usableConcurrencyFn()}
 ${usableCostFn()}
 ${usableRequestTtlFn()}
@@ -54,14 +56,14 @@ ${slotAccounting()}
   -- Refusal on '>', in every slot script: an admission written as the negation
   -- instead puts the boundary in two places that can drift apart.
   if currentCost + cost > maxConcurrency then
-    return cjson.encode({ acquired = false, currentConcurrency = currentCost })
+    return cjson.encode({ acquired = false, currentConcurrency = exact(currentCost) })
   end
 
   redis.call('ZADD', key, now, requestId)
   redis.call('HSET', costKey, requestId, cost)
   redis.call('EXPIRE', key, keyTtl)
   redis.call('EXPIRE', costKey, keyTtl)
-  return cjson.encode({ acquired = true, currentConcurrency = currentCost + cost })
+  return cjson.encode({ acquired = true, currentConcurrency = exact(currentCost + cost) })
 `;
 
 export const acquireQueuedConcurrency = `
@@ -77,6 +79,7 @@ ${ttlArgvWarning()}
 ${redisNow()}
 
 ${finiteNumberFn()}
+${exactFn()}
 ${usableConcurrencyFn()}
 ${usableCostFn()}
 ${usableRequestTtlFn()}
@@ -95,17 +98,17 @@ ${usableRequestTtlFn()}
 ${slotAccounting()}
 
   if redis.call('HGET', metadataKey, 'status') ~= 'inProgress' then
-    return cjson.encode({ acquired = false, currentConcurrency = currentCost })
+    return cjson.encode({ acquired = false, currentConcurrency = exact(currentCost) })
   end
   if currentCost + cost > maxConcurrency then
-    return cjson.encode({ acquired = false, currentConcurrency = currentCost })
+    return cjson.encode({ acquired = false, currentConcurrency = exact(currentCost) })
   end
 
   redis.call('ZADD', key, now, requestId)
   redis.call('HSET', costKey, requestId, cost)
   redis.call('EXPIRE', key, keyTtl)
   redis.call('EXPIRE', costKey, keyTtl)
-  return cjson.encode({ acquired = true, currentConcurrency = currentCost + cost })
+  return cjson.encode({ acquired = true, currentConcurrency = exact(currentCost + cost) })
 `;
 
 export const releaseConcurrency = `
@@ -126,6 +129,7 @@ export const getConcurrencyState = `
 
 ${redisNow()}
 ${finiteNumberFn()}
+${exactFn()}
   local expireTime = now - requestTtl
 
   -- Observability is non-destructive. Admission performs stale-slot cleanup;
@@ -145,9 +149,9 @@ ${finiteNumberFn()}
   -- held activeRequests would come back as an object the caller cannot
   -- iterate. Emit the array form explicitly.
   if #members == 0 then
-    return '{"currentConcurrency":' .. totalCost .. ',"activeRequests":[]}'
+    return '{"currentConcurrency":"' .. exact(totalCost) .. '","activeRequests":[]}'
   end
-  return cjson.encode({ currentConcurrency = totalCost, activeRequests = members })
+  return cjson.encode({ currentConcurrency = exact(totalCost), activeRequests = members })
 `;
 
 /**

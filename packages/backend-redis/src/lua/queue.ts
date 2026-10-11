@@ -1,4 +1,4 @@
-import { finiteNumberFn } from "./fragments.js";
+import { exactFn, finiteNumberFn } from "./fragments.js";
 import {
   MAX_QUEUE_PRIORITY as MAX_PRIORITY,
   MAX_QUEUE_RETRIES as MAX_RETRIES,
@@ -224,6 +224,7 @@ export const getQueueStats = `
 
   local requestIds = redis.call('ZRANGE', queueKey, 0, -1)
 ${finiteNumberFn()}
+${exactFn()}
   local pending = 0
   local inProgress = 0
   local totalCost = 0
@@ -250,7 +251,7 @@ ${finiteNumberFn()}
     end
   end
 
-  return cjson.encode({ pending = pending, inProgress = inProgress, totalCost = totalCost })
+  return cjson.encode({ pending = pending, inProgress = inProgress, totalCost = exact(totalCost) })
 `;
 
 export const getAllRequests = `

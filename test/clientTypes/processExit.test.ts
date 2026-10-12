@@ -41,7 +41,12 @@ beforeAll(async () => {
     platform: "node",
     format: "esm",
     target: "node20",
-    alias: { "@dianemo/core": join(repo, "packages/core/src/index.ts") },
+    // The subpath first: esbuild matches an alias as a prefix, so the bare
+    // entry alone would send `@dianemo/core/backend` to `src/index.ts/backend`.
+    alias: {
+      "@dianemo/core/backend": join(repo, "packages/core/src/backend/index.ts"),
+      "@dianemo/core": join(repo, "packages/core/src/index.ts"),
+    },
     // ioredis is CommonJS and calls `require` for Node built-ins, which an ES
     // module bundle does not define.
     banner: {
@@ -131,6 +136,21 @@ describe("signal handling in a host process", () => {
       stopped: true,
     });
   }, 30_000);
+
+  it.each(["onceBefore", "onceAfter"])(
+    "leaves the exit to a host whose process.once SIGTERM listener is still shutting down (%s start())",
+    async (mode) => {
+      const proc = host("signalHost", { HOST_MODE: mode });
+      await proc.waitFor("ready");
+      proc.child.kill("SIGTERM");
+      const exit = await proc.exit(10_000);
+      expect({ exit, done: proc.output().includes("host-done") }).toEqual({
+        exit: { code: 0, signal: null },
+        done: true,
+      });
+    },
+    30_000
+  );
 
   it("exits at once on a second signal while stop() is still draining", async () => {
     const proc = host("signalHost", { HOST_MODE: "slowStop" });

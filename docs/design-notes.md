@@ -379,8 +379,13 @@ iteration. Any
 `status` written through `updateRequest` also deletes it, so a returned entry is
 plainly pending. A stamp that does not parse never lapses, on both sides.
 
-The lease bounds only the gap between claim and confirmation, a few round
-trips, so it can be short. Too short costs little. Within one client object the
+The lease bounds only the gap between claim and confirmation, but that gap is
+three or four sequential round trips, and a lease shorter than they take under
+a latency spike refuses every confirmation: the same entry is claimed and
+refused again until its admission times out, holding the queue the while. At
+2 s a 600 ms spike did exactly that, so the lease is 10 s, enough for round
+trips of about 2.5 s each. Longer costs only how late a lost claim is
+recovered, which stays well inside `cleanupTimeout`. Within one client object the
 passes are serialised by `processingLock`, but the lock is that object's own:
 `resetClient` demotes and destroys the old client without waiting out a pass it
 is already running, so after a rebuild that pass can drain alongside the

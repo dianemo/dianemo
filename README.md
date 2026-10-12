@@ -121,9 +121,10 @@ A stopped handler stays stopped: later requests are refused with `handler_stoppe
 is called again.
 
 Once a signal's `stop()` finishes, the handler re-raises that signal, so the process ends by it just
-as it would have without dianemo. If your process listens for the signal too, exiting is yours
-instead: call `stop()` from your listener and exit when it resolves. A second signal while `stop()`
-is running is not caught, so without a listener of your own it ends the process at once.
+as it would have without dianemo. If your process listens for the signal too, with `process.on` or
+`process.once`, at any point, exiting is yours instead: call `stop()` from your listener and exit
+when it resolves. A second signal while `stop()` is running is not caught, so without a listener of
+your own it ends the process at once.
 
 
 ## Choosing a backend

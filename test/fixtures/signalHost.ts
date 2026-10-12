@@ -12,6 +12,9 @@ import RequestHandler, {
  * HOST_MODE:
  * - `plain`: no signal listener of its own.
  * - `hostListener`: listens for SIGTERM and exits with status 7 itself.
+ * - `onceBefore` / `onceAfter`: a `process.once` SIGTERM listener, added
+ *   before or after `start()`, that finishes its own shutdown after `stop()`,
+ *   prints `host-done` and exits with status 0.
  * - `slowStop`: holds a request upstream so `stop()` takes its whole budget.
  */
 
@@ -46,7 +49,22 @@ if (mode === "hostListener") {
   });
 }
 
+function onceListener(): void {
+  process.once("SIGTERM", () => {
+    void handler.stop().then(() => {
+      setTimeout(() => {
+        say("host-done");
+        process.exit(0);
+      }, 300);
+    });
+  });
+}
+
+if (mode === "onceBefore") onceListener();
+
 await handler.start();
+
+if (mode === "onceAfter") onceListener();
 
 if (mode === "slowStop") {
   handler.setDrainTimeout(30_000);

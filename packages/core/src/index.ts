@@ -11,6 +11,7 @@ import { clampDelay } from "./utils/retryAfter.js";
 import type BaseClient from "./client/index.js";
 import EventEmitter from "node:events";
 import crypto from "node:crypto";
+import os from "node:os";
 import {
   loadTemplateClientsFromBackend,
   buildAndRegisterTemplateClients,
@@ -203,16 +204,57 @@ const SHUTDOWN_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
 /** Handlers whose signal-triggered `stop()` has not settled yet. */
 const signalStops = new Set<RequestHandler>();
 
+/** Every listener dianemo has registered for a shutdown signal. */
+const ownSignalListeners = new WeakSet<(...args: never[]) => unknown>();
+
+/**
+ * Signals the host has listened for at any point since dianemo registered.
+ * Sticky, because a `process.once` listener is already removed by the time
+ * `stop()` settles, so a count taken then would miss a host mid-shutdown.
+ */
+const hostSignals = new Set<NodeJS.Signals>();
+let watchingHostSignals = false;
+
+function watchHostSignals(): void {
+  for (const signal of SHUTDOWN_SIGNALS) {
+    const host = process
+      .rawListeners(signal)
+      .some((l) => !ownSignalListeners.has(originalListener(l)));
+    if (host) hostSignals.add(signal);
+  }
+  if (watchingHostSignals) return;
+  watchingHostSignals = true;
+  process.on("newListener", (event, listener) => {
+    if (
+      (SHUTDOWN_SIGNALS as readonly unknown[]).includes(event) &&
+      !ownSignalListeners.has(listener)
+    ) {
+      hostSignals.add(event as NodeJS.Signals);
+    }
+  });
+}
+
+function originalListener(
+  l: (...args: never[]) => unknown
+): (...args: never[]) => unknown {
+  return (l as { listener?: (...args: never[]) => unknown }).listener ?? l;
+}
+
 /**
  * Re-raises `signal` once no handler is still stopping for it, unless the host
- * listens for it too. Any listener disables Node's default action for a signal,
- * so with ours gone and none of the host's, the re-raised one ends the process
- * with the conventional signal status.
+ * has listened for it. Any listener disables Node's default action for a
+ * signal, so with ours gone and none of the host's, the re-raised one ends the
+ * process with the conventional signal status.
  */
 function restoreSignalDefault(signal: NodeJS.Signals): void {
-  if (signalStops.size > 0) return;
-  if (process.listenerCount(signal) > 0) return;
-  process.kill(process.pid, signal);
+  if (signalStops.size > 0 || hostSignals.has(signal)) return;
+  try {
+    process.kill(process.pid, signal);
+  } catch {
+    // Windows' process.kill supports only SIGTERM, SIGINT and SIGKILL, and
+    // throws on SIGHUP (nodejs.org/api/process.html#signal-events).
+    process.exit(128 + (os.constants.signals[signal] ?? 0));
+  }
 }
 
 /**
@@ -223,11 +265,11 @@ function restoreSignalDefault(signal: NodeJS.Signals): void {
  * template mutation, and stops on SIGTERM, SIGINT or SIGHUP. Once stopped it
  * stays stopped: work is refused until `start()` is called again.
  *
- * On one of those signals it runs `stop()` and then, if the process has no
- * other listener for that signal, re-raises it so the process ends by that
- * signal, as it would have without dianemo. A host that listens for the signal
- * itself owns the exit: call `stop()` from that listener and exit when it
- * resolves. A second signal while `stop()` is running is not caught by
+ * On one of those signals it runs `stop()` and then, unless the host has
+ * listened for that signal at any point since the handler registered, re-raises
+ * it so the process ends by that signal, as it would have without dianemo. A
+ * host that listens for the signal itself, with `process.on` or `process.once`,
+ * owns the exit: call `stop()` from that listener and exit when it resolves. A second signal while `stop()` is running is not caught by
  * dianemo, so with no listener of the host's it ends the process at once.
  * There is no option to skip these listeners; one of your own takes the exit
  * over, as above.
@@ -520,6 +562,8 @@ export default class RequestHandler {
         });
     };
 
+    ownSignalListeners.add(this.shutdownHandler);
+    watchHostSignals();
     for (const signal of SHUTDOWN_SIGNALS) {
       process.once(signal, this.shutdownHandler);
     }

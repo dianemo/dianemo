@@ -1538,7 +1538,7 @@ describe.each(harnesses(11))(
         spec(1, {
           requestOptions: {
             defaults: { baseURL: up.baseURL },
-            cleanupTimeout: 4_000,
+            cleanupTimeout: QUEUE_CLAIM_LEASE_MS + 4_000,
           },
           healthCheckIntervalMs: 200,
         }),
@@ -1579,7 +1579,7 @@ describe.each(harnesses(11))(
         spec(1, {
           requestOptions: {
             defaults: { baseURL: up.baseURL },
-            cleanupTimeout: 4_000,
+            cleanupTimeout: QUEUE_CLAIM_LEASE_MS + 4_000,
           },
           healthCheckIntervalMs: 200,
         }),
@@ -1878,7 +1878,7 @@ describe.each(harnesses(11))(
             ],
             requestOptions: {
               defaults: { baseURL: up.baseURL },
-              cleanupTimeout: 15_000,
+              cleanupTimeout: QUEUE_CLAIM_LEASE_MS * 4,
             },
             retryOptions: { maxRetries: 0 },
           },
@@ -1943,13 +1943,21 @@ describe.each(harnesses(11))(
         );
       };
 
-      it("does not release the slot of a stream whose entry was removed at its headers", async () => {
-        await streamOutlivesItsEntry(0, 0);
-      }, 30_000);
+      it(
+        "does not release the slot of a stream whose entry was removed at its headers",
+        async () => {
+          await streamOutlivesItsEntry(0, 0);
+        },
+        QUEUE_CLAIM_LEASE_MS * 6
+      );
 
-      it("does not release the slot of a stream whose headers land while a stale claimer's refused confirmation is in flight", async () => {
-        await streamOutlivesItsEntry(1_500, 1_500);
-      }, 30_000);
+      it(
+        "does not release the slot of a stream whose headers land while a stale claimer's refused confirmation is in flight",
+        async () => {
+          await streamOutlivesItsEntry(1_500, 1_500);
+        },
+        QUEUE_CLAIM_LEASE_MS * 6
+      );
     });
 
     it("answers a request whose requestName is empty without stalling the queue behind it", async () => {
@@ -2115,5 +2123,190 @@ describe.each(harnesses(11))(
         }
       );
     }, 30_000);
+  }
+);
+
+// ------------------------------------------------- claim lease latency
+
+const LATENCY_KEY = "0123456789abcdef0123456789abcdef";
+const LATENCY_PREFIX = "fqp";
+const LATENCY_NAME = "fqp:_:a";
+
+async function startHoldingUpstream() {
+  const holds = new Map<string, () => void>();
+  const hits: string[] = [];
+  const server = createServer(async (req, res: ServerResponse) => {
+    const path = (req.url ?? "/").split("?")[0];
+    hits.push(path);
+    if (path.startsWith("/hold/")) {
+      await new Promise<void>((resolve) => holds.set(path, resolve));
+    }
+    res.writeHead(200).end("{}");
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const a = server.address();
+  const port = typeof a === "object" && a ? a.port : 0;
+  return {
+    baseURL: `http://127.0.0.1:${port}`,
+    hits,
+    held: (path: string) => holds.has(path),
+    release: (path: string) => {
+      holds.get(path)?.();
+      holds.delete(path);
+    },
+    close: async () => {
+      for (const r of holds.values()) r();
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
+    },
+  };
+}
+
+/**
+ * Every backend call's reply arrives `latency.ms` late, as under a Redis
+ * latency spike. The call itself executes at once, so a claim is stamped as
+ * early as it can be and a confirmation lands as early as it can be: this is
+ * the most favourable placement of the delay for the lease.
+ */
+function withLatency(backend: DianemoBackend) {
+  const latency = { ms: 0, confirms: [] as boolean[], claims: 0 };
+  const proxy = new Proxy(backend, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        const result = value.apply(target, args);
+        if (prop === "getNextRequest" && latency.ms > 0) latency.claims++;
+        if (prop === "confirmRequest" && latency.ms > 0) {
+          void (result as Promise<boolean>).then((ok) =>
+            latency.confirms.push(ok)
+          );
+        }
+        if (latency.ms > 0 && result && typeof result.then === "function") {
+          const ms = latency.ms;
+          return (result as Promise<unknown>).then(async (v) => {
+            await sleep(ms);
+            return v;
+          });
+        }
+        return result;
+      };
+    },
+  });
+  return { backend: proxy as DianemoBackend, latency };
+}
+
+async function withLatencyClient(
+  harness: Harness,
+  client: Record<string, unknown>,
+  fn: (
+    handler: RequestHandler,
+    latency: { ms: number; confirms: boolean[]; claims: number },
+    backend: DianemoBackend
+  ) => Promise<void>
+) {
+  const created = await harness.create();
+  const { backend, latency } = withLatency(created.backend);
+  const handler = new RequestHandler({
+    key: LATENCY_KEY,
+    backend,
+    keyPrefix: LATENCY_PREFIX,
+  });
+  await handler.registerClientTemplate(
+    "fqp" as never,
+    (() => [{ ...client, name: LATENCY_NAME }]) as never
+  );
+  await handler.start();
+  await handler.addTemplateClient("fqp" as never, { instanceId: "a" } as never);
+  try {
+    await fn(handler, latency, created.backend);
+  } finally {
+    latency.ms = 0;
+    await handler.stop().catch(() => undefined);
+    await created.cleanup().catch(() => undefined);
+  }
+}
+
+const waitUntilSync = async (check: () => boolean, ms = 5000) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (check()) return true;
+    await sleep(20);
+  }
+  return false;
+};
+
+describe.each(harnesses(11))(
+  "queue claim lease under latency — $name",
+  (harness) => {
+    it.each([1_000, 600])(
+      "dispatches a queued request when every backend round trip takes %i ms",
+      async (spikeMs) => {
+        const upstream = await startHoldingUpstream();
+        try {
+          await withLatencyClient(
+            harness,
+            {
+              rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 1 }],
+              requestOptions: {
+                defaults: { baseURL: upstream.baseURL },
+                cleanupTimeout: 25_000,
+              },
+              retryOptions: { maxRetries: 0 },
+            },
+            async (handler, latency) => {
+              const send = (url: string) =>
+                handler.handleRequest({
+                  clientName: LATENCY_NAME,
+                  requestName: "t",
+                  method: "GET",
+                  url,
+                } as never);
+
+              // A holds the only slot, so B has to queue.
+              const a = send("/hold/a");
+              expect(await waitUntilSync(() => upstream.held("/hold/a"))).toBe(
+                true
+              );
+              const b = send("/b").then(
+                () => "dispatched",
+                (error: Error) => `failed: ${error.name}`
+              );
+              await sleep(300);
+
+              // A latency spike: every reply now takes a second. Then A finishes,
+              // freeing the slot for B.
+              latency.ms = spikeMs;
+              upstream.release("/hold/a");
+              await a;
+
+              // A legitimate, merely slow pass has 20 s to send B on its way.
+              const sent = await waitUntilSync(
+                () => upstream.hits.includes("/b"),
+                20_000
+              );
+              // The cause when it is not: every confirmation of B's claim refused.
+              expect({
+                sent,
+                claims: latency.claims,
+                confirms: latency.confirms,
+              }).toEqual({
+                sent: true,
+                claims: latency.claims,
+                confirms: expect.arrayContaining([true]),
+              });
+              expect(
+                await waitUntilSync(() => upstream.hits.includes("/b"), 20_000)
+              ).toBe(true);
+              latency.ms = 0;
+              expect(await b).toBe("dispatched");
+            }
+          );
+        } finally {
+          await upstream.close();
+        }
+      },
+      60_000
+    );
   }
 );

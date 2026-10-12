@@ -3,7 +3,7 @@
 '@dianemo/backend-redis': major
 ---
 
-A queued request claimed by a controller is now a lease: an entry whose claim is not confirmed within `QUEUE_CLAIM_LEASE_MS`, 2 seconds — the claim's reply was lost, or its controller died before dispatching it — is handed out again rather than sitting `inProgress` until its admission times out, and an entry the backend cannot decode is passed over rather than claimed. A freeze that still owes thaw probes now outlives its window by up to a week, re-armed by every probe that succeeds and by the fresh freeze a failed probe arms, rather than expiring a minute after the window and letting the client back to full rate unprobed. The completion ids that keep a redelivered probe from counting twice are kept as long.
+A queued request claimed by a controller is now a lease: an entry whose claim is not confirmed within `QUEUE_CLAIM_LEASE_MS`, 10 seconds — the claim's reply was lost, or its controller died before dispatching it — is handed out again rather than sitting `inProgress` until its admission times out, and an entry the backend cannot decode is passed over rather than claimed. A freeze that still owes thaw probes now outlives its window by up to a week, re-armed by every probe that succeeds and by the fresh freeze a failed probe arms, rather than expiring a minute after the window and letting the client back to full rate unprobed. The completion ids that keep a redelivered probe from counting twice are kept as long.
 
 Fractional costs are admitted within a tolerance of `BALANCE_TOLERANCE` times the smaller of the cost and `maxTokens`, so a bucket of 1 admits a hundred claims of 0.01 while a spent bucket with a large ceiling admits nothing more.
 

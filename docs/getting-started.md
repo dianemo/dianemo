@@ -183,7 +183,8 @@ try {
 
 Retries with backoff are automatic; what surfaces is what remained after them.
 A failed upstream call surfaces as axios's own error, from the last attempt.
-Everything dianemo raises itself extends `RequestHandlerError` and carries
+Everything dianemo raises itself extends `RequestHandlerError` — `RequestError`
+aside, which plugins throw and which has the same fields — and carries
 `statusCode` and `code`, so a host that does not import dianemo's classes can
 still duck-type them. `RequestError` and `getOriginalStatus` belong to plugins:
 a plugin's request functions wrap failures in a `RequestError` — see

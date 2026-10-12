@@ -80,9 +80,11 @@ await requests.fedex.cancelShipment("fedex:_:production", {
 ```
 
 `handler.start()` is called on the first request and is idempotent. It registers SIGTERM/SIGINT/SIGHUP
-handlers so the queue drains on shutdown: `stop()` waits for queued and in-flight work to finish, up
-to a 10-second grace period (`setDrainTimeout` changes it), then fails anything still waiting with a
-`ClientUnavailableError` rather than leaving it to time out after the process meant to exit.
+handlers so the queue drains on shutdown: `stop()` waits up to a 10-second budget for queued work
+to drain, fails anything still waiting with a `ClientUnavailableError` rather than leaving it to
+time out after the process meant to exit, then waits up to the same budget again for requests
+already upstream. Shutdown can therefore take about 20 seconds; `setDrainTimeout` changes the
+budget.
 
 [Getting started](docs/getting-started.md) explains what each piece above is for.
 

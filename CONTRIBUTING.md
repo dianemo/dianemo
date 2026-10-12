@@ -171,7 +171,7 @@ six of them is usually asking to be split instead.
 
 ```bash
 npm install
-npm test              # vitest; redis-backed suites skip without a local redis
+npm test              # vitest; redis-backed suites skip unless REDIS_URL is set
 npm run check         # tsc, plus the type-level tests in type-tests/
 npm run lint
 npm run format        # prettier --check; `format:fix` to write
@@ -180,8 +180,9 @@ npm run build
 ```
 
 CI runs all of the above, plus the test suite against both a memory and a real Redis backend.
-Both backends must agree — `test/clientTypes/backendParity.test.ts` is the guard, and a change
-to one backend's semantics is expected to touch the other.
+Both backends must agree — `test/conformance.test.ts` is the guard, one suite run against each
+backend, with `test/clientTypes/backendParity.test.ts` pinning their queue selection to the same
+answers. A change to one backend's semantics is expected to touch the other.
 
 ### Publishing
 
@@ -196,11 +197,10 @@ help — the coercion happens before the quotes matter.
 matching the `paths` the root `tsconfig.json` already gives tsc. Both resolvers therefore agree,
 and `npm test` runs on a fresh clone before anything has been built.
 
-The alias is load-bearing rather than a convenience. The Redis backend's `ops/` layer imports
-`normalizeTtlSeconds`, `normalizeTombstoneTtl`, `parseStoredNumber`, `parseFiniteStored`,
-`parsePriority`, `calculateQueueScore`, `REQUEST_TOMBSTONE_TTL_SECONDS` and
-`REDIS_MAX_TTL_SECONDS` from `@dianemo/core` by name. Without it those resolve through the
-`node_modules/@dianemo/core` symlink onto `packages/core/dist`, which a fresh clone has not built —
+The alias is load-bearing rather than a convenience. The Redis backend imports runtime values from
+`@dianemo/core` by name, not only types — the TTL normalisers, the stored-number parsers, the
+queue-score constants — in `ops/`, `lua/` and `requestCodec.ts`. Without it those resolve through
+the `node_modules/@dianemo/core` symlink onto `packages/core/dist`, which a fresh clone has not built —
 so every suite fails to collect — and a *stale* `dist` is worse, because the Redis half of a run
 then reads compiled core while the memory half reads the source you just edited. The two disagree
 and it reads as a parity bug in the backend you did not touch.

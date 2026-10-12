@@ -158,14 +158,20 @@ or an environment variable.
 
 ## Errors
 
-Every error carries `statusCode` and `code` alongside `message`, so an HTTP layer can map them
-without importing this package:
+Every error dianemo raises itself carries `statusCode` and `code` alongside `message`, so an HTTP
+layer can map them without importing this package. A failed upstream call is the exception: it
+reaches a `handleRequest` caller as axios's own error, from the last attempt, which has the vendor's
+answer on `status` rather than `statusCode`:
 
 ```ts
 if (typeof err.statusCode === "number" && typeof err.code === "string") {
   res
     .status(err.statusCode)
     .json({ error: err.code, error_description: err.message });
+} else if (typeof err.status === "number") {
+  res
+    .status(502)
+    .json({ error: "upstream_error", upstream_status: err.status });
 }
 ```
 

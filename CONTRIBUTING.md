@@ -186,6 +186,13 @@ answers. A change to one backend's semantics is expected to touch the other.
 
 ### Publishing
 
+A release is a PR from a branch named `chore/release-<version>`, made from master with
+`npm run release`: it applies the version plans, bumps the versions, writes each package's
+`CHANGELOG.md` and deletes the plans. Sync the lockfile with `npm install --package-lock-only`,
+since `nx.json` skips it. The `Version Plan Check` workflow skips that branch prefix, because a
+release consumes the plans the check looks for. Once the PR is merged, tag the merge commit
+`<package>@<version>` for each package and publish from it.
+
 Releases go out with `NPM_CONFIG_OTP=<code> npm run release:publish`. The one-time password has to
 arrive by environment: nx parses `--otp` with yargs, which reads the value as a number and drops a
 leading zero, so roughly one code in ten reaches npm a digit short and is refused. Quoting does not

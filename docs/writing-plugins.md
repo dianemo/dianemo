@@ -53,7 +53,7 @@ This is self-contained and puts no constraint on the host. It suits a plugin
 that lives in your own codebase, and a handful of request functions defined in
 one file.
 
-**From a module-scoped binding**, using
+**From a process-wide binding**, using
 [`@dianemo/plugin-kit`](https://github.com/vivo-us/dianemo-plugins/tree/master/packages/plugin-kit).
 Request functions import `tryHandleRequest` directly rather than receiving it,
 which is what lets them live in separate files without threading a context
@@ -63,10 +63,12 @@ through every one:
 npm install @dianemo/plugin-kit
 ```
 
-`plugin-kit` ships from the plugins repo rather than this one and may not be on npm
-yet. The `definePlugin` form above is in `@dianemo/core` and always available, so
-reach for it if the install fails — the two differ only in how `tryHandleRequest`
-arrives.
+`plugin-kit` ships from the plugins repo rather than this one, so its releases
+trail core's. `@dianemo/plugin-kit@1.0.0` declares a peer range of
+`@dianemo/core ^1.0.0`, and a core major outside that range needs a plugin-kit
+release that accepts it before the two install side by side. The `definePlugin`
+form above is in `@dianemo/core` and always available, so reach for it if the
+install fails — the two differ only in how `tryHandleRequest` arrives.
 
 This is what the published
 [dianemo-plugins](https://github.com/vivo-us/dianemo-plugins) catalogue uses,
@@ -99,9 +101,12 @@ export { registerAcmeTemplate } from "./client.js";
 export * from "./requests/index.js";
 ```
 
-`name` is not decoration. It is the first segment of every client name and the
-key credentials are filed under, so two plugins claiming one name would route
-one's credentials to the other's builder. `use()` refuses that.
+`name` is not decoration, and it must equal the template name the plugin passes
+to `registerClientTemplate`. That template name is the first segment of every
+client name and the key credentials are filed under. `use()` refuses two plugins
+with one `name`, but it never sees the template name, so a plugin registering a
+template under some other name escapes that check — and two templates of one
+name route one's credentials to the other's builder.
 
 Call `use()` before the first request where you can. Called on a handler that
 has already started, it registers the template there and then and builds any
@@ -156,23 +161,26 @@ export async function registerAcmeTemplate(handler: RequestHandler) {
 }
 ```
 
-Three things worth noting:
+Four things worth noting:
 
 - **The `declare module` block** is what gives `addTemplateClient("acme", …)`
   a typed credential shape at every call site. It is not optional polish:
   `ClientTemplates` is empty by design, so without it `keyof ClientTemplates` is
   `never` and neither `registerClientTemplate` nor `addTemplateClient` accepts
   the name at all.
-- **`{{clientId}}` placeholders** are substituted from the client's credentials
-  at refresh time. Write them as placeholders rather than interpolating the
-  values, so the config object never holds a secret.
+- **`{{clientId}}` placeholders** are substituted at refresh time from
+  `authentication`, which holds the secret itself in `clientSecret`. Write them
+  as placeholders rather than interpolating the values, so the secret appears
+  once there instead of being copied into the token request's `data`.
 - **The builder returns an array.** One credential set may produce several
   clients — a vendor with separate rate limits per region, or a
   [`sharedLimit`](rate-limits/shared-limit.md) child alongside its parent.
 - **What it returns is copied before core writes to it.** Plans and overrides
   are placed on the copy, so a builder may return a module-level sub-client list
-  or a config it keeps per tenant. Its credentials arrive as JSON reads them
-  back from the backend: a `Date` is an ISO string by then.
+  or a config it keeps per tenant. Under `addTemplateClient` its credentials
+  arrive as JSON reads them back from the backend: a `Date` is an ISO string by
+  then. `addLocalTemplateClient` stores nothing, so it hands the builder the
+  caller's own object unchanged.
 
 Pick the rate limit from what the vendor publishes — see
 [choosing a rate limit](rate-limits/README.md), and note that granularity
@@ -228,7 +236,7 @@ not a list or cannot be built, or an object mixing `rateLimitOption` with bare
 sub-client paths, is refused with a `ConfigurationError` before anything is
 stored.
 
-Four more things worth knowing:
+Six more things worth knowing:
 
 - **A plan may hold several limits.**
   [A per-second and a per-day cap](rate-limits/multiple-limits.md) is exactly the
@@ -343,7 +351,7 @@ export const cancelShipment = async (
 ```
 
 A request function's signature is **its own domain arguments** — a client name
-and the data. No handler parameter. That is the whole point of the module-scoped
+and the data. No handler parameter. That is the whole point of the process-wide
 binding: `tryHandleRequest` is already bound to the owning handler, so a request
 function stays callable without threading a handler through every layer.
 
@@ -356,8 +364,10 @@ a failure greppable across services.
 
 ## The binding, and its one rule
 
-`bindTryHandleRequest(ctx)` establishes a **module-scoped** binding shared by
-every plugin in the process.
+`bindTryHandleRequest(ctx)` establishes a **process-wide** binding shared by
+every plugin in the process. It is kept on `globalThis` under a `Symbol.for`
+key rather than in a module variable, so two copies of plugin-kit installed side
+by side still see one binding.
 
 The cost is one handler per process. A second handler is refused loudly rather
 than silently rerouting the first one's traffic — which would be a genuinely
@@ -373,14 +383,17 @@ cache — a session cookie one replica logs in for and the rest reuse, a payment
 token with a server-side TTL:
 
 ```ts
-import { backend, acquireLock, releaseLock } from "@dianemo/plugin-kit";
+import { acquireLock, backend, pluginKey, releaseLock } from "@dianemo/plugin-kit";
 
-await backend().set(`acme:token:${clientName}`, token, ttlSeconds);
-const cached = await backend().get(`acme:token:${clientName}`);
+const key = pluginKey("acme", "token", clientName);
+await backend().set(key, token, ttlSeconds);
+const cached = await backend().get(key);
 ```
 
-Namespace keys by plugin name — the backend is shared with the handler's own
-bookkeeping and with every other plugin.
+Build keys with `pluginKey(plugin, ...parts)` rather than by hand. The backend
+is shared with the handler's own bookkeeping, with every other plugin, and — if
+the host set a `keyPrefix` — with every other handler on the same Redis.
+`pluginKey` folds that prefix in; a key written as a bare string skips it.
 
 **How far that sharing reaches is the host's choice, not yours.** Under
 [`@dianemo/backend-redis`](backends/redis.md) the cache is fleet-wide; under the
@@ -403,11 +416,12 @@ every consumer silently lost type safety.
 
 ## Checklist
 
-- [ ] `name` is unique and matches the client-name prefix
+- [ ] `name` is unique and equals the template name it registers
 - [ ] `declare module` block types the credentials
-- [ ] Secrets appear only as `{{placeholders}}` in refresh config
+- [ ] Secrets sit in `authentication` and appear only as `{{placeholders}}` in
+      refresh config
 - [ ] Rate limit reflects what the vendor actually publishes
 - [ ] `requestName` is dotted, namespaced, and describes the operation
 - [ ] Every request function takes domain arguments only, no handler
-- [ ] Backend keys are namespaced by plugin name
+- [ ] Backend keys are built with `pluginKey`
 - [ ] A test composes the plugin onto a handler and checks the namespace

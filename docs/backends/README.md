@@ -68,17 +68,34 @@ if your upstream is faster than your network.
 
 ## Writing another backend
 
-The contract is `DianemoBackend` in `packages/core/src/backend/types.ts`. It is
-deliberately a set of **domain operations** (`acquireTokens`,
-`tryAdmitImmediately`, `addRequest`) rather than storage primitives, because
-every one of them must be atomic with respect to other spenders. Each backend
-satisfies that in whatever way is natural for it — Lua scripts in Redis, or
-simply being synchronous in memory.
+The contract is `DianemoBackend` in `packages/core/src/backend/types.ts`. Its
+budget-spending half is deliberately a set of **domain operations**
+(`acquireTokens`, `tryAdmitImmediately`, `addRequest`) rather than storage
+primitives, because every one of them must be atomic with respect to other
+spenders. Each backend satisfies that in whatever way is natural for it — Lua
+scripts in Redis, or simply being synchronous in memory.
 
-Implement the interface, then run the conformance suite against it. The
-multi-limit methods (`acquireMultiLimit`, `releaseMultiLimit`,
-`tryAdmitMultiLimit`) are optional and outside that suite, and
-`test/clientTypes/multiLimit.test.ts` is what exercises them. Without the first
-two, a client declaring [several limits](../rate-limits/multiple-limits.md) is
-refused with a `ConfigurationError` when it is built; without
-`tryAdmitMultiLimit` it is built, but every request takes the queued path.
+The other half is plain storage and messaging, which the handler uses for the
+template registry, credentials, instance discovery and broadcasts: `get`, `set`,
+`del`, `hgetall`, `hset`, `sadd`, `srem`, `smembers`, `batch`, `publish`,
+`subscribe`, `acquireLock` and `releaseLock`, plus the `kind` and `distributed`
+properties. Every one of them is required.
+
+A few methods are optional, and each has a stated fallback:
+
+- **`refundTokens`.** Without it, budget claimed for a request that was never
+  dispatched is not handed back; the tokens are simply spent.
+- **`acquireQueuedConcurrency`.** Without it, a queued request claims its
+  concurrency slot through `acquireConcurrency`, which does not check in the
+  same operation that the queue entry is still in progress.
+- **`acquireMultiLimit`, `releaseMultiLimit` and `tryAdmitMultiLimit`.**
+  Without the first two, a client declaring
+  [several limits](../rate-limits/multiple-limits.md) is refused with a
+  `ConfigurationError` when it is built; without `tryAdmitMultiLimit` it is
+  built, but every request takes the queued path.
+
+Implement the interface, then run the conformance suite against it. Its
+`several budgets` block covers the multi-limit methods too, and
+`test/clientTypes/multiLimit.test.ts` exercises them through real clients. See
+[two backends, one contract](../design-notes.md#two-backends-one-contract) for
+what parity between backends requires beyond the types.

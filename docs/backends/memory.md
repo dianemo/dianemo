@@ -51,8 +51,11 @@ nothing can interleave with a synchronous loop.
 
 ## What you give up besides distribution
 
-- **Durability.** State lives in memory. A restart loses the queue, the token
-  buckets and any cached OAuth tokens. Redis would have kept them.
+- **Durability.** State lives in memory, so a process restart loses the queue,
+  the token buckets, any cached OAuth tokens and every template client stored
+  with `addTemplateClient`. Redis would have kept them. A `stop()` and `start()`
+  within one process loses nothing: the store outlives `close()`, and the
+  handler rebuilds its stored template clients from it.
 - **Shared credentials.** OAuth tokens are per-process, so a refresh benefits
   only the process that performed it. Under a distributed backend one replica's
   refresh serves the whole fleet.

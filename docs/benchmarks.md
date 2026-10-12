@@ -6,15 +6,20 @@ npm run bench -- --list                         # what is available
 npm run bench -- clientTypes queue              # just these
 npm run bench -- --all                          # including the opt-in ones
 npm run bench -- --backend=memory               # no Redis required
-npm run bench -- --json > results.json          # machine-readable
+npm run --silent bench -- --json > results.json # machine-readable
 ```
 
-`REDIS_URL` is required unless you pass `--backend=memory`.
+`REDIS_URL` is required unless you pass `--backend=memory`. `--silent` keeps npm's own banner out
+of the JSON; `node bench/index.mjs --json` does the same.
 
 ```bash
 docker run -d -p 6399:6379 redis:7-alpine
 REDIS_URL=redis://localhost:6399 npm run bench
 ```
+
+**Point `REDIS_URL` at a throwaway instance.** The runner sends `FLUSHDB` to that database when it
+finishes, and `backendOps` sends another before it measures — even under `--backend=memory`, if
+`REDIS_URL` is set. Whatever else lives in that database is deleted.
 
 ## What is actually being measured
 
@@ -82,7 +87,7 @@ The same two backends, driving real requests:
 | Scenario                               | `memoryBackend` | `redisBackend` | Ratio |
 | -------------------------------------- | --------------- | -------------- | ----- |
 | Sustained 100k, concurrency 50         | 18,340 req/s    | 16,966 req/s   | 1.08× |
-| Admission under a binding 1000/s limit | 13,717 req/s    | 9,688 req/s    | 1.42× |
+| 300 requests into a full 1000/s bucket | 13,717 req/s    | 9,688 req/s    | 1.42× |
 | `noLimit`, 15 ms upstream              | 1,653 req/s     | 1,524 req/s    | 1.08× |
 | `requestLimit`, 15 ms upstream         | 361 req/s       | 358 req/s      | 1.01× |
 
@@ -228,8 +233,11 @@ large client map slows the request path afterwards. It does not.
 
 ### queue
 
-Admission cost when a rate limit is actually binding, so every request takes the queued path rather
-than the uncontended fast path most scenarios measure.
+A `requestLimit` client at 50, 200 and 1000 tokens a second, each sent `min(maxTokens, 300)`
+requests at concurrency 50 into a bucket that starts full. The budget always covers the run, so the
+limit never binds: what this measures is admission and dispatch for a metered client while its
+budget lasts, not the queued path or the limiter's pacing. `burst` is the scenario that drives a
+budget past empty.
 
 ### replicas
 
@@ -258,8 +266,9 @@ because window 1 is still JIT-warming.
 ### backendOps _(opt-in)_
 
 Coordination cost with **no HTTP in the path** — the only scenario that compares the backends
-against each other rather than against the upstream ceiling. Runs both backends regardless of
-`--backend`, because a one-sided number answers nothing.
+against each other rather than against the upstream ceiling. Runs the memory backend regardless of
+`--backend`, and Redis whenever `REDIS_URL` is set; without it the Redis column is skipped and says
+so.
 
 ## Reading the results honestly
 

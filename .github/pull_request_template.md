@@ -1,0 +1,31 @@
+## Description
+
+**REQUIRED** | One paragraph, 4–6 sentences: what prompted this, what it does, and what standard it was held to. The gist, not a file list. Write every paragraph and bullet in this body as one line — GitHub turns each newline into a forced break — and keep the whole body under 5,000 characters.
+
+## Changes
+
+**REQUIRED** | Three to seven themes, not one per file or per commit. Say what changed and **why this way**, naming the alternative you rejected where there was one. This is the part a reviewer works from, so put the reasoning the diff cannot show here.
+
+## Version plan
+
+**REQUIRED** | The bump each published package takes, and the plan file declaring it. Write `None — no published package touched outside Markdown` if that is the case. `npm run version-plan:check` is the authority; CI runs it too.
+
+## Breaking changes
+
+**OPTIONAL** | One bullet per break, saying what a consumer must do. Delete the heading if there are none.
+
+A renamed error `code`, a moved key layout or a changed public signature all belong here. **A key layout change is a rolling-deploy hazard** — replicas metering different key names cannot see each other's balance, so the fleet can send at up to twice the agreed rate for the length of a rollout. Say so here as well as in the plan.
+
+## Verification
+
+**REQUIRED** | What you ran, and what you could not.
+
+- Test totals, and **whether the Redis-gated suites actually ran**. Without `REDIS_URL` a green run leaves out about half the suite and says nothing, and `test/conformance.test.ts` — the suite proving the two backends agree — loses its Redis half rather than skipping visibly.
+- Whether you ran the `--typecheck` form. `npm test` omits it, so the type-level suite CI runs does not execute locally.
+- `check`, `lint`, `format`, `sort-imports:check` and `build`.
+- **Any test assertion you changed, and why the behaviour under it is still right.**
+- Anything you could not exercise. Stated plainly it is useful; presented as tested it is the failure mode with teeth.
+
+## Additional notes
+
+**OPTIONAL** | Anything else a reviewer needs that the diff cannot tell them — a drive-by fix, a related-looking thing you left alone and why, a known limitation, a reverted approach, a house rule this PR changes. Delete the heading rather than writing "N/A".

@@ -192,17 +192,12 @@ async function processRequests(this: BaseClient) {
           break;
         }
 
-        // The request may have completed between the claim above and here.
-        // Admission excludes a request's own id from the occupancy sum so a
-        // resubmit does not compete with itself, which means a claim for an id
-        // that has just released succeeds and re-creates its entry — and nothing
-        // is left to release it, so the capacity sits claimed until its TTL.
-        //
-        // Narrows the window rather than closing it: a completion landing between
-        // this read and the notification below still strands the claim. Closing
-        // that would need the claim and the confirmation in one atomic operation,
-        // which is impossible while the claim and the queue entry are separate
-        // keys written by different callers.
+        // The request may have completed between the claim above and here, and
+        // a claim for an id that has just released re-creates its slot with
+        // nothing left to release it. This re-read narrows that window; only a
+        // claim that checks the entry's status in the same operation closes it,
+        // as `acquireQueuedConcurrency` does for a sole concurrency limit. See
+        // docs/design-notes.md#claiming-and-then-verifying-leaves-a-residue
         //
         // A read that failed is not evidence the request is gone, so an
         // unreadable entry is treated as still queued: keeping the claim is the

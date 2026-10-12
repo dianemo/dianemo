@@ -34,11 +34,15 @@ caller-supplied timestamp there would let one skewed replica unmark a grant the
 rest of the fleet still considers frozen. If such a script needs another `ARGV`,
 add it after the existing ones and leave `TIME` alone.
 
-**Process wall-clock is correct for one thing: a token's own lifetime.** The
-`issuedAt` / `expiresAt` pair on a stored credential is written and read in the
-same process frame, and the renewal margin is derived from the difference. Taking
-one end from `backend.now()` would inject skew into a computed lifetime, and a
-host lagging by more than the token's lifetime makes it negative.
+**Process wall-clock is correct for one thing: a stored credential's expiry.**
+`issuedAt` is the writing replica's `Date.now()`, and `expiresAt` is on the same
+wall clock — computed from it on a refresh, or supplied by the host seeding a
+grant — so the lifetime `expiresAt − issuedAt` is in one frame, and the renewal
+margin is derived from it. Expiry itself is compared against the *reading*
+replica's `Date.now()` in `authenticate.ts` — local wall clock against another
+host's — and the skew between the two is absorbed by the renewal margin. Taking
+one end of the lifetime from `backend.now()` would inject skew into it instead,
+and a host lagging by more than the token's lifetime makes it negative.
 
 **Arrival timestamps are approximate by construction**, and that is documented
 for consumers in [Concepts](concepts.md#cost-and-priority): the timestamp comes
@@ -92,11 +96,13 @@ to the bottom band in TypeScript and a default of 1 in Lua, on the same stored
 byte. `parseStoredNumber` exists to make emptiness explicit and remove the whole
 class rather than the one instance.
 
-The rule applies to **every** read of a stored numeric field, not to an
-enumerated list of them. An earlier version of this section listed the sites, and
-the list went stale twice — once when the Lua moved into `lua/`, and once when
-three inline copies of the freeze gate became one shared fragment. A list that
-undercounts is worse than no list, because walking it feels like coverage. So:
+The rule applies to **every** read of a stored numeric field in queue, budget
+and freeze state, not to an enumerated list of them. It is stated as a rule
+rather than a list of sites because a list that undercounts is worse than no
+list: walking it feels like coverage. Credential fields are outside it:
+`expiresAt`, `issuedAt` and `refreshTokenExpiresAt` are read with `Number` in
+`authenticate.ts`, where no Lua reads the same field and an unusable value is
+handled at the read. So:
 
 - **In Lua**, a read is either `tonumber(x) or <default>` where a missing field
   means the default, or a bare `tonumber(x)` followed by an explicit `nil` test
@@ -191,6 +197,42 @@ it answered — `?? this.authData` cannot distinguish "this client owns its budg
 from "the owner has no auth data", and falling back to the borrower's own config
 is exactly the disagreement the indirection removes.
 
+## Template builds and removals are serialized per entry
+
+One template entry — a `(templateName, instanceId)` — can be built and removed
+from several directions at once: a local `addTemplateClient` races its own
+`templateClientAdded` broadcast, a start reloads every stored entry, and a
+removal can arrive while a rebuild sits between reading the stored record and
+registering its clients. `entryLocks` in `templateClients.ts` serializes them: a
+`WeakMap` keyed by handler, so two handlers in one process stay independent,
+holding one promise chain per entry, which a failed predecessor does not break.
+
+The lock orders the work but cannot tell a build that its record is stale. So
+every removal bumps the entry's generation (`entryGenerations`), **before** it
+awaits the lock, and a build reads the generation before it reads the record.
+A build that finds the generation moved — on taking the lock, or after its last
+await — registers nothing. Bumped inside the lock instead, a build already
+holding it would see no change and register clients for a removed entry.
+
+Credentials need the same guarantee across a rebuild. A replacement client does
+not stop the refreshes its predecessor has in flight, so retirement is tracked
+per line of rebuilds rather than per client: `credentialLines` in
+`authenticate.ts` gives a client and every client it replaced one shared flag
+(`inheritCredentialLine`), and a removal's `retireCredentialWrites` stops all of
+them. A token refresh checks the flag after its last await before writing.
+`setGrantTokens` checks it before its write and again after, since a removal
+that purged while the write was in flight never saw that grant: the write
+deletes itself and throws `client_removed`.
+
+## Builder output is copied before it is written into
+
+A template builder's return value is deep-copied (`deepCloneWithFunctions`)
+before the plan and overrides are written into it, and the chosen plan is
+`structuredClone`d per build. Builders may return objects they share between
+tenants or keep from one build to the next, and a plan is shared by every tenant
+on it, so writing into either in place would carry one tenant's limits into
+another's build — past the validation registration gave them.
+
 ## Freeze duration and retry wait are separate numbers
 
 They used to be one, and code that assumes they still are will look correct.
@@ -201,7 +243,15 @@ They used to be one, and code that assumes they still are will look correct.
 They can legitimately disagree. `retryBackoffBaseTime: 0` is legal and means
 "retry this request immediately" — it says nothing about whether the fleet should
 keep hammering an upstream that just rejected us. Such a client has a zero
-`waitTime` while its freeze may run the budget owner's entire refill interval.
+`waitTime` while its freeze after a 429 may run the budget owner's entire refill
+interval.
+
+Only a 429 takes that floor. `getFreezeBaseTime(isRateLimited)` raises the
+freeze to the shortest refill interval when the response was a rate limit, and
+a 5xx or dropped connection freezes for the configured back-off: it says nothing
+about the budget, and flooring it would stop a per-day client for a day over one
+bad response. `MeteredClient` floors its retry wait on the same condition; a
+`sharedLimit` child's retry wait takes its own back-off either way.
 
 Consequences worth knowing before touching either:
 
@@ -223,12 +273,38 @@ Consequences worth knowing before touching either:
   self-corrects because the pass declines and re-books. A shrinking deadline would
   make it *late* with nothing behind it.
 
-  It follows that no code path ends a freeze early. `clearFreezeState`,
-  `resetTokenBucket` and `clearConcurrency` have no call sites in
-  `packages/core/src` outside the backends themselves — they are on the interface
-  for an operator, and are documented as such in
+  It follows that nothing ends a freeze before its window lapses. A successful
+  [thaw probe](#thaw-probes) deletes the freeze only once `frozenUntil` has
+  passed, so a window re-armed while the probe was in flight stands.
+  `clearFreezeState`, `resetTokenBucket` and `clearConcurrency` have no call
+  sites in `packages/core/src` outside the backends themselves — they are on the
+  interface for an operator, and are documented as such in
   [Concepts](concepts.md#clearing-a-freeze-by-hand). Keep them that way: a caller
   inside the library would be the shortening path this bullet exists to prevent.
+
+## Thaw probes
+
+A freeze whose window has lapsed still owes `thawRequestCount` probes, and they
+go out one at a time. When `canProcessNextRequest` reports a thaw, the drain
+loop nominates the head through `tryStartThawRequest`, which checks for a
+competing in-progress probe and marks this entry `isThawRequest` in one
+operation. Without grant isolation every grant shares the one freeze, so the
+claim is client-wide (`anyGrant`) and a probe of any grant holds it; an isolated
+grant probes only its own freeze.
+
+A nominated probe that does not go out — its turn declined, or the claim threw
+— gives the mark back through `returnToQueue` in `processRequests.ts`. Left set,
+it reads as a competing probe and holds off every other, and its eventual
+completion is counted against whichever freeze stands by then.
+
+A successful probe decrements the count, and `updateThawProgress` (`memory.ts`,
+`lua/freeze.ts`) deletes the freeze only once the count is spent **and** the
+window has lapsed. Another freeze can be armed while the probe is in flight;
+deleting on the count alone would let the probe's success end that new window
+early, which is the shortening that
+[`armFreeze`'s monotonicity](#freeze-duration-and-retry-wait-are-separate-numbers)
+rules out. Each completion id is recorded before the state is read, so a
+redelivered completion is not counted twice.
 
 ## Claiming and then verifying leaves a residue
 
@@ -360,13 +436,15 @@ one round trip instead of an encoded spec list.
 no queue — it is constructed with the owner's name — so it is a different thing
 rather than a different budget, and it may not be combined with other limits.
 
-Three things follow that are easy to get wrong:
+Four things follow that are easy to get wrong:
 
 - **Derive, do not cache, anything read off `rateLimit`.** `sole` and `metered`
   are getters. A cached copy is a second reading that a write can leave behind,
   and the two disagreeing would have the claim spend against one budget while the
   ceiling was checked against another.
-- **Nothing claims capacity before `tryAcquireTurn`.** The drain loop's check
+- **Within the drain loop, nothing claims capacity before `tryAcquireTurn`.**
+  The `tryAdmitImmediately` fast path claims outside it, only while the queue is
+  empty and before the request is ever enqueued. The drain loop's check
   that the entry is still queued sits after the claim, gated on
   `claimsReleasableCapacity()`, and a claim it finds stale is handed back
   through `refundUnusedAdmission`. The solo-concurrency path uses
@@ -379,6 +457,11 @@ Three things follow that are easy to get wrong:
   bucket that never gave out the tokens. A slot ledger the current limits no
   longer name is still released; a bucket they no longer name keeps the spend,
   since losing a token is the safe direction.
+- **Admission is not the last point a request can be abandoned.** The
+  interceptor and a token refresh run after it, so an abort landing there goes
+  through `releaseAbandonedRequest` like any other pre-dispatch failure: the
+  claim is refunded and the caller gets `RequestAbortedError`. Left to axios, it
+  would reject with its own `CanceledError` and keep the spend.
 
 ## Several budgets are claimed in one operation, or not at all
 
@@ -392,6 +475,12 @@ So the claim is one backend operation. Both implementations evaluate every budge
 before committing to any: the memory backend in a single synchronous pass, Redis
 in a single Lua script that runs `planMultiLimit` to completion before
 `commitMultiLimit` writes anything.
+
+The release is one operation too. The memory backend's `releaseMultiLimit`
+hands back every budget in one synchronous pass, through `creditTokens` and
+`releaseSlot` — the bodies of `refundTokens` and `releaseConcurrency`, kept
+synchronous for this — rather than awaiting each public method in turn, which
+would let another spender land between two budgets of one refund.
 
 Four consequences worth knowing before touching that code:
 
@@ -439,19 +528,19 @@ further 429 through the same retry multiplier, and probed one request at a time.
 Flooring at the shortest rather than the longest is the other half of the same
 argument — a per-day interval would pause the fleet until tomorrow.
 
-The release path has to agree. A refund is refused while a bucket's freeze
-stands, because the freeze emptied that bucket — true only of the lone
-`requestLimit` case. A claim handed back because a freeze landed mid-claim is
-therefore refunded to every bucket of a client with several `requestLimit`s,
-with the freeze key dropped from each, rather than lost.
-
-The same holds for the *kind* of freeze. Only a 429 empties a bucket; a 5xx or
-a dropped connection freezes without touching it, so a refund refused under one
+The release path has to agree. A refund is refused while a freeze that emptied
+the bucket stands, and only a 429 on a client with exactly one `requestLimit`
+empties one: a 5xx or a dropped connection freezes without touching a bucket,
+and so does a 429 on a client with several. A refund refused under any of those
 is a token lost for nothing. The freeze therefore records which it is, as an
-`emptiesBucket` field that `armFreeze` writes from its `emptiesBucket` option,
-and both backends' refund gates refuse only while a freeze with that field set
-stands. An absent field reads as set, which is what every freeze meant before
-the field existed.
+`emptiesBucket` field that `armFreeze` writes from its `emptiesBucket` option —
+`freezeEmptiesBucket` sets it only in the lone-`requestLimit` case — and both
+backends' refund gates refuse only while a freeze with that field set stands.
+So a multi-limit claim handed back because a freeze landed mid-claim is credited
+to every bucket. `releaseClaim` always sends the freeze key: whether to refuse
+is the freeze's answer rather than the caller's, since the limits in force at
+the release may not be the ones in force when it was armed. An absent field
+reads as set, which is what every freeze meant before the field existed.
 
 The probe budget looks like it already says this — a 429 arms with
 `thawRequestCount > 0` and a 5xx with 0 — and was rejected as the signal for two
@@ -474,8 +563,9 @@ each completion it announced until a controller says it has applied it:
 - The owner re-announces an unacknowledged completion on its health tick, no
   sooner than one full interval after it first stored it, so in the ordinary
   case the acknowledgement lands first and the public channel carries the
-  completion once. It gives up after `MAX_COMPLETION_FORWARDS` ticks with no
-  controller at all.
+  completion once. It gives up on a completion after `MAX_COMPLETION_FORWARDS`
+  unacknowledged announcements, whatever the cause — no controller, a lost
+  acknowledgement, or a controller that keeps failing to apply it.
 - An acknowledged completion is remembered in `completedRequestIds`, on workers
   as on the controller, so a late echo of a re-announcement is not stored again.
   Without that the owner's own echo re-armed it, and `requestDone` — which
@@ -486,6 +576,15 @@ each completion it announced until a controller says it has applied it:
   a freeze whose probe had lifted it. The owner's re-announcement is what
   reaches a new controller, and it is also what carries a completion past a
   controller that died with it unapplied.
+- **A `sharedLimit` child forwards its completions to its budget owner**, which
+  holds the queue and the freeze they apply to. While the owner is mid-rebuild
+  there is no owner to reach, so the child keeps the completion and
+  `scheduleCompletionForward` retries on a short timer until one is registered.
+- **A rebuild hands the state to the replacement.** `adoptWaitingRequests` moves
+  `pendingRequestDone` and `completedRequestIds` across, and the old client
+  forwards anything that still reaches it. Left behind, an unacknowledged
+  completion would never be re-announced, and a remembered one could be stored
+  again from a late echo.
 
 ## One queue per budget, so one arbiter orders it
 
@@ -514,7 +613,7 @@ controller does the claiming, of all the owner's budgets at once.
 
 Both backends read a missing key as the permissive answer. A token bucket with
 no `tokens` field is full — `finiteNumber(..., maxTokens)` in
-`lua/tokenBucket.ts`, `parseStoredNumber(..., config.maxTokens)` in the memory
+`lua/tokenBucket.ts`, `parseFiniteStored(..., config.maxTokens)` in the memory
 backend — and absent freeze state is no freeze. That is the only sane reading
 for a client's first request: nothing has been written yet, and the alternative
 is that a new client stalls until something seeds its keys.
@@ -581,8 +680,10 @@ nothing wrong.
 ## Two backends, one contract
 
 `memoryBackend()` and `redisBackend()` implement the same interface and must be
-semantically identical. `test/clientTypes/backendParity.test.ts` is the guard,
-and a change to one backend's semantics is expected to touch the other.
+semantically identical. `test/conformance.test.ts` is the cross-backend guard,
+running one suite against both; `test/clientTypes/backendParity.test.ts` holds
+the two queue-selection implementations to one answer. A change to one backend's
+semantics is expected to touch the other.
 
 Where they legitimately differ is *how* atomicity is achieved, not whether it
 holds:
@@ -607,16 +708,19 @@ Two things follow that are easy to get wrong:
   delivered first finds nothing, the add then creates the entry, and it survives
   with a live `ownerId` that nobody awaits — spared by `cleanupOrphanedRequests`
   because its owner is alive, and pinning the queue non-empty, which disables the
-  fast path for the whole client. Both shipped backends satisfy this
-  *incidentally* — Redis orders commands on one connection, the memory backend
-  commits without yielding — so a backend that batches, proxies or resolves the
-  call across a yield has to arrange it explicitly.
+  fast path for the whole client. Command order on one connection does not
+  meet this — a `NOSCRIPT` resend can put the add behind a later `PUBLISH` — so
+  what holds it is the removal tombstone both backends keep: see
+  [a removed request cannot be re-added](#a-removed-request-cannot-be-re-added).
+  A backend that batches, proxies or resolves the call across a yield has to
+  arrange the same explicitly.
 
-One difference is deliberate and is not a parity break. `close()` releases what
-the backend itself opened, and the two own different things: the memory
-backend's store *is* the shared state, so closing discards it, while the Redis
-backend owns only the pub/sub duplicate it created and must leave the caller's
-connection and every key untouched. Both stay usable afterwards — `stop()`
-closes the backend and `start()` re-subscribes, so a handler restart on one
-backend is a supported pattern rather than a leak, and neither backend refuses a
-`subscribe` after a `close`.
+`close()` releases what the backend itself opened and keeps the data, on both.
+The memory backend stops its sweeper and drops its subscriptions but keeps its
+store; the Redis backend quits only the pub/sub duplicate it created and leaves
+the caller's connection and every key untouched. Both stay usable afterwards —
+`stop()` closes the backend and `start()` re-subscribes, so a handler restart is
+a supported pattern rather than a leak, and neither backend refuses a
+`subscribe` after a `close`. `doStop` clears `templateClientMap` along with the
+clients, so the restart rebuilds every stored template client rather than
+skipping it as already built.

@@ -31,6 +31,77 @@ export type SettleFunction = (
   outcome: AttemptOutcome
 ) => RequestCost | undefined | Promise<RequestCost | undefined>;
 
+/**
+ * Watches a streamed response pass through on its way to the caller, to read
+ * the usage a vendor reports inside the stream — Anthropic in
+ * `message_start` and `message_delta`, for instance. One is made per attempt.
+ * See docs/rate-limits/streaming.md.
+ */
+export interface StreamObserver {
+  /** Sees each chunk as the caller will, without consuming it. Must not throw. */
+  onChunk?(chunk: Buffer | string): void;
+  /**
+   * Called once, however the stream ends — so a stream cut short settles at
+   * what was generated. Returns the cost to settle at, `undefined` to leave it
+   * to `settle` or the response's `dianemo.settle`, or `{ error }` for an error
+   * the vendor reported mid-stream, which freezes the client like a 5xx.
+   */
+  result?(): StreamResult | undefined;
+}
+
+/**
+ * What a stream observer reports. An object carrying a string `error` is an
+ * error report, optionally with what the stream cost before it; anything else
+ * is a cost.
+ */
+export type StreamResult = RequestCost | StreamError;
+
+export interface StreamError {
+  /** The vendor's error, such as `"overloaded_error"`, for the logs. */
+  error: string;
+  cost?: RequestCost;
+}
+
+/** Reads a stream observer's result as the error form, if it is one. */
+export function streamErrorOf(result: StreamResult): StreamError | undefined {
+  if (typeof result !== "object" || result === null) return undefined;
+  const error = (result as { error?: unknown }).error;
+  return typeof error === "string" ? (result as StreamError) : undefined;
+}
+
+/** How a streamed response came to an end. */
+export type StreamEndReason =
+  /** The upstream finished sending. */
+  | "completed"
+  /** The caller destroyed the stream, or its `signal` aborted. */
+  | "closed"
+  /** The upstream connection failed mid-stream. */
+  | "error"
+  /** `streamTimeout` elapsed. */
+  | "timeout"
+  /** The handler stopped with the stream still open. */
+  | "shutdown";
+
+/**
+ * Attached to a streamed response as `response.dianemo`.
+ */
+export interface StreamControls {
+  /**
+   * Settles the attempt at what the caller read from the stream. The first
+   * settlement wins, whether this or an observer's; later ones are no-ops.
+   * Resolves once applied, and never rejects.
+   */
+  settle(cost: RequestCost): Promise<void>;
+  /** Resolves when the stream has ended and its slot has been released. */
+  finished: Promise<StreamEndReason>;
+}
+
+/** A response as `handleRequest` returns it. */
+export type DianemoResponse<T = unknown, D = unknown> = AxiosResponse<T, D> & {
+  /** Present when the request set `responseType: "stream"`. */
+  dianemo?: StreamControls;
+};
+
 export interface RequestConfig<
   TRequestData = unknown,
 > extends AxiosRequestConfig<TRequestData> {
@@ -65,6 +136,13 @@ export interface RequestConfig<
    * {@link SettleFunction} and docs/rate-limits/settlement.md.
    */
   settle?: SettleFunction;
+  /**
+   * For a request with `responseType: "stream"`: makes the observer that reads
+   * usage from the stream as it passes, and settles at what it reports when the
+   * stream ends. Usually declared by a plugin's request definition, where the
+   * vendor's event format is known. See docs/rate-limits/streaming.md.
+   */
+  settleStream?: () => StreamObserver;
   /**
    * Set by the handler before any `requestInterceptor` runs, and unique per
    * `handleRequest` call: every retry of that call carries the same id. A value
@@ -106,7 +184,10 @@ export interface RequestMetadata {
   isThawRequest: boolean;
   /** Admitted without queueing; no queue entry exists for it. */
   fastPath?: boolean;
-  /** Declares `settle`, so its claim leaves a mark. See `QueuedRequest.settles`. */
+  /**
+   * Declares `settle` or `settleStream`, or streams its response, so its claim
+   * leaves a mark. See `QueuedRequest.settles`.
+   */
   settles?: boolean;
   /**
    * The budget keys this attempt claimed from, set by whoever claimed it.
@@ -141,6 +222,13 @@ export interface RequestRetryData {
 
 export interface RequestDoneData extends RequestMetadata {
   responseStatus: "success" | "failure" | "retry";
+  /**
+   * For a streamed response, which of its two announcements this is: at the
+   * headers, which settles the queue entry and the thaw probe, or at the end of
+   * the stream, which releases the slot and may freeze. Absent for anything
+   * else, which announces once. See docs/rate-limits/streaming.md.
+   */
+  phase?: "headers" | "end";
   waitTime: number;
   /** How long the client-wide freeze should last. See `RequestRetryData`. */
   freezeTime?: number;

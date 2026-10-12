@@ -275,6 +275,8 @@ export interface ClientSpec {
   retryOptions?: Record<string, unknown>;
   /** For a suite whose behaviour turns on the health tick, at test speed. */
   healthCheckIntervalMs?: number;
+  /** Merged over the upstream's `baseURL`, for a suite tuning timeouts. */
+  requestOptions?: Record<string, unknown>;
 }
 
 /**
@@ -298,7 +300,7 @@ export async function withHandler(
         {
           name: `${spec.name}:_:${creds.instanceId}`,
           rateLimit: spec.rateLimit,
-          requestOptions: { defaults: { baseURL } },
+          requestOptions: { ...spec.requestOptions, defaults: { baseURL } },
           ...(spec.retryOptions ? { retryOptions: spec.retryOptions } : {}),
           ...(spec.healthCheckIntervalMs
             ? { healthCheckIntervalMs: spec.healthCheckIntervalMs }

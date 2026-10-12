@@ -335,6 +335,15 @@ export interface RequestOptions {
    */
   settleWindow?: number;
   /**
+   * How long a streamed response may stay open before it is closed and its
+   * slot released, so a forgotten stream cannot hold a slot for ever. Long,
+   * because a large generation streams for half an hour or more, and its slot
+   * is kept alive meanwhile rather than reaped at `concurrencySlotTtl`.
+   *
+   * Default: 3600000 milliseconds (60 minutes)
+   */
+  streamTimeout?: number;
+  /**
    * When cleaning up requests, how long until the request is counted as timed-out.
    *
    * Default: 60000 milliseconds (1 minute)
@@ -343,7 +352,8 @@ export interface RequestOptions {
   /**
    * Crash recovery only. Must exceed the slowest response the upstream can
    * legitimately produce, or a slot is reaped while its request is still in flight and
-   * the effective cap becomes a multiple of `maxConcurrency`.
+   * the effective cap becomes a multiple of `maxConcurrency`. A streamed response
+   * counts only to its headers: its slot is refreshed while the stream is open.
    *
    * Default: 120000 milliseconds (2 minutes)
    */

@@ -107,8 +107,9 @@ arriving after the window applies nothing.
 - The backend must implement `settleTokens`. Both built-in backends do; a
   request with `settle` on one that does not is refused when it is made.
 - A `sharedLimit` client settles against its owner's limits, by their names.
-- Streamed responses are not settled yet: `settle` runs when the headers
-  arrive, before the usage is known.
+- A streamed response settles when the stream ends, from an observer that
+  reads the usage as it passes or from the caller; see
+  [streamed responses](streaming.md).
 - A spend-cap 429 is retried and freezes the fleet like any other 429. To fail
   it at once instead, see
   [classifying failures](README.md#classifying-failures).

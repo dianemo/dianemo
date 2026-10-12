@@ -37,6 +37,8 @@ that is easiest to configure.
   per-day, or a rate *and* a concurrency ceiling
 - [Settling against the response](rate-limits/settlement.md) — a cost known
   only afterwards, such as an AI API's tokens
+- [Streamed responses](rate-limits/streaming.md) — a slot held and a cost
+  settled until the stream ends
 
 ## Backends
 

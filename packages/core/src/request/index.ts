@@ -153,16 +153,26 @@ export default class Request {
       retries: this.retries,
       grantId: this.config.grantId,
       isThawRequest: this.isThawRequest,
-      ...(this.config.settle ? { settles: true } : {}),
+      ...(this.settles() ? { settles: true } : {}),
       fastPath: this.fastPath,
       claimedKeys: this.claimedKeys,
       ownerId: this.ownerId,
     };
   }
 
+  /** Whether this request's claims should leave a mark for settlement. */
+  settles(): boolean {
+    return Boolean(
+      this.config.settle ||
+      this.config.settleStream ||
+      this.config.responseType === "stream"
+    );
+  }
+
   getRequestDoneData(
     retryData?: RequestTypes.RequestRetryData,
-    httpStatus?: number
+    httpStatus?: number,
+    phase?: "headers" | "end"
   ): RequestTypes.RequestDoneData {
     let responseStatus: "success" | "failure" | "retry" = "success";
     if (retryData) responseStatus = retryData.retry ? "retry" : "failure";
@@ -175,6 +185,7 @@ export default class Request {
       freezeClient: retryData?.freezeClient || false,
       completedAt: Date.now(),
       httpStatus,
+      ...(phase ? { phase } : {}),
     };
   }
 }

@@ -305,6 +305,16 @@ class RedisBackend implements DianemoBackend {
   settleTokens(...a: Parameters<NonNullable<DianemoBackend["settleTokens"]>>) {
     return this.ops.tokenBucket.settleTokens(...a);
   }
+  touchClaimMark(
+    ...a: Parameters<NonNullable<DianemoBackend["touchClaimMark"]>>
+  ) {
+    return this.ops.tokenBucket.touchClaimMark(...a);
+  }
+  touchConcurrency(
+    ...a: Parameters<NonNullable<DianemoBackend["touchConcurrency"]>>
+  ) {
+    return this.ops.concurrency.touchConcurrency(...a);
+  }
 
   // -------------------------------------------------------- several budgets
 

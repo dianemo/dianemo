@@ -4,6 +4,7 @@ import {
   acquireQueuedConcurrency,
   getConcurrencyState,
   releaseConcurrency,
+  touchConcurrency,
   tryAdmitConcurrency,
 } from "./concurrency.js";
 import {
@@ -64,6 +65,7 @@ export const SCRIPTS = {
   dianemoAcquireConcurrency: { keys: 1, lua: acquireConcurrency },
   dianemoAcquireQueuedConcurrency: { keys: 2, lua: acquireQueuedConcurrency },
   dianemoReleaseConcurrency: { keys: 1, lua: releaseConcurrency },
+  dianemoTouchConcurrency: { keys: 1, lua: touchConcurrency },
   dianemoGetConcurrencyState: { keys: 1, lua: getConcurrencyState },
   dianemoGetNextRequest: { keys: 2, lua: getNextRequest },
   dianemoUpdateRequest: { keys: 2, lua: updateRequest },

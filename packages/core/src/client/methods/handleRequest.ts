@@ -1,17 +1,23 @@
-import { trace, SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import { type Span, trace, SpanKind, SpanStatusCode } from "@opentelemetry/api";
 import { clampDelay, retryAfterMs } from "../../utils/retryAfter.js";
+import { PassThrough, type Readable, Transform } from "node:stream";
 import type { AxiosError, AxiosResponse } from "axios";
+import { streamErrorOf } from "../../request/types.js";
 import type * as ClientTypes from "../types.js";
 import authenticate from "./authenticate.js";
 import Request from "../../request/index.js";
 import type BaseClient from "../index.js";
 import type {
   AttemptOutcome,
+  DianemoResponse,
   RequestConfig,
   RequestCost,
   RequestDoneData,
   RequestMetadata,
   RequestRetryData,
+  StreamEndReason,
+  StreamObserver,
+  StreamResult,
 } from "../../request/types.js";
 import {
   redactBody,
@@ -25,6 +31,8 @@ import {
   NoResponseError,
   RequestAbortedError,
   RequestTimeoutError,
+  StreamClosedError,
+  StreamTimeoutError,
 } from "../../errors.js";
 
 const tracer = trace.getTracer("@dianemo/core");
@@ -69,7 +77,10 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
       if (costProblem) throw costProblem;
       // Refused here rather than discovered after the response, when the claim
       // could no longer be corrected and the caller would never hear why.
-      if (config.settle && !this.backend.settleTokens) {
+      if (
+        (config.settle || config.settleStream) &&
+        !this.backend.settleTokens
+      ) {
         throw new ConfigurationError(
           "backend_missing_settlement",
           `Client ${this.name} was given a request that settles, which needs a backend implementing settleTokens.`
@@ -80,6 +91,9 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
       // Counted for the shutdown drain, which otherwise cannot see a fast-path
       // request — it has no queue entry, but it may hold a concurrency slot.
       this.trackRequestStarted();
+      // A streamed response hands its bookkeeping to the stream's end, which
+      // outlives this function.
+      let handedToStream = false;
       try {
         do {
           request.setStatus("inQueue");
@@ -98,6 +112,7 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
             throw error;
           }
           let res;
+          const sentAt = Date.now();
           try {
             res = await this.http.request(request.config);
           } catch (error: unknown) {
@@ -132,6 +147,15 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
             }
             continue;
           }
+          if (isStreamed(request, res)) {
+            handedToStream = true;
+            return await handleStreamedResponse.bind(this)(
+              request,
+              res,
+              span,
+              sentAt
+            );
+          }
           return await handleResponse.bind(this)(request, res);
         } while (request.retries <= this.retryOptions.maxRetries);
         throw new NoResponseError();
@@ -144,9 +168,11 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
           span.setAttribute("http.response.status_code", axiosStatus);
         throw err;
       } finally {
-        this.trackRequestFinished();
-        span.setAttribute("dianemo.retries", request.retries);
-        span.end();
+        if (!handedToStream) {
+          this.trackRequestFinished();
+          span.setAttribute("dianemo.retries", request.retries);
+          span.end();
+        }
       }
     }
   );
@@ -531,6 +557,20 @@ async function handleResponse(
     request,
     JSON.stringify(request.getRequestDoneData(undefined, res.status))
   );
+  await runResponseHooks.bind(this)(request, res);
+  this.logger.debug(`Request ID: ${request.id} | Status: ${res.status}`);
+  return res;
+}
+
+/**
+ * The client's `responseInterceptor` and `rateLimitChange`, which never fail a
+ * served request.
+ */
+async function runResponseHooks(
+  this: BaseClient,
+  request: Request,
+  res: AxiosResponse
+) {
   if (this.requestOptions?.responseInterceptor) {
     try {
       await this.requestOptions.responseInterceptor(request.config, res);
@@ -553,8 +593,305 @@ async function handleResponse(
       );
     }
   }
-  this.logger.debug(`Request ID: ${request.id} | Status: ${res.status}`);
-  return res;
+}
+
+// ---- streamed responses
+
+/** The default for `requestOptions.streamTimeout`: an hour. */
+const DEFAULT_STREAM_TIMEOUT_MS = 3_600_000;
+
+/**
+ * How long after a stream ends an explicit `dianemo.settle` may still arrive
+ * before a missing settlement is warned about. It often runs just after the
+ * last chunk, once the caller has parsed it.
+ */
+const SETTLE_GRACE_MS = 5_000;
+
+function isReadable(value: unknown): value is Readable {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as Readable).pipe === "function" &&
+    typeof (value as Readable).destroy === "function"
+  );
+}
+
+function isStreamed(request: Request, res: AxiosResponse): boolean {
+  return request.config.responseType === "stream" && isReadable(res.data);
+}
+
+/**
+ * The streamed half of a response: announced once when the headers arrive and
+ * again when the stream ends, with the slot held, kept alive and in flight in
+ * between. See docs/rate-limits/streaming.md.
+ *
+ * The caller gets a `PassThrough` in place of axios's stream, which keeps
+ * backpressure and lets the end be observed without the caller's help.
+ */
+async function handleStreamedResponse(
+  this: BaseClient,
+  request: Request,
+  res: AxiosResponse,
+  span: Span,
+  sentAt: number
+): Promise<DianemoResponse> {
+  span.setAttribute("dianemo.time_to_headers_ms", Date.now() - sentAt);
+  const source = res.data as Readable;
+  // Held until the listeners below exist: the announcements are awaited first,
+  // and an `error` with no listener would be thrown out of the host.
+  let earlyError: Error | undefined;
+  const onEarlyError = (error: Error) => {
+    earlyError ??= error;
+  };
+  source.on("error", onEarlyError);
+  // A fast-path request has no queue entry and is never a thaw probe, so its
+  // headers have nothing to settle.
+  if (!request.fastPath) {
+    await publishRequestDone.bind(this)(
+      request,
+      JSON.stringify(
+        request.getRequestDoneData(undefined, res.status, "headers")
+      )
+    );
+  }
+  await runResponseHooks.bind(this)(request, res);
+
+  const metadata = request.getMetadata();
+  const observer = startObserver.bind(this)(request);
+  const relay = observingRelay.bind(this)(request, observer);
+  // A stream destroyed with an error emits `error`, and Node throws one that
+  // has no listener — so a timeout or a shutdown would crash a host that reads
+  // without listening for errors. Listeners the caller adds still receive it.
+  relay.on("error", () => undefined);
+
+  let settled = false;
+  const settle = async (cost: RequestCost): Promise<void> => {
+    if (settled) return;
+    settled = true;
+    try {
+      await this.settleAttempt(metadata, cost);
+    } catch (error) {
+      this.logger.error(
+        { error },
+        `Request ID: ${request.id} | settlement failed; the attempt keeps what it claimed`
+      );
+    }
+  };
+
+  let resolveFinished!: (reason: StreamEndReason) => void;
+  const finished = new Promise<StreamEndReason>((resolve) => {
+    resolveFinished = resolve;
+  });
+
+  const keepAlive = setInterval(() => {
+    void this.keepAttemptAlive(metadata).catch((error) => {
+      this.logger.error(
+        { error },
+        `Request ID: ${request.id} | could not keep the streaming request's claims alive`
+      );
+    });
+  }, this.streamKeepAliveMs());
+  keepAlive.unref?.();
+
+  const timeoutMs = streamTimeoutOf(this.requestOptions.streamTimeout);
+  const timeout = setTimeout(
+    () => end("timeout", new StreamTimeoutError(request.id, timeoutMs)),
+    timeoutMs
+  );
+  timeout.unref?.();
+
+  const signal = request.config.signal;
+  const onAbort = () =>
+    end("closed", new RequestAbortedError(request.id, true));
+  // axios's own abort listener usually destroys the source first, with its
+  // `CanceledError`; the caller sees the same error whichever wins.
+  const onSourceError = (error: Error) =>
+    signal?.aborted ? onAbort() : end("error", error);
+  signal?.addEventListener?.("abort", onAbort, { once: true });
+
+  let ended = false;
+  const end = (reason: StreamEndReason, error?: Error) => {
+    if (ended) return;
+    ended = true;
+    clearInterval(keepAlive);
+    clearTimeout(timeout);
+    signal?.removeEventListener?.("abort", onAbort);
+    // Closing the upstream stops a generation nobody will read, and with it
+    // the vendor's meter.
+    if (reason !== "completed") source.destroy();
+    if (error) relay.destroy(error);
+    void finishStream
+      .bind(this)(request, res, span, reason, observer, settle, () => settled)
+      .catch((finishError) => {
+        this.logger.error(
+          { error: finishError },
+          `Request ID: ${request.id} | could not finish the streamed response`
+        );
+      })
+      .finally(() => {
+        this.unregisterStream(request.id);
+        resolveFinished(reason);
+      });
+  };
+
+  source.once("end", () => end("completed"));
+  source.once("error", onSourceError);
+  relay.once("close", () => end("closed"));
+  source.off("error", onEarlyError);
+  source.pipe(relay);
+  if (earlyError) onSourceError(earlyError);
+
+  this.registerStream(request.id, {
+    close: () => end("shutdown", new StreamClosedError(request.id)),
+    finished,
+  });
+
+  res.data = relay;
+  const response = res as DianemoResponse;
+  response.dianemo = { settle, finished };
+  this.logger.debug(
+    `Request ID: ${request.id} | Status: ${res.status} | Streaming...`
+  );
+  return response;
+}
+
+/**
+ * What the caller reads in place of axios's stream: a `PassThrough`, or with an
+ * observer a transform that shows it each chunk on the way through. Not a
+ * `data` listener, which would switch the stream to flowing and read ahead of
+ * the caller.
+ */
+function observingRelay(
+  this: BaseClient,
+  request: Request,
+  observer: StreamObserver | undefined
+): Transform {
+  const onChunk = observer?.onChunk?.bind(observer);
+  if (!onChunk) return new PassThrough();
+  return new Transform({
+    transform: (chunk: Buffer | string, _encoding, callback) => {
+      try {
+        onChunk(chunk);
+      } catch (error) {
+        this.logger.error(
+          { error },
+          `Request ID: ${request.id} | settleStream's onChunk threw; the stream continues`
+        );
+      }
+      callback(null, chunk);
+    },
+  });
+}
+
+/** The request's `settleStream` observer, if it declares one that can be made. */
+function startObserver(
+  this: BaseClient,
+  request: Request
+): StreamObserver | undefined {
+  const make = request.config.settleStream;
+  if (!make) return undefined;
+  try {
+    return make();
+  } catch (error) {
+    this.logger.error(
+      { error },
+      `Request ID: ${request.id} | settleStream threw; the stream is relayed without it`
+    );
+    return undefined;
+  }
+}
+
+function streamTimeoutOf(configured: number | undefined): number {
+  return configured !== undefined &&
+    Number.isFinite(configured) &&
+    configured > 0
+    ? clampDelay(configured)
+    : DEFAULT_STREAM_TIMEOUT_MS;
+}
+
+/**
+ * The second announcement: settles the attempt, releases its slot, and ends
+ * its span and its count in flight. Runs once, however the stream ended.
+ */
+async function finishStream(
+  this: BaseClient,
+  request: Request,
+  res: AxiosResponse,
+  span: Span,
+  reason: StreamEndReason,
+  observer: StreamObserver | undefined,
+  settle: (cost: RequestCost) => Promise<void>,
+  isSettled: () => boolean
+): Promise<void> {
+  try {
+    let result: StreamResult | undefined;
+    try {
+      result = observer?.result?.();
+    } catch (error) {
+      this.logger.error(
+        { error },
+        `Request ID: ${request.id} | settleStream's result threw; the claim stands unless settled otherwise`
+      );
+    }
+    const streamError =
+      result === undefined ? undefined : streamErrorOf(result);
+    const cost = streamError
+      ? streamError.cost
+      : (result as RequestCost | undefined);
+    if (cost !== undefined) {
+      await settle(cost);
+    } else if (request.config.settle && !isSettled()) {
+      await runSettle.bind(this)(request, { response: res });
+    }
+
+    let retryData: RequestRetryData | undefined;
+    if (streamError) {
+      // Never retried: the caller has already read part of the body. A freeze
+      // for the rest of the fleet, as a 5xx would bring.
+      retryData = {
+        retry: false,
+        message: `Error inside the stream: ${streamError.error}`,
+        isRateLimited: false,
+        waitTime: 0,
+        freezeClient: true,
+      };
+      handleBackoff.bind(this)(request, retryData);
+      this.logger.error(`Request ID: ${request.id} | ${retryData.message}`);
+    } else if (reason === "error" || reason === "timeout") {
+      retryData = {
+        retry: false,
+        message: `Stream ended early: ${reason}`,
+        isRateLimited: false,
+        waitTime: 0,
+        freezeClient: false,
+      };
+    }
+    await publishRequestDone.bind(this)(
+      request,
+      JSON.stringify(request.getRequestDoneData(retryData, res.status, "end"))
+    );
+
+    if (!isSettled() && (observer || request.config.settle)) {
+      setTimeout(() => {
+        if (isSettled()) return;
+        this.logger.warn(
+          `Request ID: ${request.id} | streamed response was not settled; the attempt keeps what it claimed`
+        );
+      }, SETTLE_GRACE_MS).unref?.();
+    }
+
+    span.setAttribute("dianemo.stream_end_reason", reason);
+    if (retryData) {
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: retryData.message,
+      });
+    }
+  } finally {
+    this.trackRequestFinished();
+    span.setAttribute("dianemo.retries", request.retries);
+    span.end();
+  }
 }
 
 async function handleError(
@@ -594,7 +931,13 @@ async function handleError(
     JSON.stringify(request.getRequestDoneData(retryData, res.response?.status))
   );
 
-  if (retryData.retry) return retryData;
+  if (retryData.retry) {
+    // Nobody will read a streamed error body that is being retried, and an
+    // unread one holds its socket open.
+    const body = res.response?.data;
+    if (isReadable(body)) body.destroy();
+    return retryData;
+  }
 
   throw res;
 }

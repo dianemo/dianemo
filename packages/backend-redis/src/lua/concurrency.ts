@@ -122,6 +122,24 @@ export const releaseConcurrency = `
   return 1
 `;
 
+/**
+ * Restamps a held slot with Redis's clock, for a request still streaming. ZADD
+ * XX leaves a reaped or released slot absent rather than re-creating it.
+ */
+export const touchConcurrency = `
+  local key = KEYS[1]
+  local slotId = ARGV[1]
+  local keyTtl = tonumber(ARGV[2])
+${redisNow()}
+  if redis.call('ZSCORE', key, slotId) == false then return 0 end
+  redis.call('ZADD', key, 'XX', now, slotId)
+  redis.call('EXPIRE', key, keyTtl)
+  if redis.call('EXISTS', key .. ':costs') == 1 then
+    redis.call('EXPIRE', key .. ':costs', keyTtl)
+  end
+  return 1
+`;
+
 export const getConcurrencyState = `
   local key = KEYS[1]
   local requestTtl = tonumber(ARGV[1])

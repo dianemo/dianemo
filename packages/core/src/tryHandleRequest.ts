@@ -1,8 +1,7 @@
-import type { RequestConfig } from "./request/types.js";
+import type { DianemoResponse, RequestConfig } from "./request/types.js";
 import type { RequestErrorMetadata } from "./errors.js";
 import { redactBody } from "./utils/redact.js";
 import type RequestHandler from "./index.js";
-import type { AxiosResponse } from "axios";
 import { RequestError } from "./errors.js";
 import type { Logger } from "./logger.js";
 import { AxiosError } from "axios";
@@ -32,7 +31,7 @@ export type BoundTryHandleRequest = <T = unknown, D = unknown>(
   code: string,
   message: string,
   options?: TryHandleRequestOptions
-) => Promise<AxiosResponse<T, D>>;
+) => Promise<DianemoResponse<T, D>>;
 
 /**
  * Builds the `tryHandleRequest` bound to a specific handler. Called once per
@@ -52,7 +51,7 @@ export function createTryHandleRequest(
     code: string,
     message: string,
     options?: TryHandleRequestOptions
-  ): Promise<AxiosResponse<T, D>> {
+  ): Promise<DianemoResponse<T, D>> {
     try {
       return await handler.handleRequest<T, D>(config);
     } catch (error) {

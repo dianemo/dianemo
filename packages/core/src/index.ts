@@ -1,13 +1,12 @@
+import type { DianemoResponse, RequestConfig } from "./request/types.js";
 import { createTryHandleRequest } from "./tryHandleRequest.js";
 import startSubscriptions from "./utils/startSubscriptions.js";
 import updateClientRoles from "./utils/updateClientRoles.js";
 import { generateClients } from "./utils/createClients.js";
 import { assertNameSegment } from "./utils/clientName.js";
 import type { DianemoBackend } from "./backend/types.js";
-import type { RequestConfig } from "./request/types.js";
 import { noopLogger, type Logger } from "./logger.js";
 import type BaseClient from "./client/index.js";
-import type { AxiosResponse } from "axios";
 import EventEmitter from "node:events";
 import crypto from "node:crypto";
 import {
@@ -84,6 +83,8 @@ export {
   ClientConflictError,
   ConfigurationError,
   RequestTimeoutError,
+  StreamClosedError,
+  StreamTimeoutError,
   NoResponseError,
   ClientUnavailableError,
   NotOAuth2ClientError,
@@ -155,9 +156,17 @@ export {
 } from "./tryHandleRequest.js";
 
 export type {
+  AttemptOutcome,
+  DianemoResponse,
   RequestConfig,
   RequestCost,
   RequestMetadata,
+  SettleFunction,
+  StreamControls,
+  StreamEndReason,
+  StreamError,
+  StreamObserver,
+  StreamResult,
 } from "./request/types.js";
 export type {
   CreateClientData,
@@ -194,6 +203,9 @@ function assertInstanceSegments(credentials: unknown): void {
     assertNameSegment(organizationId, "organizationId");
   }
 }
+
+/** How long shutdown waits for closed streams to release their slots. */
+const STREAM_CLOSE_TIMEOUT_MS = 5_000;
 
 /**
  * The host for every outbound client in one process, and this process's seat
@@ -605,9 +617,29 @@ export default class RequestHandler {
       (total, client) => total + client.countInFlight(),
       0
     );
-    this.logger.warn(
-      `Shutdown closed with ${remaining} request(s) still upstream; their concurrency slots lapse on the slot TTL`
-    );
+    const streaming = clients.flatMap((client) => client.openStreamIds());
+    if (streaming.length) {
+      this.logger.warn(
+        { requestIds: streaming },
+        `Shutdown is closing ${streaming.length} streamed response(s) still open`
+      );
+    }
+    // Closed rather than left to run on: a stream's end releases its slot, and
+    // that needs the backend this shutdown is about to close. Bounded, because
+    // a backend that is not answering would otherwise hold the process.
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.all(clients.map((client) => client.closeStreams())),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, STREAM_CLOSE_TIMEOUT_MS);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (remaining > streaming.length) {
+      this.logger.warn(
+        `Shutdown closed with ${remaining - streaming.length} request(s) still upstream; their concurrency slots lapse on the slot TTL`
+      );
+    }
   }
 
   private async doStop(): Promise<void> {
@@ -804,7 +836,7 @@ export default class RequestHandler {
    */
   public async handleRequest<TResponse = unknown, TRequestData = unknown>(
     config: RequestConfig<TRequestData>
-  ): Promise<AxiosResponse<TResponse, TRequestData>> {
+  ): Promise<DianemoResponse<TResponse, TRequestData>> {
     if (this.status === "stopping" || this.stopPromise) {
       throw new ClientUnavailableError(
         "handler_stopping",
@@ -813,7 +845,7 @@ export default class RequestHandler {
     }
     if (this.status !== "started") await this.start();
     const client = await this.waitForClient(config.clientName);
-    return (await client.handleRequest(config as never)) as AxiosResponse<
+    return (await client.handleRequest(config as never)) as DianemoResponse<
       TResponse,
       TRequestData
     >;

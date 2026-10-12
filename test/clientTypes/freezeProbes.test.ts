@@ -1,8 +1,11 @@
 import type { DianemoBackend } from "../../packages/core/src/backend/types.js";
+import { memoryBackend } from "../../packages/core/src/backend/memory.js";
+import { redisBackend } from "../../packages/backend-redis/src/index.js";
 import { createServer, type ServerResponse } from "node:http";
 import RequestHandler from "../../packages/core/src/index.js";
 import { harnesses, type Harness } from "./harness.js";
 import { describe, expect, it } from "vitest";
+import { Redis } from "ioredis";
 
 const KEY = "0123456789abcdef0123456789abcdef";
 const PREFIX = "aud";
@@ -313,6 +316,130 @@ describe.each(harnesses(0))("what a thaw probe learns — $name", (harness) => {
     }
   }, 20_000);
 
+  it("keeps a 429 freeze whose thaw probe gets a 503 (control)", async () => {
+    const upstream = await startUpstream();
+    try {
+      await withClient(harness, probing(upstream), async (handler, backend) => {
+        await freezeAndLapse(handler, backend);
+        await send(handler, "/status/503").catch(() => undefined);
+        await sleep(200);
+        expect(await backend.getFreezeState(FREEZE)).not.toBeNull();
+      });
+    } finally {
+      await upstream.close();
+    }
+  }, 20_000);
+
+  it("does not count a thaw probe its caller aborted toward thawing a 429 freeze", async () => {
+    const upstream = await startUpstream();
+    try {
+      await withClient(
+        harness,
+        probing(upstream),
+        async (handler, backend) => {
+          await freezeAndLapse(handler, backend);
+
+          // The probe reaches the vendor, and its caller gives up before the
+          // vendor answers.
+          const controller = new AbortController();
+          const probe = handler
+            .handleRequest({
+              clientName: NAME,
+              requestName: "t",
+              method: "GET",
+              url: "/hold/probe",
+              signal: controller.signal,
+            } as never)
+            .catch(() => undefined);
+          expect(
+            await waitUntil(async () => upstream.held("/hold/probe"))
+          ).toBe(true);
+          controller.abort();
+          await probe;
+          await sleep(200);
+
+          expect(await backend.getFreezeState(FREEZE)).toMatchObject({
+            thawRequestCount: 1,
+          });
+          // And it gave the probe back: the next request probes and thaws.
+          await send(handler, "/ok");
+          expect(
+            await waitUntil(
+              async () => (await backend.getFreezeState(FREEZE)) === null
+            )
+          ).toBe(true);
+        },
+        () => upstream.releaseAll()
+      );
+    } finally {
+      await upstream.close();
+    }
+  }, 20_000);
+
+  it("does not count a thaw probe abandoned before dispatch toward thawing a 429 freeze", async () => {
+    const upstream = await startUpstream();
+    const spec = probing(upstream);
+    try {
+      await withClient(
+        harness,
+        {
+          ...spec,
+          requestOptions: {
+            ...spec.requestOptions,
+            requestInterceptor: async (config: { url?: string }) => {
+              if (config.url === "/never") throw new Error("interceptor");
+              return config;
+            },
+          },
+        },
+        async (handler, backend) => {
+          await freezeAndLapse(handler, backend);
+          // Nominated as the probe, then fails in its interceptor.
+          await send(handler, "/never").catch(() => undefined);
+          await sleep(200);
+
+          expect(await backend.getFreezeState(FREEZE)).toMatchObject({
+            thawRequestCount: 1,
+          });
+          await send(handler, "/ok");
+          expect(
+            await waitUntil(
+              async () => (await backend.getFreezeState(FREEZE)) === null
+            )
+          ).toBe(true);
+        }
+      );
+    } finally {
+      await upstream.close();
+    }
+  }, 20_000);
+
+  it("does not count a thaw probe refused by an unreachable upstream toward thawing a 429 freeze", async () => {
+    const upstream = await startUpstream();
+    // Nothing listens on a port just closed, so the probe is refused.
+    const dead = await startUpstream();
+    await dead.close();
+    try {
+      await withClient(harness, probing(upstream), async (handler, backend) => {
+        await freezeAndLapse(handler, backend);
+        await send(handler, `${dead.baseURL}/x`).catch(() => undefined);
+        await sleep(200);
+
+        expect(await backend.getFreezeState(FREEZE)).toMatchObject({
+          thawRequestCount: 1,
+        });
+        await send(handler, "/ok");
+        expect(
+          await waitUntil(
+            async () => (await backend.getFreezeState(FREEZE)) === null
+          )
+        ).toBe(true);
+      });
+    } finally {
+      await upstream.close();
+    }
+  }, 20_000);
+
   it("keeps the client frozen when its probe gets a 4xx that classifyError freezes on", async () => {
     const upstream = await startUpstream();
     const classifyError = (error: { response?: { status?: number } }) =>
@@ -337,3 +464,214 @@ describe.each(harnesses(0))("what a thaw probe learns — $name", (harness) => {
     }
   }, 20_000);
 });
+
+// ---- invariants across two handlers sharing one backend
+
+/** An upstream that measures what the vendor sees, and fails on a schedule. */
+async function startFailingUpstream(fail: (n: number) => number | undefined) {
+  let n = 0;
+  let inFlight = 0;
+  let peak = 0;
+  const arrivals: number[] = [];
+  const server = createServer(async (_req, res) => {
+    const i = n++;
+    arrivals.push(Date.now());
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    const status = fail(i);
+    await sleep(status ? 5 : 15 + (i % 4) * 10);
+    inFlight--;
+    if (!res.destroyed) res.writeHead(status ?? 200).end("{}");
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const a = server.address();
+  const port = typeof a === "object" && a ? a.port : 0;
+  return {
+    baseURL: `http://127.0.0.1:${port}`,
+    peak: () => peak,
+    arrivals: () => arrivals,
+    close: async () => {
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
+    },
+  };
+}
+
+interface SharedBackend {
+  name: string;
+  backends: () => Promise<{
+    backends: DianemoBackend[];
+    close: () => Promise<void>;
+  }>;
+}
+
+/** One store, reached through two backends, as two replicas reach Redis. */
+function sharedBackends(): SharedBackend[] {
+  const list: SharedBackend[] = [
+    {
+      name: "memory",
+      backends: async () => {
+        const backend = memoryBackend();
+        return { backends: [backend, backend], close: () => backend.close() };
+      },
+    },
+  ];
+  const url = process.env.REDIS_URL;
+  if (url) {
+    list.push({
+      name: "redis",
+      backends: async () => {
+        const conns = [new Redis(`${url}/0`), new Redis(`${url}/0`)];
+        await conns[0].flushdb();
+        const backends = conns.map((c) => redisBackend(c));
+        return {
+          backends,
+          close: async () => {
+            for (const b of backends) await b.close().catch(() => undefined);
+            for (const c of conns) await c.quit().catch(() => undefined);
+          },
+        };
+      },
+    });
+  }
+  return list;
+}
+
+async function withTwoHandlers(
+  shared: SharedBackend,
+  client: Record<string, unknown>,
+  fn: (handlers: RequestHandler[]) => Promise<void>
+) {
+  const { backends, close } = await shared.backends();
+  const handlers: RequestHandler[] = [];
+  try {
+    for (const [i, backend] of backends.entries()) {
+      const handler = new RequestHandler({
+        key: KEY,
+        backend,
+        keyPrefix: PREFIX,
+      });
+      handlers.push(handler);
+      await handler.registerClientTemplate(
+        "aud" as never,
+        (() => [{ ...client, name: NAME }]) as never
+      );
+      await handler.start();
+      if (i === 0) {
+        await handler.addTemplateClient(
+          "aud" as never,
+          { instanceId: "a" } as never
+        );
+      }
+    }
+    await waitUntil(async () =>
+      handlers.every((h) => h.getMetadata().registeredClients.includes(NAME))
+    );
+    await fn(handlers);
+  } finally {
+    for (const h of handlers) await h.stop().catch(() => undefined);
+    await close();
+  }
+}
+
+describe.each(sharedBackends())(
+  "invariants while failures freeze and thaw — $name",
+  (shared) => {
+    const sendVia =
+      (handler: RequestHandler) =>
+      (url: string, extra: Record<string, unknown> = {}) =>
+        handler.handleRequest({
+          clientName: NAME,
+          requestName: "t",
+          method: "GET",
+          url,
+          ...extra,
+        } as never);
+
+    it("never has more than maxConcurrency requests at the vendor while failures freeze and thaw the client", async () => {
+      const upstream = await startFailingUpstream((i) =>
+        i % 9 === 4 ? 429 : i % 13 === 7 ? 503 : undefined
+      );
+      try {
+        await withTwoHandlers(
+          shared,
+          {
+            rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 3 }],
+            requestOptions: {
+              defaults: { baseURL: upstream.baseURL },
+              cleanupTimeout: 20_000,
+            },
+            retryOptions: {
+              maxRetries: 2,
+              retryBackoffBaseTime: 60,
+              thawRequestCount: 2,
+            },
+          },
+          async (handlers) => {
+            const all = Array.from({ length: 80 }, (_, i) =>
+              sendVia(handlers[i % 2])("/x", { priority: i % 3 }).catch(
+                () => undefined
+              )
+            );
+            await Promise.all(all);
+            expect(upstream.arrivals().length).toBeGreaterThan(60);
+            expect(upstream.peak()).toBeLessThanOrEqual(3);
+          }
+        );
+      } finally {
+        await upstream.close();
+      }
+    }, 60_000);
+
+    it("never admits more than a bucket's worth per interval while failures freeze and thaw the client", async () => {
+      const upstream = await startFailingUpstream((i) =>
+        i % 7 === 3 ? 429 : i % 11 === 5 ? 503 : undefined
+      );
+      const interval = 500;
+      const maxTokens = 4;
+      try {
+        await withTwoHandlers(
+          shared,
+          {
+            rateLimit: [
+              {
+                type: "requestLimit",
+                maxTokens,
+                tokensToAdd: maxTokens,
+                interval,
+              },
+            ],
+            requestOptions: {
+              defaults: { baseURL: upstream.baseURL },
+              cleanupTimeout: 30_000,
+            },
+            retryOptions: {
+              maxRetries: 1,
+              retryBackoffBaseTime: 60,
+              thawRequestCount: 1,
+            },
+          },
+          async (handlers) => {
+            const all = Array.from({ length: 40 }, (_, i) =>
+              sendVia(handlers[i % 2])("/x").catch(() => undefined)
+            );
+            await Promise.all(all);
+            const t = upstream.arrivals();
+            expect(t.length).toBeGreaterThan(20);
+            // Any window one interval long sees at most a full bucket plus one
+            // refill.
+            let worst = 0;
+            for (let i = 0; i < t.length; i++) {
+              let j = i;
+              while (j < t.length && t[j] - t[i] < interval) j++;
+              worst = Math.max(worst, j - i);
+            }
+            expect(worst).toBeLessThanOrEqual(2 * maxTokens);
+          }
+        );
+      } finally {
+        await upstream.close();
+      }
+    }, 90_000);
+  }
+);

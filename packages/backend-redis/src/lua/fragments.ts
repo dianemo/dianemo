@@ -1,4 +1,7 @@
-import { QUEUE_CLAIM_LEASE_MS, REDIS_MAX_TTL_SECONDS } from "@dianemo/core";
+import {
+  QUEUE_CLAIM_LEASE_MS,
+  REDIS_MAX_TTL_SECONDS,
+} from "@dianemo/core/backend";
 
 /**
  * Lua blocks that more than one script needs to agree on, character for

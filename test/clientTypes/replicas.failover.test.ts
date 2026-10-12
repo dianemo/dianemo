@@ -769,7 +769,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
             "the worker's request to reach the queue",
             async () => (await raw.zcard(queueKey)) === 1
           );
-          const [requestId] = await raw.zrange(queueKey, 0, -1);
+          const [requestId] = await raw.zrange(queueKey, 0, "-1");
           expect(requestId).toBeDefined();
 
           await hardKill(worker, backends[replicas.indexOf(worker)], raw);
@@ -879,7 +879,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
             "B to be queued",
             async () => (await raw.zcard(queueKey)) === 1
           );
-          const [requestId] = await raw.zrange(queueKey, 0, -1);
+          const [requestId] = await raw.zrange(queueKey, 0, "-1");
 
           // Freeing the slot makes the controller admit B for the worker, which
           // is what gives B a queue entry while it runs.
@@ -933,10 +933,11 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           // property this library offers — only that it does.
           await waitFor(
             "B's orphaned entry to be reclaimed",
-            async () => !(await raw.zrange(queueKey, 0, -1)).includes(requestId)
+            async () =>
+              !(await raw.zrange(queueKey, 0, "-1")).includes(requestId)
           );
           // And C's survives it, which is the half a blanket sweep would break.
-          expect(await raw.zrange(queueKey, 0, -1)).toHaveLength(1);
+          expect(await raw.zrange(queueKey, 0, "-1")).toHaveLength(1);
 
           upstream.release();
           await c;

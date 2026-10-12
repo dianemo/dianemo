@@ -3,18 +3,34 @@ import { fileURLToPath } from "node:url";
 
 export default defineConfig({
   // The same source-not-dist resolution the root tsconfig's `paths` set up for
-  // tsc. `packages/backend-redis/src` imports `@dianemo/core` by name, so
-  // without this every suite resolves it through the workspace symlink to a
-  // `dist` that a fresh clone has not built yet and fails to collect.
+  // tsc. `packages/backend-redis/src` imports `@dianemo/core/backend` by name,
+  // so without this every suite resolves it through the workspace symlink to
+  // a `dist` that a fresh clone has not built yet and fails to collect.
+  //
+  // Anchored patterns, not string keys: a string alias also rewrites every
+  // subpath under it, which would send `@dianemo/core/backend` to
+  // `src/index.ts/backend`.
   resolve: {
-    alias: {
-      "@dianemo/core": fileURLToPath(
-        new URL("./packages/core/src/index.ts", import.meta.url)
-      ),
-      "@dianemo/backend-redis": fileURLToPath(
-        new URL("./packages/backend-redis/src/index.ts", import.meta.url)
-      ),
-    },
+    alias: [
+      {
+        find: /^@dianemo\/core$/,
+        replacement: fileURLToPath(
+          new URL("./packages/core/src/index.ts", import.meta.url)
+        ),
+      },
+      {
+        find: /^@dianemo\/core\/backend$/,
+        replacement: fileURLToPath(
+          new URL("./packages/core/src/backend/index.ts", import.meta.url)
+        ),
+      },
+      {
+        find: /^@dianemo\/backend-redis$/,
+        replacement: fileURLToPath(
+          new URL("./packages/backend-redis/src/index.ts", import.meta.url)
+        ),
+      },
+    ],
   },
   test: {
     include: ["test/**/*.test.ts"],

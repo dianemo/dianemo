@@ -1504,9 +1504,12 @@ class MemoryBackend implements DianemoBackend {
   ): Promise<boolean> {
     const hash = this.live(`${metadataKeyPrefix}:${requestId}`)?.hash;
     if (!hash || hash.get("status") !== "inProgress") return false;
-    if (parseStoredNumber(hash.get("claimedAt"), NaN) !== claimedAt) {
-      return false;
-    }
+    const stamp = hash.get("claimedAt");
+    if (parseStoredNumber(stamp, NaN) !== claimedAt) return false;
+    // Refused once lapsed even with nobody yet holding it: a lapsed claim's
+    // probe mark no longer counts, so confirming it could dispatch a second
+    // probe beside one started since. See the Lua twin.
+    if (claimLapsed(stamp, Date.now())) return false;
     hash.delete("claimedAt");
     return true;
   }

@@ -108,7 +108,9 @@ arriving after the window applies nothing.
 ## Requirements and limits
 
 - The backend must implement `settleTokens`. Both built-in backends do; a
-  request with `settle` on one that does not is refused when it is made.
+  request with `settle` or `settleStream` on one that does not is refused when
+  it is made, with `ConfigurationError` `backend_missing_settlement`, before
+  anything is spent.
 - A `sharedLimit` client settles against its owner's limits, by their names.
 - A streamed response settles when the stream ends, from an observer that
   reads the usage as it passes or from the caller; see

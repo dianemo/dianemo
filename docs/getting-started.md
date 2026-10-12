@@ -27,7 +27,7 @@ import { redisBackend } from "@dianemo/backend-redis";
 const redis = new Redis(process.env.REDIS_URL!);
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY!, // 32+ chars; encrypts credentials at rest
+  key: process.env.REQUEST_HANDLER_KEY!, // 32+ chars, enforced; encrypts credentials at rest
   backend: redisBackend(redis),
   logger: console, // optional; silent by default
 });
@@ -50,8 +50,7 @@ makes a typo in a template name a compile error rather than a runtime
 warn-and-skip.
 
 ```ts
-import { buildClientName } from "@dianemo/core";
-import type { OAuth2Credentials } from "@dianemo/core/client/types";
+import { buildClientName, type OAuth2Credentials } from "@dianemo/core";
 
 declare module "@dianemo/core" {
   interface ClientTemplates {
@@ -126,8 +125,10 @@ const res = await handler.handleRequest({
 
 `handler.start()` is called automatically on the first request and is
 idempotent. It registers SIGTERM/SIGINT/SIGHUP handlers so the queue drains on
-shutdown. A stopped handler stays stopped: a request after `stop()` is refused
-with `ClientUnavailableError` `handler_stopped` until `start()` is called again.
+shutdown, then lets the signal end the process unless you listen for it
+yourself; see [Shutdown](../README.md#shutdown). A stopped handler stays
+stopped: a request after `stop()` is refused with `ClientUnavailableError`
+`handler_stopped` until `start()` is called again.
 
 `requestName` is not cosmetic — it appears in spans, logs and queue metadata.
 Name the operation, not the URL.
@@ -167,6 +168,13 @@ Worth knowing before you debug it.
 
 ## 6. Errors
 
+`isAxiosError` below comes from axios. Core depends on it, but import it only
+once it is a dependency of your own:
+
+```bash
+npm install axios
+```
+
 ```ts
 import { RequestHandlerError } from "@dianemo/core";
 import { isAxiosError } from "axios";
@@ -194,24 +202,24 @@ a plugin's request functions wrap failures in a `RequestError` — see
 ## 7. Plugins, when you have more than one integration
 
 ```ts
-import fedex from "@dianemo/plugin-fedex";
-import ups from "@dianemo/plugin-ups";
+import acme from "./plugins/acme.js"; // your own, built with definePlugin
 
-export const requests = handler.use(fedex, ups);
+export const requests = handler.use(acme);
 
-await requests.fedex.cancelShipment("fedex:_:production", { ... });
+await requests.acme.cancelShipment("acme:_:production", "SHIP-1234");
 ```
 
-A plugin bundles a template with its request functions. The namespace is
-inferred from the plugins you pass — there is no module augmentation to write,
-and a plugin you didn't pass doesn't appear on the result.
+A plugin bundles a template with its request functions; steps 2 and 4 above,
+packaged. The namespace is inferred from the plugins you pass — there is no
+module augmentation to write, and a plugin you didn't pass doesn't appear on the
+result. [Writing a plugin](writing-plugins.md) builds the one above.
 
 Ready-made plugins are published one package per vendor from
-[dianemo-plugins](https://github.com/vivo-us/dianemo-plugins), on their own release
-schedule — check npm for the vendor you need rather than assuming it is there. Steps
-1–6 above never touch a plugin, so an integration without one is written exactly the
-same way, and [writing a plugin](writing-plugins.md) packages it when you want to
-share it.
+[dianemo-plugins](https://github.com/vivo-us/dianemo-plugins), on their own
+release schedule. **Every one released so far is 1.x and does not work with core
+2.0:** each declares a peer of `@dianemo/core ^1.0.0` and a rate limit written
+as a bare object, which 2.0 refuses. Until they are re-released, write the
+template yourself as in steps 2–4.
 
 ## Production checklist
 

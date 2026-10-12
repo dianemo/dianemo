@@ -277,12 +277,21 @@ on a client with exactly one `requestLimit` does.
 Recovery from a 429 is not "everyone retries at once". Once the deadline
 passes, one request at a time across the whole fleet is nominated as the **thaw
 probe**. A probe asks one question — has the upstream stopped limiting or
-failing? — so it succeeds on any response that would not itself freeze the
-client, a 404 or 400 included, and fails only on a 429, a 5xx, a dropped
-connection, or a failure `classifyError` freezes on. Each probe that succeeds
-counts toward `thawRequestCount` (default 3), and the freeze clears when that
-many have. A failed probe does not consume thaw progress; it arms a freeze of
-its own, and the next request after that becomes the next probe.
+failing? — and only an answer from the upstream settles it:
+
+- **Success:** the upstream returned a response that would not itself freeze
+  the client, a 404 or 400 included.
+- **Failure:** the upstream returned a response that freezes the client — a
+  429, a 5xx, or a status `classifyError` freezes on.
+- **No progress:** the probe got no response at all. It was aborted or timed
+  out before an answer, abandoned before dispatch, refused at connect, or its
+  connection was reset or timed out. A reset or timeout still arms a freeze as
+  any request's would, but the probe counts for nothing either way.
+
+Each probe that succeeds counts toward `thawRequestCount` (default 3), and the
+freeze clears when that many have. A failure or a probe that made no progress
+consumes no thaw progress, and the next request becomes the next probe; a
+failure also arms a freeze of its own first.
 
 With isolated grants, probing is per grant: one probe per grant rather than one
 per client, so recovering tenants do not wait behind each other. Without

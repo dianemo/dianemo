@@ -143,13 +143,15 @@ Each thing lives at the **lowest level that contains all of its users**:
 | one module                                  | that module                       |
 | several modules in one area                 | that area's `types.ts` / a util   |
 | the handler and the clients                 | `core/src/utils/`                 |
-| both backends                               | `core/src/backend/`, exported     |
+| both backends                               | `core/src/backend/`, exported on `@dianemo/core/backend` |
 
 The last row is load-bearing and easy to get wrong. The Redis backend imports its TTL
-normalisers, stored-number parsers and queue-score constants **from `@dianemo/core` by
-name** — shared arithmetic lives in core and is imported, rather than being reimplemented in the backend where it would
-drift. If you find yourself writing a second copy of a calculation the memory backend
-already does, export the first one instead.
+normalisers, stored-number parsers and queue-score constants **from `@dianemo/core/backend`
+by name** — shared arithmetic lives in core and is imported, rather than being reimplemented
+in the backend where it would drift. If you find yourself writing a second copy of a
+calculation the memory backend already does, export the first one instead — from
+`core/src/backend/index.ts`, the `@dianemo/core/backend` entry, never from the root
+`index.ts`, which is the host's API.
 
 Push things down as far as they go; promote only when a second area reaches for them.
 

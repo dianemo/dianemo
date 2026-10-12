@@ -1,7 +1,10 @@
-import type { AcquireMultiLimitResult, MultiLimitSpec } from "@dianemo/core";
-import { claimMarkKey, normalizeStateTtlSeconds } from "@dianemo/core";
+import { claimMarkKey, normalizeStateTtlSeconds } from "@dianemo/core/backend";
 import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
+import type {
+  AcquireMultiLimitResult,
+  MultiLimitSpec,
+} from "@dianemo/core/backend";
 
 /**
  * Several budgets claimed as one operation. Twin of the memory backend's

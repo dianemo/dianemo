@@ -1,10 +1,10 @@
-import { normalizeStateTtlSeconds } from "@dianemo/core";
+import { normalizeStateTtlSeconds } from "@dianemo/core/backend";
 import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 import type {
   AcquireConcurrencyResult,
   ConcurrencyConfig,
-} from "@dianemo/core";
+} from "@dianemo/core/backend";
 
 /** A reply whose occupancy the script sent as an `exact` string. */
 function readConcurrency<T extends { currentConcurrency?: number }>(

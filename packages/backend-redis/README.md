@@ -76,7 +76,9 @@ script body, falling back to `EVAL` once if Redis reports `NOSCRIPT` after a res
 ## Conformance
 
 This backend is verified by the same suite as every other backend, in `test/conformance.test.ts` at
-the repository root. Adding a backend means making that suite pass.
+the repository root. Adding a backend means making that suite pass, and
+[implementing a backend](https://github.com/vivo-us/dianemo/blob/master/docs/backends/README.md#implementing-a-backend)
+lists the toolkit `@dianemo/core/backend` exports for it — the one this backend is built on.
 
 ## Documentation
 

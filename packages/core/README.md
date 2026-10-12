@@ -90,39 +90,56 @@ as-is. **DragonflyDB** refuses some of the backend's scripts by default; see
 
 ```ts
 import { Redis } from "ioredis";
-import RequestHandler from "@dianemo/core";
+import RequestHandler, {
+  buildClientName,
+  type TokenCredentials,
+} from "@dianemo/core";
 import { redisBackend } from "@dianemo/backend-redis";
-import fedex from "@dianemo/plugin-fedex";
-import ups from "@dianemo/plugin-ups";
 
-const redis = new Redis(process.env.REDIS_URL!);
+// Template names are typed: declare each one with the credentials it takes.
+declare module "@dianemo/core" {
+  interface ClientTemplates {
+    acme: TokenCredentials;
+  }
+}
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY!, // encrypts credentials at rest
-  backend: redisBackend(redis),
+  key: process.env.REQUEST_HANDLER_KEY!, // 32+ characters; encrypts stored credentials
+  backend: redisBackend(new Redis(process.env.REDIS_URL!)),
   logger: console, // optional; silent by default
 });
 
-export const requests = handler.use(fedex, ups);
+// The shape of the integration — its rate limit, auth and base URL. No secrets.
+await handler.registerClientTemplate("acme", (creds) => [
+  {
+    name: buildClientName("acme", creds),
+    rateLimit: [
+      { type: "requestLimit", interval: 1000, tokensToAdd: 10, maxTokens: 10 },
+    ],
+    authentication: { type: "token", token: creds.token }, // Authorization: Bearer …
+    requestOptions: { defaults: { baseURL: creds.baseUrl } },
+  },
+]);
 
 // Credentials arrive separately — from a vault, a database, or env.
-await handler.addTemplateClient("fedex", {
+await handler.addTemplateClient("acme", {
   instanceId: "production",
-  clientId: process.env.FEDEX_CLIENT_ID!,
-  clientSecret: process.env.FEDEX_CLIENT_SECRET!,
-  baseUrl: "https://apis.fedex.com",
+  baseUrl: "https://api.acme.example",
+  token: process.env.ACME_API_TOKEN!,
 });
 
-// Fully typed from the plugins you passed to use().
-await requests.fedex.cancelShipment("fedex:_:production", {
-  accountNumber: { value: process.env.FEDEX_ACCOUNT_NUMBER },
-  trackingNumber: "123456789012",
+const orders = await handler.handleRequest({
+  clientName: "acme:_:production",
+  requestName: "acme.orders.list",
+  method: "GET",
+  url: "/orders",
 });
 ```
 
-`handler.start()` is called automatically on the first request and is idempotent. It registers
-SIGTERM/SIGINT/SIGHUP handlers so the queue drains on shutdown. After `stop()`, requests are
-refused with `ClientUnavailableError` `handler_stopped` until `start()` is called again.
+`handler.start()` is called automatically on the first request or template call, and is idempotent.
+It registers SIGTERM/SIGINT/SIGHUP handlers so the queue drains on shutdown. After `stop()`,
+requests are refused with `ClientUnavailableError` `handler_stopped` until `start()` is called
+again.
 
 For a single-process program, swap two lines and drop the dependency entirely:
 
@@ -135,12 +152,13 @@ const handler = new RequestHandler({
 });
 ```
 
-Integrations are published one package per vendor from
-[dianemo-plugins](https://github.com/vivo-us/dianemo-plugins), on their own release schedule — check
-npm for the vendor you need rather than assuming it is there. Nothing waits on them:
-`registerClientTemplate` plus `handleRequest` covers a vendor with no plugin, and
-[writing your own](https://github.com/vivo-us/dianemo/blob/master/docs/writing-plugins.md) needs only
-`@dianemo/core`.
+> **Plugins and 2.0.** Integrations are published one package per vendor from
+> [dianemo-plugins](https://github.com/vivo-us/dianemo-plugins), but every one released so far is
+> 1.x: it declares a peer of `@dianemo/core ^1.0.0` and a rate-limit shape 2.0 refuses, so none of
+> them works with core 2.0 yet. Nothing waits on them: `registerClientTemplate` plus `handleRequest`,
+> as above, covers any vendor, and
+> [writing your own plugin](https://github.com/vivo-us/dianemo/blob/master/docs/writing-plugins.md)
+> needs only `@dianemo/core`.
 
 ## Concepts
 

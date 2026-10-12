@@ -1,4 +1,5 @@
 import { ClientFrozenError, ConfigurationError } from "../../errors.js";
+import { clampDelay } from "../../utils/retryAfter.js";
 import BaseClient from "../index.js";
 import {
   assertUsableRateLimits,
@@ -521,7 +522,7 @@ class MeteredClient extends BaseClient {
       const mark = this.markFor(request, spec.config);
       if (mark) shortestMs = Math.min(shortestMs, mark.ttlSeconds * 1000);
     }
-    return Math.max(shortestMs / 3, MIN_STREAM_KEEP_ALIVE_MS);
+    return clampDelay(Math.max(shortestMs / 3, MIN_STREAM_KEEP_ALIVE_MS));
   }
 
   private heldSpecs(request: RequestMetadata): MultiLimitSpec[] {

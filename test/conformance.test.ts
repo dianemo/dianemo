@@ -1,9 +1,9 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { QUEUE_CLAIM_LEASE_MS } from "../packages/core/src/backend/index.js";
 import { harnesses as clientTypeHarnesses } from "./clientTypes/harness.js";
 import type { RequestCost } from "../packages/core/src/request/types.js";
 import { memoryBackend } from "../packages/core/src/backend/memory.js";
 import { redisBackend } from "../packages/backend-redis/src/index.js";
-import { QUEUE_CLAIM_LEASE_MS } from "../packages/core/src/index.js";
 import { Redis } from "ioredis";
 import type {
   ConcurrencyConfig,
@@ -1529,6 +1529,50 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       expect(await backend.confirmRequest(PREFIX, "a", fresh!.claimedAt!)).toBe(
         true
       );
+    });
+
+    it("refuses to confirm a lapsed claim nobody took over, and hands the entry out again", async () => {
+      await add("a");
+      const stale = await backend.getNextRequest(QUEUE, PREFIX);
+      await lapse("a");
+      const lapsedAt = stale!.claimedAt! - QUEUE_CLAIM_LEASE_MS;
+
+      expect(await backend.confirmRequest(PREFIX, "a", lapsedAt)).toBe(false);
+      const again = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(again?.requestId).toBe("a");
+    });
+
+    it("does not let a second probe start while a lapsed nomination can still confirm and dispatch", async () => {
+      await add("e1", { priority: 1 });
+      const first = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(
+        await backend.tryStartThawRequest("q:frozen", QUEUE, PREFIX, "e1", "", {
+          anyGrant: true,
+        })
+      ).toBe("started");
+      await lapse("e1");
+      const lapsedAt = first!.claimedAt! - QUEUE_CLAIM_LEASE_MS;
+
+      // Another pass claims a higher-priority arrival and probes with it.
+      await add("e2", { priority: 9 });
+      const second = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(second?.requestId).toBe("e2");
+      const secondProbe = await backend.tryStartThawRequest(
+        "q:frozen",
+        QUEUE,
+        PREFIX,
+        "e2",
+        "",
+        { anyGrant: true }
+      );
+
+      // Exactly one of the two may go out as a probe.
+      const firstConfirmed = await backend.confirmRequest(
+        PREFIX,
+        "e1",
+        lapsedAt
+      );
+      expect(secondProbe === "started" && firstConfirmed).toBe(false);
     });
 
     it("refuses to confirm an entry that is gone", async () => {

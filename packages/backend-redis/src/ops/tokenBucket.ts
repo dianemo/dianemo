@@ -7,12 +7,12 @@ import type {
   SettleResult,
   SettleSpec,
   TokenBucketConfig,
-} from "@dianemo/core";
+} from "@dianemo/core/backend";
 import {
   claimMarkKey,
   normalizeStateTtlSeconds,
   parseFiniteStored,
-} from "@dianemo/core";
+} from "@dianemo/core/backend";
 
 /**
  * A mark's key, lifetime and presence flag as the scripts take them. With no

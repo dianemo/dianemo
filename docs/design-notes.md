@@ -310,12 +310,19 @@ rules out. Each completion id is recorded before the state is read, so a
 redelivered completion is not counted twice, and the set of them lives
 `FREEZE_PROBE_TTL_SECONDS`, as long as the freeze it guards outlives its window.
 
-What counts as success is decided in `handleRequestDone`: a probe fails only
-if its own completion arms a freeze (`freezesClient`, the same test that arms
-one), so `classifyError` decides probes as it decides freezes. A failure leaves
-the freeze key alone, TTL included. Re-arming there would be redundant, since
-the failure has just armed a freeze through `armFreeze`, whose merge keeps the
-probes owed and sizes the key for them.
+What counts as success is decided in `handleRequestDone`, by
+`probeSucceeded`: the upstream returned a response (`httpStatus` is set) and
+that response would not arm a freeze (`freezesClient`, the same test that arms
+one), so `classifyError` decides probes as it decides freezes. A probe with no
+response — abandoned before dispatch, aborted in flight, refused at connect,
+stopped with the handler — has learned nothing about the upstream, and is
+reported to `updateThawProgress` as not succeeding, exactly like a failure. Its
+queue entry is removed as for any completion, which takes the probe mark with
+it, so the next request is nominated in its place. A failure, or an attempt
+with no response, leaves the freeze key alone, TTL included. Re-arming there
+would be redundant: a failure has just armed a freeze through `armFreeze`,
+whose merge keeps the probes owed and sizes the key for them, and an attempt
+with no response changes nothing the key records.
 
 ## Claiming and then verifying leaves a residue
 
@@ -358,7 +365,17 @@ clock (Redis `TIME`, `Date.now()` in memory) when they hand an entry out, and
 `QUEUE_CLAIM_LEASE_MS` old as eligible again, clearing any thaw-probe mark the
 lapsed claim made. Before dispatching, `processRequests` calls
 `confirmRequest`, which deletes the stamp only if it is still the one this pass
-was handed; an entry without a stamp is admitted and is never reclaimed. Any
+was handed and has not lapsed, on the same clock and test as `getNextRequest`;
+an entry without a stamp is admitted and is never reclaimed.
+
+The lease is strict: a lapsed claim is refused even when nobody has reclaimed
+the entry yet. A lapsed claim's probe mark stops counting as a competing probe
+the moment it lapses, so another pass can start a probe; were the lapsed claim
+still confirmable, its own nomination would dispatch beside that probe. A pass
+that is merely slow, past the lease before it confirms, takes the stale-claimer
+path below and dispatches nothing; the entry, still `inProgress` under its
+lapsed stamp, is claimable again, usually by the same pass on its next
+iteration. Any
 `status` written through `updateRequest` also deletes it, so a returned entry is
 plainly pending. A stamp that does not parse never lapses, on both sides.
 
@@ -372,13 +389,32 @@ lapses under a live claimer.
 
 Then the stale claimer's confirmation fails and it does not dispatch. It does
 not release what it claimed either, because a concurrency slot is keyed by
-request id and is the slot the new holder is using. The exception is an entry
-that a re-read finds gone: it has no holder, so the slot is this pass's alone
-and is released. A token-bucket claim is spent twice instead, and the stale
-claimer's claim mark, `<bucket>:claim:<slotId>`, is keyed by the same request
-and overwrites the new holder's. Settling the new holder's response against
-that mark can credit back at most `cost − actual`, against a full extra spend
-already taken, so both under-admit rather than over-admit.
+request id and is the slot the new holder is using. A token-bucket claim is
+spent twice instead, and the stale claimer's claim mark,
+`<bucket>:claim:<slotId>`, is keyed by the same request and overwrites the new
+holder's. Settling the new holder's response against that mark can credit back
+at most `cost − actual`, against a full extra spend already taken, so both
+under-admit rather than over-admit.
+
+An entry that a re-read finds gone does not mean nobody holds its slot. A
+streamed response's entry is removed at its headers while its slot is held to
+the end of the stream, so a stale claimer whose claim re-used that slot would
+free it under a live stream, and the next request would exceed
+`maxConcurrency`. `releaseGoneClaim` in `processRequests.ts` therefore releases
+only when the pass's own lease is provably unbroken: it samples the backend
+clock after the read, and releases if the claim is still younger than the
+lease. Then no other pass can have been handed the entry, so nothing else has
+dispatched it, and a slot under its id is the one this pass's claim re-created
+after the request finished or was abandoned. Past the lease it releases
+nothing, and a slot it did re-create is left to the slot TTL
+(`concurrencySlotTtl`), the reaper for any slot no completion will release.
+That costs one slot for the TTL in a race already rare, where releasing costs
+the cap.
+
+Keeping the stream's entry until its end would restore "gone means finished",
+but the entry would then count toward queue depth and the fast-path gate for
+the length of every stream, and the headers would need a separate write to
+clear the probe mark, so it was not taken.
 
 Every write-back of a claim in the loop — declined by a freeze, by a probe
 already running, by the budget, or failed in admission — goes through
@@ -394,8 +430,10 @@ keeps being handed out is never reached, and its mark would otherwise hold off
 every probe.
 
 A confirmation whose reply is lost throws into the loop's catch, which returns
-the entry to the queue undispatched, as for any other admission failure. That
-write does not confirm again: the lost confirmation may have landed and removed
+the entry to the queue undispatched, as for any other admission failure. Every
+exit runs inside that `try`, the declines included, so a write-back's own
+confirmation losing its reply is caught the same way. That write does not
+confirm again: the lost confirmation may have landed and removed
 the stamp, and a second one would then refuse and leave the entry `inProgress`
 with nothing to move it on.
 
@@ -767,7 +805,10 @@ nothing wrong.
 semantically identical. `test/conformance.test.ts` is the cross-backend guard,
 running one suite against both; `test/clientTypes/backendParity.test.ts` holds
 the two queue-selection implementations to one answer. A change to one backend's
-semantics is expected to touch the other.
+semantics is expected to touch the other. The arithmetic they share lives in
+core and is exported on `@dianemo/core/backend`, which the Redis backend imports
+by name rather than keeping a copy; see
+[implementing a backend](backends/README.md#implementing-a-backend).
 
 Where they legitimately differ is *how* atomicity is achieved, not whether it
 holds:

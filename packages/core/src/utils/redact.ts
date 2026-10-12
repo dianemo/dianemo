@@ -102,22 +102,19 @@ const USERINFO_WITH_PASSWORD =
 
 /**
  * A password holding a raw `?` or `#`, which an unescaped one from a config
- * file can. Tried only when the strict form above found no userinfo, so a
- * query's own `@` is not mistaken for the end of one. Anchored, and only its
- * last run backtracks, so a match stays linear in the URL's length.
+ * file can. Tried only when the strict form above found no userinfo. It also
+ * matches a port followed by a query holding `@`, which reads the same.
+ * Anchored, and only its last run backtracks, so a match stays linear in the
+ * URL's length.
  */
 const USERINFO_WITH_RAW_PASSWORD =
   /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#@:]*:)([^/]*)@/i;
 
-/** `host:8080?email=a@b.com`: a port, then a query or fragment holding `@`. */
-const PORT_BEFORE_QUERY = /^\d{1,5}[?#]/;
-
 function redactPassword(url: string): string {
-  const strict = USERINFO_WITH_PASSWORD.exec(url);
-  const match = strict ?? USERINFO_WITH_RAW_PASSWORD.exec(url);
+  const match =
+    USERINFO_WITH_PASSWORD.exec(url) ?? USERINFO_WITH_RAW_PASSWORD.exec(url);
   if (!match) return url;
-  const [whole, scheme, user, password] = match;
-  if (!strict && PORT_BEFORE_QUERY.test(password)) return url;
+  const [whole, scheme, user] = match;
   return `${scheme}${user}${REDACTED}@${url.slice(whole.length)}`;
 }
 
@@ -126,6 +123,8 @@ function redactPassword(url: string): string {
  *
  * Redacting `params` is not enough on its own: an OAuth refresh built with
  * `dataLocation: "urlQuery"` puts `client_secret` inline in `url` instead.
+ *
+ * Where userinfo and a port-then-query cannot be told apart, it redacts.
  */
 export function redactUrl(url: string | undefined): string | undefined {
   if (!url) return url;

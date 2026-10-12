@@ -279,7 +279,7 @@ async function waitOutBackoff(
       else resolve();
     };
     const onAbort = () => finish(new RequestAbortedError(request.id));
-    const timer = setTimeout(() => finish(), waitMs);
+    const timer = setTimeout(() => finish(), clampDelay(waitMs));
     signal?.addEventListener?.("abort", onAbort, { once: true });
     // Shutdown and client removal cancel waiters through this registration.
     this.registerWaitingRequest(request.id, finish);
@@ -346,7 +346,7 @@ async function withDeadline<T>(
 }
 
 async function waitForRequestReady(this: BaseClient, request: Request) {
-  const timeoutMs = this.requestOptions.cleanupTimeout || 60000;
+  const timeoutMs = clampDelay(this.requestOptions.cleanupTimeout || 60000);
 
   // A retry re-enters on the same Request object, and `fastPath` and
   // `claimedKeys` describe how *this* attempt was admitted, so both are cleared
@@ -757,8 +757,15 @@ async function handleStreamedResponse(
     end("closed", new RequestAbortedError(request.id, true));
   // axios's own abort listener usually destroys the source first, with its
   // `CanceledError`; the caller sees the same error whichever wins.
+  // Sanitized because it becomes the caller's stream error: axios destroys the
+  // source with an `AxiosError` that carries the request's config and headers.
   const onSourceError = (error: Error) =>
-    signal?.aborted ? onAbort() : end("error", error);
+    signal?.aborted
+      ? onAbort()
+      : end(
+          "error",
+          sanitizeError(error, this.getSensitiveHeaderNames()) as Error
+        );
   signal?.addEventListener?.("abort", onAbort, { once: true });
 
   let ended = false;

@@ -398,7 +398,7 @@ describeIfRedis("redis backend — ops layer", () => {
       const seen: string[] = [];
       await backend.subscribe(["ps:killed"], (_c, m) => seen.push(m));
 
-      await redis.client("KILL", "TYPE", "pubsub");
+      await redis.call("CLIENT", "KILL", "TYPE", "pubsub");
       await new Promise((r) => setTimeout(r, 500));
       await backend.publish("ps:killed", "after-kill");
       await new Promise((r) => setTimeout(r, 200));

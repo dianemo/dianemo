@@ -1,5 +1,8 @@
+import { memoryBackend } from "../../packages/core/src/backend/memory.js";
+import { redisBackend } from "../../packages/backend-redis/src/index.js";
 import { describe, expect, it } from "vitest";
 import { harnesses } from "./harness.js";
+import { Redis } from "ioredis";
 import type {
   DianemoBackend,
   QueuedRequest,
@@ -391,4 +394,93 @@ describe.each(harnesses(2))("backend selection parity — $name", (harness) => {
       expect(claimed?.status).toBe("inProgress");
     });
   });
+});
+
+// Both backends side by side, which the per-backend suite above cannot do.
+describe.skipIf(!process.env.REDIS_URL)("backend selection parity", () => {
+  it("hands out the same entries in the same order on both backends", async () => {
+    const conn = new Redis(`${process.env.REDIS_URL}/2`);
+    await conn.flushdb();
+    const redis = redisBackend(conn);
+    const memory = memoryBackend();
+    // A fixed seed: a failure names the iteration that reproduces it.
+    let seed = 12345;
+    const rnd = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const pick = <T>(xs: T[]): T => xs[rnd(xs.length)];
+    const mismatches: string[] = [];
+    try {
+      for (let iter = 0; iter < 150; iter++) {
+        const queue = `fz${iter}:queue`;
+        const prefix = `fz${iter}:request`;
+        const now = Date.now();
+        const ids = Array.from({ length: 6 }, (_, i) => `r${i}`);
+        const plans = ids.map((id) => ({
+          id,
+          priority: rnd(4),
+          grantId: pick([undefined, "g1", "g2"]),
+          status: pick(["pending", "pending", "inProgress", "done"]),
+          claimedAt: pick([
+            "",
+            String(now - 60_000),
+            String(now + 60_000),
+            "nan",
+            "x",
+          ]),
+          clientName: pick(["c", "c", ""]),
+          requestId: pick([id, id, ""]),
+          isThawRequest: pick(["true", "false"]),
+        }));
+        for (const backend of [memory, redis]) {
+          for (const plan of plans) {
+            await backend.addRequest(queue, prefix, {
+              ...entry(plan.id, plan.priority, plan.grantId),
+              requestName: "r",
+              timestamp: now,
+            });
+            const fields: Record<string, string> = {
+              status: plan.status,
+              clientName: plan.clientName,
+              requestId: plan.requestId,
+              isThawRequest: plan.isThawRequest,
+            };
+            if (plan.claimedAt !== "") fields.claimedAt = plan.claimedAt;
+            await backend.hset(`${prefix}:${plan.id}`, fields);
+          }
+        }
+        const skipGrants = pick([[], ["g1"], ["g2"], ["g1", "g2"]]);
+        const skipIds = pick([[], ["r0"], ["r2", "r3"]]);
+        for (let step = 0; step < 8; step++) {
+          const a = await memory.getNextRequest(
+            queue,
+            prefix,
+            skipGrants,
+            skipIds
+          );
+          const b = await redis.getNextRequest(
+            queue,
+            prefix,
+            skipGrants,
+            skipIds
+          );
+          const fromMemory = a ? `${a.requestId}/${a.isThawRequest}` : "null";
+          const fromRedis = b ? `${b.requestId}/${b.isThawRequest}` : "null";
+          if (fromMemory !== fromRedis) {
+            mismatches.push(
+              `iter ${iter} step ${step}: memory ${fromMemory} redis ${fromRedis} ${JSON.stringify(plans)}`
+            );
+            break;
+          }
+          if (!a) break;
+        }
+      }
+      expect(mismatches.slice(0, 3)).toEqual([]);
+    } finally {
+      await memory.close();
+      await redis.close();
+      await conn.quit();
+    }
+  }, 120_000);
 });

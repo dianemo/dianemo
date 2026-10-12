@@ -7,6 +7,7 @@
     // (Paths are relative to this file; baseUrl is deprecated in TS 6.)
     "paths": {
       "@dianemo/core": ["./packages/core/src/index.ts"],
+      "@dianemo/core/backend": ["./packages/core/src/backend/index.ts"],
       "@dianemo/backend-redis": ["./packages/backend-redis/src/index.ts"]
     }
   },

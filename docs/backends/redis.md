@@ -142,6 +142,14 @@ atomic script, taking a request from nine round-trips down to two, or one for a
 - **Failover.** ioredis handles reconnection. Coordination state is rebuilt from
   what remains; a lost queue means in-flight requests are re-driven by their
   callers rather than silently dropped.
+- **A restart that loses state is briefly permissive.** A Redis that comes back
+  without dianemo's keys — restarted without persistence, or failed over to a
+  replica that had not caught up — reads absent state the way it reads evicted
+  state: as permissive. Token buckets read as full, so the fleet can spend a
+  whole interval's budget at once, and the concurrency slots held by requests
+  still upstream are gone, so new requests are admitted beside them and
+  `maxConcurrency` is briefly exceeded until those finish. Run Redis with
+  persistence if a burst like that would cost you with the vendor.
 - **Replica clock skew does not affect coordination.** Every script that decides
   fleet-wide state reads Redis's own clock with `TIME`, so a freeze deadline, a
   token bucket's `lastUpdate` and a concurrency slot's age are all written and

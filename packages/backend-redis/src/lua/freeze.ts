@@ -1,4 +1,4 @@
-import { FREEZE_PROBE_TTL_SECONDS } from "@dianemo/core";
+import { FREEZE_PROBE_TTL_SECONDS } from "@dianemo/core/backend";
 import {
   exactFn,
   claimLapsedFn,
@@ -105,13 +105,18 @@ ${freezeTtlFn}
   -- '%d', not tostring: a millisecond epoch is 13 digits and Lua 5.1's
   -- default number formatting is %.14g — correct today, and silently lossy
   -- the moment either value grows a digit or gains a fraction.
+  local untilText = string.format('%d', frozenUntil)
+  local thawText = string.format('%d', thawRequestCount)
   redis.call('HSET', key,
-    'frozenUntil', string.format('%d', frozenUntil),
-    'thawRequestCount', string.format('%d', thawRequestCount),
+    'frozenUntil', untilText,
+    'thawRequestCount', thawText,
     'emptiesBucket', emptiesBucket and '1' or '0')
   redis.call('EXPIRE', key, ttl)
 
-  return { frozenUntil, thawRequestCount }
+  -- Strings, not an integer reply: ioredis 6's decoder sums digits in a double
+  -- as \`n * 10 + byte - 48\`, so an integer within 48 of 2^53 — the clamp
+  -- above produces one — reads back a unit off.
+  return { untilText, thawText }
 `;
 
 /**

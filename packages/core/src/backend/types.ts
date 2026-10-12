@@ -489,6 +489,11 @@ export interface DianemoBackend {
    * both are dropped across an `emptyTokenBucket` or `resetTokenBucket`. The
    * arithmetic:
    * docs/proposals/usage-based-limits.md#settling-late-against-a-bucket-that-has-moved-on.
+   *
+   * Optional so an earlier backend still satisfies the interface. Without it a
+   * request with `settle` or `settleStream` is refused when it is made —
+   * `ConfigurationError` `backend_missing_settlement` — rather than admitted
+   * with a claim nothing could correct.
    */
   settleTokens?(specs: SettleSpec[]): Promise<SettleResult[]>;
 
@@ -671,9 +676,11 @@ export interface DianemoBackend {
   /**
    * Records that the claim {@link getNextRequest} stamped with `claimedAt` led
    * to admission, so the entry is never handed out again. True only while the
-   * entry is still `inProgress` under that same claim; false when it is gone or
-   * its lease lapsed and another caller claimed it, in which case the caller
-   * must not dispatch it.
+   * entry is still `inProgress` under that same claim and the claim is younger
+   * than `QUEUE_CLAIM_LEASE_MS` by the backend's own clock, the one
+   * `getNextRequest` stamps with. False when it is gone, when another caller
+   * claimed it, or when its lease lapsed even with nobody yet reclaiming it;
+   * the caller must then not dispatch it, and the entry is handed out again.
    */
   confirmRequest(
     metadataKeyPrefix: string,

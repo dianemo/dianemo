@@ -53,41 +53,78 @@ ESM only, Node 20+.
 
 ```ts
 import { Redis } from "ioredis";
-import RequestHandler from "@dianemo/core";
+import RequestHandler, {
+  buildClientName,
+  type TokenCredentials,
+} from "@dianemo/core";
 import { redisBackend } from "@dianemo/backend-redis";
-import fedex from "@dianemo/plugin-fedex";
+
+// Template names are typed: declare each one with the credentials it takes.
+declare module "@dianemo/core" {
+  interface ClientTemplates {
+    acme: TokenCredentials;
+  }
+}
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY!, // encrypts stored credentials
+  key: process.env.REQUEST_HANDLER_KEY!, // 32+ characters; encrypts stored credentials
   backend: redisBackend(new Redis(process.env.REDIS_URL!)),
   logger: console, // optional; silent by default
 });
 
-export const requests = handler.use(fedex);
+// The shape of the integration — its rate limit, auth and base URL. No secrets.
+await handler.registerClientTemplate("acme", (creds) => [
+  {
+    name: buildClientName("acme", creds),
+    rateLimit: [
+      { type: "requestLimit", interval: 1000, tokensToAdd: 10, maxTokens: 10 },
+    ],
+    authentication: { type: "token", token: creds.token }, // Authorization: Bearer …
+    requestOptions: { defaults: { baseURL: creds.baseUrl } },
+  },
+]);
 
 // Credentials arrive separately — from a vault, a database, or env.
-await handler.addTemplateClient("fedex", {
+await handler.addTemplateClient("acme", {
   instanceId: "production",
-  clientId: process.env.FEDEX_CLIENT_ID!,
-  clientSecret: process.env.FEDEX_CLIENT_SECRET!,
-  baseUrl: "https://apis.fedex.com",
+  baseUrl: "https://api.acme.example",
+  token: process.env.ACME_API_TOKEN!,
 });
 
-// Typed from exactly the plugins you passed to use().
-await requests.fedex.cancelShipment("fedex:_:production", {
-  trackingNumber: "123456789012",
+const orders = await handler.handleRequest({
+  clientName: "acme:_:production",
+  requestName: "acme.orders.list",
+  method: "GET",
+  url: "/orders",
 });
 ```
 
-`handler.start()` is called on the first request and is idempotent. It registers SIGTERM/SIGINT/SIGHUP
-handlers so the queue drains on shutdown: `stop()` waits up to a 10-second budget for queued work
-to drain, fails anything still waiting with a `ClientUnavailableError` rather than leaving it to
-time out after the process meant to exit, then waits up to the same budget again for requests
-already upstream. Shutdown can therefore take about 20 seconds; `setDrainTimeout` changes the
-budget. A stopped handler stays stopped: later requests are refused with `handler_stopped` until
-`start()` is called again.
+That client sends at most ten requests a second however many replicas run it. [Getting
+started](docs/getting-started.md) explains what each piece above is for.
 
-[Getting started](docs/getting-started.md) explains what each piece above is for.
+> **Plugins and 2.0.** The vendor plugins published from
+> [dianemo-plugins](https://github.com/vivo-us/dianemo-plugins) are all 1.x: they declare a peer of
+> `@dianemo/core ^1.0.0` and a rate-limit shape 2.0 refuses, so none of them works with core 2.0
+> yet. Until they are re-released, write the template yourself as above.
+
+### Shutdown
+
+`handler.start()` is called on the first request or template call, and is idempotent. It registers
+SIGTERM, SIGINT and SIGHUP handlers so the queue drains on shutdown: `stop()` waits up to a
+10-second budget for queued work to drain, fails anything still waiting with a
+`ClientUnavailableError` rather than leaving it to time out after the process meant to exit, then
+waits up to the same budget again for requests already upstream, and up to 5 seconds more for
+streamed responses it has to close. Deregistering and closing the backend get a second each, so a
+backend that has stopped answering cannot hold `stop()` open. The worst case is about 27 seconds,
+inside Kubernetes' default 30-second termination grace period; `setDrainTimeout` changes the budget.
+A stopped handler stays stopped: later requests are refused with `handler_stopped` until `start()`
+is called again.
+
+Once a signal's `stop()` finishes, the handler re-raises that signal, so the process ends by it just
+as it would have without dianemo. If your process listens for the signal too, exiting is yours
+instead: call `stop()` from your listener and exit when it resolves. A second signal while `stop()`
+is running is not caught, so without a listener of your own it ends the process at once.
+
 
 ## Choosing a backend
 
@@ -135,8 +172,8 @@ The manual lives in [`docs/`](docs/README.md).
 Integrations are published separately, one package per vendor, from
 [dianemo-plugins](https://github.com/vivo-us/dianemo-plugins) — FedEx, UPS, Shopify, Stripe, Amazon
 SP-API and others, each carrying that vendor's rate-limit calibration and auth flow. They release on
-their own schedule, so a particular vendor's package may not be on npm yet; the quick start above
-shows the shape a plugin gives you rather than a guaranteed install.
+their own schedule, and every one released so far targets core 1.x: none installs beside core 2.0
+until it is re-released. Nothing waits on them — the quick start above needs only `@dianemo/core`.
 
 ## History
 
@@ -188,6 +225,8 @@ one name, so the token bucket, fast-path admission, concurrency slots, queue ord
 probing, locks and pub/sub are asserted identically against both. Adding a backend means making this
 suite pass — nothing less is sufficient — plus `test/clientTypes/multiLimit.test.ts` if it implements
 the optional multi-limit methods that clients declaring several limits need.
+[Implementing a backend](docs/backends/README.md#implementing-a-backend) lists what
+`@dianemo/core/backend` gives you to build one with.
 
 `test/handler.integration.test.ts` runs a whole handler end to end on each backend, asserting through
 the backend interface rather than poking at storage. `test/lifecycle.integration.test.ts` covers the

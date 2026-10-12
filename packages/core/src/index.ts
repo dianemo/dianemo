@@ -1,11 +1,13 @@
 import type { DianemoResponse, RequestConfig } from "./request/types.js";
 import { createTryHandleRequest } from "./tryHandleRequest.js";
 import startSubscriptions from "./utils/startSubscriptions.js";
+import { settleWithin, TIMED_OUT } from "./utils/deadline.js";
 import updateClientRoles from "./utils/updateClientRoles.js";
 import { generateClients } from "./utils/createClients.js";
 import { assertNameSegment } from "./utils/clientName.js";
 import type { DianemoBackend } from "./backend/types.js";
 import { noopLogger, type Logger } from "./logger.js";
+import { clampDelay } from "./utils/retryAfter.js";
 import type BaseClient from "./client/index.js";
 import EventEmitter from "node:events";
 import crypto from "node:crypto";
@@ -101,32 +103,7 @@ export {
 export { noopLogger, type LogFn, type Logger } from "./logger.js";
 
 export { default as MemoryBackend, memoryBackend } from "./backend/memory.js";
-export {
-  calculateQueueScore,
-  MAX_QUEUE_PRIORITY,
-  MAX_QUEUE_RETRIES,
-  QUEUE_PRIORITY_BAND,
-  QUEUE_RETRY_BAND,
-  QUEUE_SCORE_EPOCH_MS,
-} from "./backend/queueScore.js";
-export { QUEUE_CLAIM_LEASE_MS } from "./backend/queueClaim.js";
-export {
-  formatStoredCost,
-  parseFiniteStored,
-  parsePriority,
-  parseStoredCost,
-  parseStoredNumber,
-} from "./backend/parseStored.js";
-export {
-  FREEZE_PROBE_TTL_SECONDS,
-  normalizeStateTtlSeconds,
-  normalizeTombstoneTtl,
-  normalizeTtlSeconds,
-  REDIS_MAX_TTL_SECONDS,
-  REQUEST_TOMBSTONE_TTL_SECONDS,
-} from "./backend/ttl.js";
-export { claimMarkKey } from "./backend/settlement.js";
-export { BALANCE_TOLERANCE } from "./backend/balance.js";
+// Implementing a backend: the helpers are on `@dianemo/core/backend`.
 export type {
   AcquireConcurrencyResult,
   AcquireMultiLimitResult,
@@ -208,8 +185,35 @@ function assertInstanceSegments(credentials: unknown): void {
   }
 }
 
+/** The shortest `key` the handler accepts, in characters. */
+const MIN_KEY_LENGTH = 32;
+
 /** How long shutdown waits for closed streams to release their slots. */
 const STREAM_CLOSE_TIMEOUT_MS = 5_000;
+
+/**
+ * How long shutdown gives deregistration, and then `backend.close()`, on a
+ * backend that has stopped answering. Sized so the default worst case, in
+ * README.md#shutdown, fits Kubernetes' default 30 s termination grace period.
+ */
+const SHUTDOWN_BACKEND_GRACE_MS = 1_000;
+
+const SHUTDOWN_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
+
+/** Handlers whose signal-triggered `stop()` has not settled yet. */
+const signalStops = new Set<RequestHandler>();
+
+/**
+ * Re-raises `signal` once no handler is still stopping for it, unless the host
+ * listens for it too. Any listener disables Node's default action for a signal,
+ * so with ours gone and none of the host's, the re-raised one ends the process
+ * with the conventional signal status.
+ */
+function restoreSignalDefault(signal: NodeJS.Signals): void {
+  if (signalStops.size > 0) return;
+  if (process.listenerCount(signal) > 0) return;
+  process.kill(process.pid, signal);
+}
 
 /**
  * The host for every outbound client in one process, and this process's seat
@@ -218,6 +222,15 @@ const STREAM_CLOSE_TIMEOUT_MS = 5_000;
  * Construct one per process. It starts itself on the first request or
  * template mutation, and stops on SIGTERM, SIGINT or SIGHUP. Once stopped it
  * stays stopped: work is refused until `start()` is called again.
+ *
+ * On one of those signals it runs `stop()` and then, if the process has no
+ * other listener for that signal, re-raises it so the process ends by that
+ * signal, as it would have without dianemo. A host that listens for the signal
+ * itself owns the exit: call `stop()` from that listener and exit when it
+ * resolves. A second signal while `stop()` is running is not caught by
+ * dianemo, so with no listener of the host's it ends the process at once.
+ * There is no option to skip these listeners; one of your own takes the exit
+ * over, as above.
  *
  * ```ts
  * import RequestHandler, { memoryBackend } from "@dianemo/core";
@@ -242,8 +255,9 @@ const STREAM_CLOSE_TIMEOUT_MS = 5_000;
  * });
  * ```
  *
- * @throws {ConfigurationError} `backend_required` without a `backend`, and
- * `key_required` for an empty or non-string `key`.
+ * @throws {ConfigurationError} `backend_required` without a `backend`,
+ * `key_required` for an empty or non-string `key`, and `key_too_short` for a
+ * `key` under 32 characters.
  */
 export default class RequestHandler {
   protected id: string;
@@ -272,7 +286,7 @@ export default class RequestHandler {
   protected shutdownHooksRegistered = false;
   /** Whether pub/sub handlers are installed, so a retried start cannot duplicate them. */
   public subscriptionsStarted = false;
-  protected shutdownHandler?: () => void;
+  protected shutdownHandler?: (signal: NodeJS.Signals) => void;
   private rolesRunning = false;
   private rolesRerun = false;
   private rolesRerunStartup = false;
@@ -294,7 +308,13 @@ export default class RequestHandler {
     if (typeof data.key !== "string" || data.key.length === 0) {
       throw new ConfigurationError(
         "key_required",
-        "RequestHandler requires a non-empty `key`. It encrypts stored credentials, so use a high-entropy secret (32+ characters) from your secret store, not a literal."
+        `RequestHandler requires a non-empty \`key\`. It encrypts stored credentials, so use a high-entropy secret (${MIN_KEY_LENGTH}+ characters) from your secret store, not a literal.`
+      );
+    }
+    if (data.key.length < MIN_KEY_LENGTH) {
+      throw new ConfigurationError(
+        "key_too_short",
+        `RequestHandler's \`key\` is ${data.key.length} characters; it needs at least ${MIN_KEY_LENGTH}. It encrypts stored credentials, so use a high-entropy secret from your secret store. Credentials stored under the old key cannot be read under a new one: add them again.`
       );
     }
     this.id = crypto.randomUUID();
@@ -483,27 +503,35 @@ export default class RequestHandler {
     if (this.shutdownHooksRegistered) return;
     this.shutdownHooksRegistered = true;
 
-    this.shutdownHandler = () => {
-      this.stop().catch((err) => {
-        this.logger.error(
-          {
-            error: err,
-          },
-          "Failed to stop request handler during shutdown"
-        );
-      });
+    this.shutdownHandler = (signal) => {
+      signalStops.add(this);
+      this.stop()
+        .catch((err) => {
+          this.logger.error(
+            {
+              error: err,
+            },
+            "Failed to stop request handler during shutdown"
+          );
+        })
+        .finally(() => {
+          signalStops.delete(this);
+          restoreSignalDefault(signal);
+        });
     };
 
-    process.once("SIGTERM", this.shutdownHandler);
-    process.once("SIGINT", this.shutdownHandler);
-    process.once("SIGHUP", this.shutdownHandler);
+    for (const signal of SHUTDOWN_SIGNALS) {
+      process.once(signal, this.shutdownHandler);
+    }
   }
 
   private unregisterShutdownHooks(): void {
     if (!this.shutdownHooksRegistered || !this.shutdownHandler) return;
-    process.removeListener("SIGTERM", this.shutdownHandler);
-    process.removeListener("SIGINT", this.shutdownHandler);
-    process.removeListener("SIGHUP", this.shutdownHandler);
+    // Removed for every signal as soon as stopping begins, so a second signal
+    // meets Node's default action, or the host's own listener, instead of ours.
+    for (const signal of SHUTDOWN_SIGNALS) {
+      process.removeListener(signal, this.shutdownHandler);
+    }
     this.shutdownHandler = undefined;
     this.shutdownHooksRegistered = false;
   }
@@ -514,6 +542,11 @@ export default class RequestHandler {
    * still waiting with `ClientUnavailableError` `handler_stopped`, waits up to
    * the same budget again for requests already upstream, deregisters, and
    * closes what the backend opened — never the connection you passed in.
+   *
+   * Each backend call it makes is bounded — by the drain budget, or by one
+   * second for deregistering and one for closing — so a backend that stops
+   * answering logs a warning instead of holding this open. See
+   * README.md#shutdown for the worst case.
    *
    * Idempotent; a stop during `start()` lets the start finish first. Always
    * ends `stopped`, even when deregistration fails, though that error still
@@ -574,16 +607,27 @@ export default class RequestHandler {
     while (Date.now() < deadline) {
       let outstanding = 0;
       for (const client of clients) {
+        let busy: boolean | typeof TIMED_OUT;
         try {
           // This replica's own work, not the queue's total. The queue key is
           // fleet-wide, and a worker cannot advance a peer's entry at all —
           // `processRequests` returns immediately for that role — so counting all of
           // it spends the whole drain budget on someone else's backlog.
-          if (await client.hasOutstandingWork()) outstanding++;
+          busy = await settleWithin(
+            client.hasOutstandingWork(),
+            deadline - Date.now()
+          );
         } catch {
           // A backend already going away cannot say what is left.
           return;
         }
+        if (busy === TIMED_OUT) {
+          this.logger.warn(
+            `Shutdown drain got no answer from the backend within ${this.drainTimeoutMs}ms; failing what is left`
+          );
+          return;
+        }
+        if (busy) outstanding++;
       }
       if (outstanding === 0) return;
       // Nothing else pokes the loop once new requests stop arriving.
@@ -679,15 +723,23 @@ export default class RequestHandler {
       // already upstream releases its slot when the response lands, and that call
       // needs the backend still open.
       await this.awaitInFlightRequests();
-      await this.backend.batch([
-        { op: "srem", key: `${this.namespace}:instances`, member: this.id },
-        { op: "del", key: `${this.namespace}:instance:${this.id}` },
-        {
-          op: "publish",
-          channel: `${this.namespace}:instanceStopped`,
-          message: this.id,
-        },
-      ]);
+      const deregistered = await settleWithin(
+        this.backend.batch([
+          { op: "srem", key: `${this.namespace}:instances`, member: this.id },
+          { op: "del", key: `${this.namespace}:instance:${this.id}` },
+          {
+            op: "publish",
+            channel: `${this.namespace}:instanceStopped`,
+            message: this.id,
+          },
+        ]),
+        SHUTDOWN_BACKEND_GRACE_MS
+      );
+      if (deregistered === TIMED_OUT) {
+        this.logger.warn(
+          `Shutdown could not deregister within ${SHUTDOWN_BACKEND_GRACE_MS}ms; peers will presume this instance lost when its heartbeat lapses`
+        );
+      }
     } finally {
       // Reaching the terminal state is not optional even when a step above throws,
       // and this path is reachable in ordinary operation: deregistration fails
@@ -701,7 +753,15 @@ export default class RequestHandler {
         // Closes only what the backend opened for itself. A connection handed to
         // the backend belongs to the caller, who may still be using it — closing
         // that here would break unrelated work in the same process.
-        await this.backend.close();
+        const closed = await settleWithin(
+          this.backend.close(),
+          SHUTDOWN_BACKEND_GRACE_MS
+        );
+        if (closed === TIMED_OUT) {
+          this.logger.warn(
+            `Shutdown gave up closing the backend after ${SHUTDOWN_BACKEND_GRACE_MS}ms`
+          );
+        }
       } catch (error) {
         this.logger.error(
           { error },
@@ -720,6 +780,11 @@ export default class RequestHandler {
       this.templateClientMap.clear();
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = undefined;
+      // Also cleared here, after every wait: a peer timer must not outlive `stop()`.
+      for (const timeout of this.heartbeatTimeouts.values()) {
+        clearTimeout(timeout);
+      }
+      this.heartbeatTimeouts.clear();
       this.startPromise = null;
       this.status = "stopped";
     }
@@ -945,7 +1010,7 @@ export default class RequestHandler {
             `Timed out after ${timeoutMs}ms awaiting client "${clientName}"`
           )
         );
-      }, timeoutMs);
+      }, clampDelay(timeoutMs));
       const cleanup = () => {
         clearTimeout(warnTimer);
         clearTimeout(timeoutTimer);

@@ -46,7 +46,9 @@ The end is the first of:
 - the caller destroying the stream, or the request's `signal` aborting,
   reported as `"closed"`. An abort destroys the caller's stream with
   `RequestAbortedError`;
-- the upstream connection failing, reported as `"error"`;
+- the upstream connection failing, reported as `"error"`. The caller's stream
+  is destroyed with the upstream's error, stripped of the request's
+  credentials;
 - `streamTimeout`, reported as `"timeout"`;
 - the handler stopping, reported as `"shutdown"`.
 
@@ -64,7 +66,9 @@ probe, so it announces only its end.
 
 Two ways, and the first to settle wins. Both go through the attempt's
 [claim mark](settlement.md#what-settle-returns), so the second applies
-nothing.
+nothing. Both need a backend implementing `settleTokens`; on one without it a
+request declaring `settleStream` is refused with `ConfigurationError`
+`backend_missing_settlement`.
 
 **An observer**, usually declared by a plugin's request definition, where the
 vendor's event format is known. It sees each chunk as it passes through,
@@ -115,6 +119,11 @@ settles at what was generated — which is what the vendor bills. It may return:
 `onChunk` and `result` must not throw. A throw is logged, the stream carries
 on, and the claim stands.
 
+`streamErrorOf(result)`, from `@dianemo/core/request/types`, reads a result the
+way dianemo does: the `{ error, cost? }` form when it carries a string `error`,
+`undefined` when it is a cost. Use it in an observer that wraps another, or in a
+test of your own observer, rather than repeating the check.
+
 **The caller**, when it parsed the usage itself:
 
 ```ts
@@ -152,7 +161,8 @@ before the stream settles. A slot lives `concurrencySlotTtl`. A request that
 settles leaves a claim mark on each token bucket, living `settleWindow` or the
 bucket's refill from empty, whichever is longer, rounded up to whole seconds.
 The refresh never runs more often than every 250 ms, so a `concurrencySlotTtl`
-under 750 ms can lose its slot between refreshes. A crashed replica stops
+under 750 ms can lose its slot between refreshes, nor less often than every
+2^31-1 ms (about 24.8 days), the longest interval Node's timers honour. A crashed replica stops
 refreshing, so crash recovery is as quick as it has always been, and
 `concurrencySlotTtl` no longer has to exceed the longest generation.
 

@@ -1,0 +1,12 @@
+---
+'@dianemo/core': major
+'@dianemo/backend-redis': major
+---
+
+A request with `responseType: "stream"` now runs until its stream ends rather than until its headers arrive: its concurrency slot stays held, it counts as in flight for shutdown, and its span stays open. A stream ends when its last chunk has passed through to the caller's stream, not when the upstream connection closes, so a slow reader holds the slot until it has read the body; a body of up to about 128 KiB completes even if the caller never reads it. While the stream is open its slot and claim marks are refreshed every third of the shorter of `concurrencySlotTtl` and the claim marks' lifetime, and never more often than every 250 ms, so a half-hour generation keeps its slot without a half-hour TTL delaying crash recovery. A refresh that finds the slot already gone logs one warning per stream. The new `requestOptions.streamTimeout`, an hour by default, closes a stream left open and releases its slot.
+
+A stream settles when it ends, at what a `settleStream` observer read from the chunks as they passed, or at what the caller reports through `response.dianemo.settle`; the first wins. An observer that reports an error inside the stream freezes the client as a 5xx would; `streamErrorOf`, on `@dianemo/core/request/types`, reads an observer's result the way the handler does. A thaw probe that streams counts as a success at its headers, so a long generation does not hold the fleet's recovery.
+
+A streamed request that fails at its headers hands the caller the vendor's error body as an unread stream in `error.response.data`, relayed so that it reaches neither the connection nor the request that carried the credentials; read it or destroy it. A body the caller is not handed, such as a retried attempt's, is destroyed for you.
+
+BREAKING: a streamed request announces `requestDone` twice — with `phase: "headers"` and then `phase: "end"` — so a host counting completions off that channel should count only `phase !== "headers"`. The caller's `response.data` is a `PassThrough` relaying axios's stream rather than axios's stream itself, and is destroyed with `StreamTimeoutError` or `StreamClosedError` when the timeout or a shutdown closes it. For a custom `DianemoBackend`, the new optional `touchConcurrency` and `touchClaimMark` keep a stream's claims alive; without them a stream outliving `concurrencySlotTtl` loses its slot to the reaper.

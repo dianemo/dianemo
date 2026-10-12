@@ -5,6 +5,7 @@ import { normalizeRateLimit } from "../utils/rateLimit.js";
 import processRequests from "./methods/processRequests.js";
 import type { QueuedRequest } from "../backend/types.js";
 import handleRequest from "./methods/handleRequest.js";
+import { clampDelay } from "../utils/retryAfter.js";
 import { encrypt } from "../utils/encryption.js";
 import type * as ClientTypes from "./types.js";
 import type { Logger } from "../logger.js";
@@ -462,7 +463,7 @@ abstract class BaseClient {
         .finally(() => {
           running = false;
         });
-    }, this.healthCheckIntervalMs);
+    }, clampDelay(this.healthCheckIntervalMs));
   }
 
   /**
@@ -1353,7 +1354,7 @@ abstract class BaseClient {
               `Client ${this.name} | post-freeze processing failed`
             );
           });
-        }, waitFor);
+        }, clampDelay(waitFor));
         this.freezeTimers.add(timer);
       }
       pending.freezeHandled = true;
@@ -1394,18 +1395,15 @@ abstract class BaseClient {
     }
 
     if (isThawRequest && !pending.thawHandled) {
-      // A probe asks whether the upstream still limits or fails us, so any
-      // answer that would not itself freeze the client is a success — a 404
-      // included. See docs/concepts.md#freeze-and-thaw.
       await this.backend.updateThawProgress(
         this.getFreezeStateKey(data.grantId),
-        !freezesClient(data),
+        probeSucceeded(data),
         completionIdOf(data)
       );
 
-      // Clearing the frozen mark releases the single-probe claim, whether the
-      // probe succeeded or not. `processRequests` re-adds it when it nominates
-      // the next probe; a failed probe consumes no thaw progress.
+      // Clearing the frozen mark releases the single-probe claim, whatever the
+      // probe's outcome. `processRequests` re-adds it when it nominates the
+      // next probe; a probe that did not succeed consumes no thaw progress.
       if (data.grantId) await this.removeFrozenGrantId(data.grantId);
       pending.thawHandled = true;
 
@@ -1805,10 +1803,20 @@ function freezeDuration(data: RequestDoneData): number {
 
 /**
  * Whether this completion arms a freeze. The one test for arming one and for
- * failing a thaw probe, so the two cannot disagree.
+ * failing a thaw probe that got an answer, so the two cannot disagree.
  */
 function freezesClient(data: RequestDoneData): boolean {
   return Boolean(data.freezeClient && freezeDuration(data));
+}
+
+/**
+ * Whether a thaw probe counts toward thawing: the upstream answered, and the
+ * answer would not itself freeze the client — a 404 included. An attempt with
+ * no response, abandoned or refused before the vendor said anything, has
+ * learned nothing and makes no progress. docs/concepts.md#freeze-and-thaw
+ */
+function probeSucceeded(data: RequestDoneData): boolean {
+  return data.httpStatus !== undefined && !freezesClient(data);
 }
 
 /**

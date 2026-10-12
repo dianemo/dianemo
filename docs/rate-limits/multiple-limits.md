@@ -58,9 +58,13 @@ list.
 > refuses a 1.x bare object and logs it. For the length of the rollout, a retune
 > reaches only part of the fleet.
 >
-> Stop the fleet, then start it on the new version. If you cannot, do the
-> rollout inside a window where a doubled rate is acceptable, and expect the
-> one-time burst above on top.
+> Stop the fleet, then start it on the new version — every replica, with none
+> of 1.x left running. A mixed fleet is not supported: besides the doubled rate
+> above, a 1.x replica cannot read the template settings 2.0 writes, reads a
+> queued per-limit cost as 1, and, on a connection with an ioredis
+> `keyPrefix`, listens on different pub/sub channels. There is no window in
+> which running both versions is safe. Expect the one-time burst above after
+> the restart.
 >
 > Template overrides stored by 1.x are read back as one-entry lists, with one
 > change in what they do. 1.x skipped an override whose `type` differed from the

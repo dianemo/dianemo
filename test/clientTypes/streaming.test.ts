@@ -313,6 +313,26 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
       );
     }, 30_000);
 
+    it("does not hammer the backend when concurrencySlotTtl is very long", async () => {
+      // A third of 1e10 ms is past setInterval's 2^31-1 ms limit, above which
+      // Node fires every 1 ms.
+      await run(
+        { rateLimit: [slot], requestOptions: { concurrencySlotTtl: 1e10 } },
+        async (handler, backend) => {
+          let touches = 0;
+          const touch = backend.touchConcurrency!.bind(backend);
+          backend.touchConcurrency = async (...args) => {
+            touches++;
+            return touch(...args);
+          };
+          const res = await stream(handler, "id=a&chunks=5&gap=100");
+          await readAll(res.data);
+          await res.dianemo!.finished;
+          expect(touches).toBeLessThan(10);
+        }
+      );
+    }, 30_000);
+
     it("warns when a keep-alive finds the slot already gone", async () => {
       await run(
         { rateLimit: [slot], requestOptions: { concurrencySlotTtl: 300 } },
@@ -495,6 +515,42 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
       });
     }, 30_000);
 
+    it("relays the whole error body to a caller that reads it", async () => {
+      await run({ rateLimit: [slot] }, async (handler) => {
+        upstream.respond(400);
+        const error = await stream(handler, "id=a").catch(
+          (caught: unknown) => caught
+        );
+        const body = (error as AxiosError<Readable>).response!.data!;
+        expect(await readAll(body)).toBe("{}");
+      });
+    }, 30_000);
+
+    it("closes the upstream connection when the caller destroys the error body", async () => {
+      await run({ rateLimit: [slot] }, async (handler) => {
+        upstream.respond(400);
+        const error = await stream(handler, "id=a&holdError").catch(
+          (caught: unknown) => caught
+        );
+        (error as AxiosError<Readable>).response!.data!.destroy();
+        await sleep(200);
+        expect(upstream.ends.has("a:error")).toBe(true);
+      });
+    }, 30_000);
+
+    it("lets the next request through once a terminal error's body is destroyed", async () => {
+      await run({ rateLimit: [slot] }, async (handler) => {
+        upstream.respond(500);
+        const error = await stream(handler, "id=a&holdError").catch(
+          (caught: unknown) => caught
+        );
+        (error as AxiosError<Readable>).response!.data!.destroy();
+        const res = await stream(handler, "id=b");
+        await readAll(res.data);
+        expect(await res.dianemo!.finished).toBe("completed");
+      });
+    }, 30_000);
+
     it("keeps the request's credentials out of a thrown streamed error body", async () => {
       await run({ rateLimit: [slot] }, async (handler) => {
         upstream.respond(400);
@@ -533,6 +589,22 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
           );
         }
       );
+    }, 30_000);
+
+    it("keeps credentials out of the error a mid-stream failure destroys the caller's stream with", async () => {
+      await run({ rateLimit: [slot] }, async (handler) => {
+        const res = await stream(handler, "id=overflow&chunks=20&gap=5", {
+          headers: { Authorization: "Bearer s3cr3t-value-that-must-not-leak" },
+          maxContentLength: 60,
+        });
+        const error = await readAll(res.data).then(
+          () => undefined,
+          (caught: unknown) => caught
+        );
+        await res.dianemo!.finished;
+        expect(error).toBeDefined();
+        expect(inspect(error, { depth: null })).not.toContain("s3cr3t-value");
+      });
     }, 30_000);
   });
 
@@ -581,6 +653,32 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
         expect(await read).toBeInstanceOf(StreamClosedError);
         expect(await res.dianemo!.finished).toBe("shutdown");
       });
+    }, 30_000);
+
+    it("lets an admitted request in a slow interceptor finish during a graceful stop", async () => {
+      await run(
+        {
+          rateLimit: [slot],
+          requestOptions: {
+            requestInterceptor: async (config: unknown) => {
+              await sleep(300);
+              return config;
+            },
+          },
+        },
+        async (handler) => {
+          const pending = stream(handler, "id=a&chunks=1").then(
+            async (res) => {
+              await readAll(res.data);
+              return "ok";
+            },
+            (error: unknown) => error
+          );
+          await sleep(50);
+          await handler.stop();
+          expect(await pending).toBe("ok");
+        }
+      );
     }, 30_000);
   });
 });

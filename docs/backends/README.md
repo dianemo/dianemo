@@ -66,20 +66,64 @@ See [benchmarks](../benchmarks.md) for the numbers. Choosing memory to gain
 throughput trades a correctness guarantee for a few percent you will only notice
 if your upstream is faster than your network.
 
-## Writing another backend
+## Implementing a backend
 
-The contract is `DianemoBackend` in `packages/core/src/backend/types.ts`. Its
-budget-spending half is deliberately a set of **domain operations**
-(`acquireTokens`, `tryAdmitImmediately`, `addRequest`) rather than storage
-primitives, because every one of them must be atomic with respect to other
-spenders. Each backend satisfies that in whatever way is natural for it — Lua
-scripts in Redis, or simply being synchronous in memory.
+The contract is `DianemoBackend`. Its budget-spending half is deliberately a set
+of **domain operations** (`acquireTokens`, `tryAdmitImmediately`, `addRequest`)
+rather than storage primitives, because every one of them must be atomic with
+respect to other spenders. Each backend satisfies that in whatever way is
+natural for it — Lua scripts in Redis, or simply being synchronous in memory.
 
 The other half is plain storage and messaging, which the handler uses for the
 template registry, credentials, instance discovery and broadcasts: `get`, `set`,
 `del`, `hgetall`, `hset`, `sadd`, `srem`, `smembers`, `batch`, `publish`,
 `subscribe`, `acquireLock` and `releaseLock`, plus the `kind` and `distributed`
-properties. Every one of them is required.
+properties. Every one of them is required, as is `confirmRequest`, which ends a
+queue claim's lease (see
+[a queue claim is a lease](../design-notes.md#a-queue-claim-is-a-lease)).
+
+### What `@dianemo/core/backend` gives you
+
+Everything an implementation needs from core is on one subpath, kept off the
+root entry because a host never needs it:
+
+```ts
+import {
+  normalizeStateTtlSeconds,
+  type DianemoBackend,
+} from "@dianemo/core/backend";
+```
+
+- **The contract types**: `DianemoBackend`, `QueuedRequest`, `QueueStats`,
+  `TokenBucketConfig`, `ConcurrencyConfig`, `FreezeState`, `ClaimMark`,
+  `SettleSpec`, `SettleResult`, `MultiLimitSpec`, the `Acquire*Result` types,
+  `BatchOp`, `BatchOptions` and `MessageHandler`. The root entry exports the
+  same types, for a host that only names them.
+- **The queue-score layout**: `calculateQueueScore`, and the constants it
+  packs with — `MAX_QUEUE_PRIORITY`, `MAX_QUEUE_RETRIES`,
+  `QUEUE_PRIORITY_BAND`, `QUEUE_RETRY_BAND` and `QUEUE_SCORE_EPOCH_MS`. The
+  bands are an on-disk format; see
+  [queue score bands](../design-notes.md#queue-score-bands).
+- **The claim lease**: `QUEUE_CLAIM_LEASE_MS`, how old a `claimedAt` stamp must
+  be before `getNextRequest` hands its entry out again.
+- **TTL normalisers**: `normalizeTtlSeconds` for the plain store,
+  `normalizeStateTtlSeconds` for a key holding rate-limit state,
+  `normalizeTombstoneTtl` for a removed request's marker, and the constants
+  `REDIS_MAX_TTL_SECONDS`, `REQUEST_TOMBSTONE_TTL_SECONDS` and
+  `FREEZE_PROBE_TTL_SECONDS`. See
+  [TTL arguments](../design-notes.md#ttl-arguments-are-validated-before-the-write-not-after).
+- **Stored-number parsers**: `parseStoredNumber`, `parseFiniteStored`,
+  `parsePriority`, and `formatStoredCost` with its reader `parseStoredCost`,
+  so a field written as a string reads back as Lua's `tonumber` would read it.
+  See [numeric field parsing](../design-notes.md#numeric-field-parsing).
+- **Settlement**: `claimMarkKey`, where a claim's mark lives beside its bucket,
+  and `BALANCE_TOLERANCE`, how far below a cost a balance may fall and still
+  cover it.
+
+Reading these rather than reimplementing them is what keeps a third backend in
+step with the two built-in ones.
+
+### Optional methods
 
 A few methods are optional, and each has a stated fallback:
 
@@ -93,9 +137,17 @@ A few methods are optional, and each has a stated fallback:
   [several limits](../rate-limits/multiple-limits.md) is refused with a
   `ConfigurationError` when it is built; without `tryAdmitMultiLimit` it is
   built, but every request takes the queued path.
+- **`settleTokens` and `emptyTokenBucket`.** Without `settleTokens`, a request
+  with `settle` or `settleStream` is refused with `ConfigurationError`
+  `backend_missing_settlement`; see [settlement](../rate-limits/settlement.md).
+  Without `emptyTokenBucket`, a freeze empties a bucket by writing it directly.
+- **`touchConcurrency` and `touchClaimMark`.** Without them, a
+  [stream](../rate-limits/streaming.md) outliving `concurrencySlotTtl` loses its
+  slot to the reaper.
 
-Implement the interface, then run the conformance suite against it. Its
-`several budgets` block covers the multi-limit methods too, and
-`test/clientTypes/multiLimit.test.ts` exercises them through real clients. See
+Implement the interface, then run the conformance suite in
+`test/conformance.test.ts` against it. Its `several budgets` block covers the
+multi-limit methods too, and `test/clientTypes/multiLimit.test.ts` exercises
+them through real clients. See
 [two backends, one contract](../design-notes.md#two-backends-one-contract) for
 what parity between backends requires beyond the types.

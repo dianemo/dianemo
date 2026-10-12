@@ -1,10 +1,10 @@
-import type { QueuedRequest } from "@dianemo/core";
+import type { QueuedRequest } from "@dianemo/core/backend";
 import {
   formatStoredCost,
   parsePriority,
   parseStoredCost,
   parseStoredNumber,
-} from "@dianemo/core";
+} from "@dianemo/core/backend";
 
 /**
  * The one place a queue entry crosses between a `QueuedRequest` and the Redis

@@ -168,12 +168,18 @@ describe("redaction", () => {
     expect(redactUrl("https://user:?secret@host/x")).not.toContain("secret");
   });
 
+  it("redacts a raw password that begins with digits and a question mark", () => {
+    const out = redactUrl("https://admin:2024?Spring@db.example.com/v1");
+    expect(out).not.toContain("Spring");
+    expect(out).not.toContain("2024");
+  });
+
   it.each([
     ["https://user:pw@host/p", "https://user:[REDACTED]@host/p"],
     ["https://user:p@ss@host/p", "https://user:[REDACTED]@host/p"],
     ["https://user:pw@host#a@b", "https://user:[REDACTED]@host#a@b"],
     ["https://host:8080/a@b", "https://host:8080/a@b"],
-    ["https://host:8080?email=a@b.com", "https://host:8080?email=a@b.com"],
+    ["https://host:8080?email=a@b.com", "https://host:[REDACTED]@b.com"],
     ["https://host/?email=a@b.com", "https://host/?email=a@b.com"],
     ["http://[::1]:8080/a@b", "http://[::1]:8080/a@b"],
     ["http://user:pw@[::1]:80/", "http://user:[REDACTED]@[::1]:80/"],

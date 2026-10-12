@@ -1,4 +1,4 @@
-import type { FreezeState } from "@dianemo/core";
+import type { FreezeState } from "@dianemo/core/backend";
 import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 
@@ -22,8 +22,11 @@ async function writeFreezeState(
     thawRequestCount,
     mode,
     options.emptiesBucket === false ? "0" : "1"
-  )) as [number, number];
-  return { frozenUntil: result[0], thawRequestCount: result[1] };
+  )) as [string, string];
+  return {
+    frozenUntil: parseLuaNumber(result[0]),
+    thawRequestCount: parseLuaNumber(result[1]),
+  };
 }
 
 async function readFreezeState(

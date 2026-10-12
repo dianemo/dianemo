@@ -1,3 +1,4 @@
+import { QUEUE_CLAIM_LEASE_MS } from "../../backend/queueClaim.js";
 import type { RequestMetadata } from "../../request/types.js";
 import type { QueuedRequest } from "../../backend/types.js";
 import type BaseClient from "../index.js";
@@ -43,6 +44,27 @@ async function failUnsatisfiable(
   if (this.failWaitingRequest(request.requestId, error)) {
     await this.removeRequestFromQueue(request.requestId).catch(() => {});
   }
+}
+
+/**
+ * Hands back what this pass claimed for an entry a re-read found gone, but only
+ * while its lease is provably unbroken: the clock is sampled after the read, so
+ * no other pass can have been handed the entry and dispatched it. Past that, a
+ * slot under this request id may be a stream's that outlived its entry, and a
+ * slot this pass re-created is left to the slot TTL.
+ * docs/design-notes.md#a-queue-claim-is-a-lease
+ */
+async function releaseGoneClaim(
+  this: BaseClient,
+  claim: QueuedRequest,
+  request: RequestMetadata
+): Promise<void> {
+  if (claim.claimedAt !== undefined) {
+    const now = await this.backend.now().catch(() => undefined);
+    if (now === undefined) return;
+    if (now - claim.claimedAt >= QUEUE_CLAIM_LEASE_MS) return;
+  }
+  await this.releaseUnusedAdmission(request);
 }
 
 async function processRequests(this: BaseClient) {
@@ -123,67 +145,67 @@ async function processRequests(this: BaseClient) {
         await this.updateRequestInQueue(requestId, updates);
       };
 
-      const res = await this.canProcessNextRequest(requestMetadata);
-      if (!res.canProcess) {
-        await returnToQueue();
-        // Checked before the grant short-circuit below, because an impossible cost
-        // is a property of the request rather than of its grant's momentary
-        // capacity — otherwise a grant-scoped request goes to `blockedGrantIds` and
-        // waits out the admission timeout for an answer known now.
-        if (isPermanentlyUnsatisfiable(this, requestMetadata)) {
-          this.logger.warn(
-            `Client ${this.name} | request ${requestId} has a cost the client can never satisfy; failing it and moving on`
-          );
-          skippedRequestIds.add(requestId);
-          await failUnsatisfiable.bind(this)(requestMetadata);
-          continue;
-        }
-
-        // Booked above all three exits below, not beside the `break`: two are
-        // `continue`s taken by grant-scoped and grant-isolated requests, so booking
-        // only before the `break` leaves exactly the isolated-grant tenants
-        // recovering on the health tick.
-        await this.scheduleDrainForFreeze(res.frozenUntil, grantId);
-
-        if (grantId && isolated) {
-          blockedGrantIds.add(grantId);
-          continue;
-        }
-        // The client-level budget is exhausted or frozen, so nothing drawing on it
-        // can proceed — but a grant-isolated client meters each grant against its
-        // own bucket, so breaking here would stall every tenant behind a
-        // client-level head. Skip it and keep scanning instead; anything else on the
-        // client-level budget declines in turn and is skipped too.
-        if (isolated) {
-          skippedRequestIds.add(requestId);
-          continue;
-        }
-        break;
-      }
-
-      // Applies with or without a grant. Grants are opt-in, so gating this on
-      // `grantId` would let the default client release its entire queue the
-      // instant a freeze expired, instead of probing with exactly one request.
-      if (res.isThawRequest) {
-        const thawResult = await this.tryStartThawRequest(grantId, requestId);
-
-        if (thawResult === "exists") {
+      // Between the claim above and the notification below the request exists
+      // only in this loop — `getNextRequest` already marked it `inProgress`, and
+      // orphan cleanup skips it while its owner lives. Every exit, declines
+      // included, runs inside this `try`: an escaping rejection would hold the
+      // entry for the lease, or for good once a confirmation removed its stamp.
+      try {
+        const res = await this.canProcessNextRequest(requestMetadata);
+        if (!res.canProcess) {
           await returnToQueue();
-          // No `scheduleDrainForFreeze` here, unlike the three decline exits above:
-          // this request is not waiting for the freeze to lapse but for a probe that
-          // is already running, and that probe's `requestDone` re-enters this loop.
+          // Checked before the grant short-circuit below, because an impossible cost
+          // is a property of the request rather than of its grant's momentary
+          // capacity — otherwise a grant-scoped request goes to `blockedGrantIds` and
+          // waits out the admission timeout for an answer known now.
+          if (isPermanentlyUnsatisfiable(this, requestMetadata)) {
+            this.logger.warn(
+              `Client ${this.name} | request ${requestId} has a cost the client can never satisfy; failing it and moving on`
+            );
+            skippedRequestIds.add(requestId);
+            await failUnsatisfiable.bind(this)(requestMetadata);
+            continue;
+          }
+
+          // Booked above all three exits below, not beside the `break`: two are
+          // `continue`s taken by grant-scoped and grant-isolated requests, so booking
+          // only before the `break` leaves exactly the isolated-grant tenants
+          // recovering on the health tick.
+          await this.scheduleDrainForFreeze(res.frozenUntil, grantId);
+
+          if (grantId && isolated) {
+            blockedGrantIds.add(grantId);
+            continue;
+          }
+          // The client-level budget is exhausted or frozen, so nothing drawing on it
+          // can proceed — but a grant-isolated client meters each grant against its
+          // own bucket, so breaking here would stall every tenant behind a
+          // client-level head. Skip it and keep scanning instead; anything else on the
+          // client-level budget declines in turn and is skipped too.
+          if (isolated) {
+            skippedRequestIds.add(requestId);
+            continue;
+          }
           break;
         }
 
-        requestMetadata.isThawRequest = true;
-      }
+        // Applies with or without a grant. Grants are opt-in, so gating this on
+        // `grantId` would let the default client release its entire queue the
+        // instant a freeze expired, instead of probing with exactly one request.
+        if (res.isThawRequest) {
+          const thawResult = await this.tryStartThawRequest(grantId, requestId);
 
-      // Between the claim above and the notification below the request exists
-      // only in this loop — `getNextRequest` already marked it `inProgress`, so
-      // nothing reconsiders it until its claim lapses and orphan cleanup skips
-      // it while its owner lives. An escaping rejection would hold it for the
-      // lease.
-      try {
+          if (thawResult === "exists") {
+            await returnToQueue();
+            // No `scheduleDrainForFreeze` here, unlike the three decline exits above:
+            // this request is not waiting for the freeze to lapse but for a probe that
+            // is already running, and that probe's `requestDone` re-enters this loop.
+            break;
+          }
+
+          requestMetadata.isThawRequest = true;
+        }
+
         const turn = await this.tryAcquireTurn(requestMetadata);
         if (!turn.acquired) {
           await returnToQueue();
@@ -227,14 +249,13 @@ async function processRequests(this: BaseClient) {
           );
           // Only a definite absence hands the claim back.
           if (stillQueued === null) {
-            await this.releaseUnusedAdmission(requestMetadata);
+            await releaseGoneClaim.bind(this)(request, requestMetadata);
             continue;
           }
         }
 
         // Not released on a lapsed claim: a concurrency slot is keyed by
-        // request id, so it is the slot the entry's new holder is using. An
-        // entry that is gone has no holder, and its slot is this pass's alone.
+        // request id, so it is the slot the entry's new holder is using.
         // docs/design-notes.md#a-queue-claim-is-a-lease
         if (!(await confirm())) {
           if (this.claimsReleasableCapacity()) {
@@ -242,7 +263,7 @@ async function processRequests(this: BaseClient) {
               () => "unreadable" as const
             );
             if (entry === null) {
-              await this.releaseUnusedAdmission(requestMetadata);
+              await releaseGoneClaim.bind(this)(request, requestMetadata);
             }
           }
           continue;

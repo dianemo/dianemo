@@ -1,4 +1,4 @@
-import { BALANCE_TOLERANCE } from "@dianemo/core";
+import { BALANCE_TOLERANCE } from "@dianemo/core/backend";
 import {
   bucketTtlFn,
   exactFn,

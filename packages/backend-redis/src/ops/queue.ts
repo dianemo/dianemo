@@ -1,17 +1,17 @@
-import type { QueueStats, QueuedRequest } from "@dianemo/core";
+import type { QueueStats, QueuedRequest } from "@dianemo/core/backend";
 import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
-import {
-  decodeFlatHash,
-  decodeRequest,
-  encodeRequestFields,
-} from "../requestCodec.js";
 import {
   calculateQueueScore,
   normalizeTombstoneTtl,
   normalizeStateTtlSeconds,
   REQUEST_TOMBSTONE_TTL_SECONDS,
-} from "@dianemo/core";
+} from "@dianemo/core/backend";
+import {
+  decodeFlatHash,
+  decodeRequest,
+  encodeRequestFields,
+} from "../requestCodec.js";
 
 /**
  * Marks an id as removed, so a later add for it is refused rather than creating an

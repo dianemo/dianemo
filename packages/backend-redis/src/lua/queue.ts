@@ -1,16 +1,16 @@
 import {
-  exactFn,
-  redisNow,
-  claimLapsedFn,
-  finiteNumberFn,
-} from "./fragments.js";
-import {
   MAX_QUEUE_PRIORITY as MAX_PRIORITY,
   MAX_QUEUE_RETRIES as MAX_RETRIES,
   QUEUE_PRIORITY_BAND as PRIORITY_BAND,
   QUEUE_RETRY_BAND as RETRY_BAND,
   QUEUE_SCORE_EPOCH_MS as SCORE_EPOCH_MS,
-} from "@dianemo/core";
+} from "@dianemo/core/backend";
+import {
+  exactFn,
+  redisNow,
+  claimLapsedFn,
+  finiteNumberFn,
+} from "./fragments.js";
 
 /**
  * Request-queue Lua. Order is the sorted-set score packed by
@@ -153,6 +153,8 @@ ${claimLapsedFn()}
 export const confirmRequest = `
   local metadataKey = KEYS[1]
   local claimedAt = ARGV[1]
+${redisNow()}
+${claimLapsedFn()}
 
   local fields = redis.call('HMGET', metadataKey, 'status', 'claimedAt')
   if fields[1] ~= 'inProgress' then return 0 end
@@ -160,6 +162,9 @@ export const confirmRequest = `
   -- nothing: an absent stamp confirms no claim.
   local stored = tonumber(fields[2])
   if stored == nil or stored ~= tonumber(claimedAt) then return 0 end
+  -- A lapsed claim is refused even when nobody has taken it over: its probe
+  -- mark no longer counts, so confirming it could dispatch a second probe.
+  if claimLapsed(fields[2]) then return 0 end
   redis.call('HDEL', metadataKey, 'claimedAt')
   return 1
 `;

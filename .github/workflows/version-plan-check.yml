@@ -7,6 +7,10 @@ on:
 jobs:
   check-version-plan:
     name: Version plans cover touched packages
+    # A release PR consumes the plans while bumping every package it releases,
+    # so this check could only fail there. CONTRIBUTING.md#publishing names the
+    # branch.
+    if: ${{ !startsWith(github.head_ref, 'chore/release-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

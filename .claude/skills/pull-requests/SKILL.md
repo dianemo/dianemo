@@ -13,7 +13,9 @@ PR and they are the only enforcement there is, so a red pipeline on a fresh PR m
 was skipped, not that CI found something clever.
 
 **If your change touches either published package outside Markdown, write the version plan
-before you open the PR.** `Version Plan Check` fails the PR otherwise.
+before you open the PR.** `Version Plan Check` fails the PR otherwise. The exception is a
+release PR, on a `chore/release-<version>` branch, which consumes the plans and skips the check
+— see CONTRIBUTING.md#publishing.
 
 ## Branch and base
 

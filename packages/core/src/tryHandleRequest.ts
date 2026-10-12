@@ -36,7 +36,8 @@ export type BoundTryHandleRequest = <T = unknown, D = unknown>(
 
 /**
  * Builds the `tryHandleRequest` bound to a specific handler. Called once per
- * plugin during `use()`; plugins receive the result via their context.
+ * `use()` call, and the result is shared by every plugin that call registers,
+ * through its context.
  *
  * Logging happens here rather than in `RequestError`'s constructor so that
  * building or rethrowing an error emits nothing — one failed call produces

@@ -45,9 +45,8 @@ ${finiteNumberFn()}
   local mode = ARGV[3]
   local emptiesBucket = ARGV[4] ~= '0'
 
-  -- Sized against redis TIME, the same clock frozenUntil is written from.
-  -- On the caller's clock, a process running behind sized the key to expire
-  -- BEFORE the freeze it was holding.
+  -- Sized against redis TIME, the same clock frozenUntil is written from: on a
+  -- caller's clock that runs behind, the key would expire before its freeze.
 ${redisNow()}
 
   if mode == 'max' then
@@ -104,12 +103,9 @@ ${redisNow()}
 /**
  * Reads the freeze state and decides, on Redis's clock, in one round trip.
  *
- * `getFreezeState`, `isFrozen` and `canProcessRequest` all answer questions
- * about the same two fields against the same clock, and each fetched TIME
- * separately — `canProcessRequest` twice, because it called `getFreezeState`
- * (which had already read TIME) and then read it again. Three commands for one
- * decision, and the decision was taken against a clock sampled AFTER the state,
- * so it leaned toward "lapsed" by a round trip. One script is one clock.
+ * `getFreezeState`, `isFrozen` and `canProcessRequest` all decide on these two
+ * fields, and one script samples the clock once, beside the state: a TIME read
+ * a round trip later leans every decision toward "lapsed".
  */
 export const readFreezeState = `
   local key = KEYS[1]
@@ -117,8 +113,8 @@ export const readFreezeState = `
 ${finiteNumberFn()}
 ${exactFn()}
   -- An unusable deadline counts as no freeze state at all. A nan parses through
-  -- tonumber and then survives every comparison, which reported a client frozen
-  -- with zero probes owed and no deadline any wake-up could be booked against.
+  -- tonumber and then survives every comparison, which would report a client
+  -- frozen with no deadline any wake-up could be booked against.
   local frozenUntil = finiteNumber(state[1], nil)
   if frozenUntil == nil then return nil end
   local thawRequestCount = finiteNumber(state[2], 0)
@@ -269,8 +265,7 @@ export const hasThawRequestInProgress = `
     local fields = redis.call('HMGET', metadataKey, 'status', 'grantId', 'isThawRequest')
     local status = fields[1]
     -- Normalised exactly as tryStartThawRequest does: HMGET yields false for an
-    -- absent field, and false is not equal to the empty string, so a client-level
-    -- probe went unnoticed here while that script counted it.
+    -- absent field, which is not equal to the '' a client-level probe carries.
     local grantId = fields[2] or ''
     local isThawRequest = fields[3]
 

@@ -203,13 +203,18 @@ export interface RequestHandlerConstructorOptions {
   /** Namespaces every backend key, so one Redis can host several handlers. */
   keyPrefix?: string;
   /**
-   * Configures the built-in client, registered as `"default"` and reachable by
-   * passing that as `clientName` — for requests that belong to no template.
+   * Configures the built-in client, for requests that belong to no template.
+   * It is registered under its own `name`, which is what a request passes as
+   * `clientName`, and its `subClients` are built with it.
    *
-   * **Defaults to a `noLimit` client named `default`**
+   * **Defaults to a `noLimit` client named `"default"`**
    */
   defaultClientOptions?: CreateClientData;
-  /** Election weight for becoming a queue controller; higher wins. */
+  /**
+   * Election weight for becoming a queue controller; higher wins.
+   *
+   * **Default value: 1.** `0` is treated as 1.
+   */
   priority?: number;
 }
 

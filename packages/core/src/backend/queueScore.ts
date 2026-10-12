@@ -22,8 +22,16 @@ export const QUEUE_SCORE_EPOCH_MS = 1767225600000;
  * retries (more first), then arrival (earlier first). Priority and retries are
  * clamped to their bands.
  *
- * @throws {RangeError} for a `timestamp` past the version-1 epoch's range, or
- * a score too large to keep its ordering exact.
+ * Meant for integer arguments: what the request path enqueues. A `timestamp`
+ * before {@link QUEUE_SCORE_EPOCH_MS} is unsupported — it returns a score, but
+ * one whose arrival term reaches into the next retry band, so it can sort
+ * ahead of an entry with one more retry.
+ *
+ * @throws {RangeError} when `timestamp` is {@link QUEUE_RETRY_BAND} ms or more
+ * past the epoch, `Infinity` included, or when the score is not a safe integer:
+ * any `NaN` argument, a fractional `timestamp` or `-Infinity`, and a fractional
+ * `priority` or `retries` whose band arithmetic leaves a fraction (`0.3` does,
+ * `0.5` does not).
  */
 export function calculateQueueScore(
   priority: number,

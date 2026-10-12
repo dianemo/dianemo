@@ -186,7 +186,14 @@ export interface CreateClientData<R extends RateLimitData = RateLimitData> {
   metadata?: { [key: string]: unknown };
   axiosOptions?: CreateAxiosDefaults;
   authentication?: AuthCreateData;
-  /** Inherit this client's endpoint, auth and retry options; override the rest. */
+  /**
+   * Clients built from this one. A sub-client inherits every field of its
+   * parent that it does not declare itself, `rateLimit` included; `metadata`,
+   * `axiosOptions`, `requestOptions` (and its `defaults`) and `retryOptions`
+   * merge key by key rather than being replaced whole. `subClients` is not
+   * inherited. Its name is joined to its parent's with `:`, so `"orders"`
+   * under `"acme"` registers as `"acme:orders"`.
+   */
   subClients?: CreateClientData[];
   probeRequest?: ProbeRequestConfig;
 }
@@ -238,7 +245,7 @@ export type DeclaredRateLimit<R extends RateLimitData = RateLimitData> = R & {
 
 /**
  * One limit once its name has been resolved. This is the shape everything past
- * `createClient` works in — there is no second shape to branch on.
+ * client construction works in — there is no second shape to branch on.
  *
  * Names must match `/^[a-z0-9_]{1,64}$/` and be unique within the client,
  * because they become backend key segments.
@@ -336,7 +343,16 @@ export interface RetryOptions {
   /** Default: 3. */
   maxRetries: number;
   /**
-   * The base number of ms to wait before retrying a server error (5xx) request
+   * The base wait in ms before any retry, scaled by `retryBackoffMethod`: the
+   * attempt number squared for `"exponential"`, the attempt number for
+   * `"linear"`. After a 429, the base is floored at the shortest `interval`
+   * among the client's `requestLimit`s, if it has any.
+   *
+   * Also the base of the client-wide freeze a 429, 5xx or dropped connection
+   * arms, scaled the same way. Only a 429's freeze is floored at the shortest
+   * refill interval — the budget owner's, for a `sharedLimit` client, whose
+   * own retries are not floored — and a zero, negative or `NaN` value bases
+   * the freeze on 1000 ms instead.
    *
    * **Default value: 1000 ms**
    */

@@ -290,6 +290,11 @@ export default class RequestHandler {
    * before its first `await` — and builds the template's stored tenants. A
    * registration that fails then has no caller to reject, so it is logged as
    * an error. Plugin names must be unique across every call.
+   *
+   * @throws {ConfigurationError} `duplicate_plugin` when a name is already
+   * registered on this handler or repeats within the call. Every name is
+   * checked before any plugin is registered, so a refused call registers
+   * nothing.
    */
   public use<const P extends readonly RequestHandlerPlugin[]>(
     ...plugins: P
@@ -417,10 +422,7 @@ export default class RequestHandler {
     this.startupHooksRan = false;
     await startSubscriptions.bind(this)();
 
-    // `generateClients`, not `createClient`: the latter builds exactly one
-    // client and never looks at `subClients`, so sub-clients declared on the
-    // default client were dropped with no warning and no error — a
-    // configuration option that silently did nothing.
+    // Builds the default client's `subClients` too.
     await generateClients.bind(this)([this.defaultClient]);
 
     for (const hook of this.startupHooks) await hook(this);
@@ -761,9 +763,9 @@ export default class RequestHandler {
    * `retryOptions`, freezing the client fleet-wide on each. Rejects with:
    *
    * - `ClientUnavailableError` — `handler_stopping` during `stop()`,
-   *   `handler_stopped` if shutdown failed it while queued, and
-   *   `shared_limit_parent_missing` for a `sharedLimit` client whose owner is
-   *   gone.
+   *   `handler_stopped` if shutdown or the removal of its client failed it
+   *   while queued, and `shared_limit_parent_missing` for a `sharedLimit`
+   *   client whose owner is gone.
    * - `ClientNotFoundError` when no client of that name appears within 5 s.
    * - `ConfigurationError` — `invalid_request_cost`,
    *   `invalid_request_priority`, `invalid_grant_id` or
@@ -773,9 +775,19 @@ export default class RequestHandler {
    *   queued.
    * - `RequestTimeoutError` when it is not admitted within the client's
    *   `requestOptions.cleanupTimeout` (default 60 s).
-   * - `RequestAbortedError` when `config.signal` aborts before dispatch.
+   * - `RequestAbortedError` when `config.signal` aborts before dispatch,
+   *   including after admission while the interceptor or a token refresh runs;
+   *   what the request claimed is handed back. An abort once it is upstream
+   *   reaches axios instead.
+   * - From pre-request auth on an OAuth2 client:
+   *   `GrantRefreshTokenMissingError` for a grant with no stored refresh
+   *   token, `ConfigurationError` `missing_grant_refresh_config` or
+   *   `invalid_token_response`, and the token endpoint's own axios error.
+   * - Anything the client's `requestInterceptor` throws, unchanged.
    * - The axios error itself for an upstream failure that is not retried or
    *   has run out of retries.
+   *
+   * A pre-request failure hands back what admission claimed before it rejects.
    */
   public async handleRequest<TResponse = unknown, TRequestData = unknown>(
     config: RequestConfig<TRequestData>
@@ -821,6 +833,10 @@ export default class RequestHandler {
    * `DIANEMO_AWAIT_CLIENT_TIMEOUT_MS`), so a credential source that never comes up
    * fails a liveness probe rather than hanging. Deliberately more patient than the
    * per-request `waitForClient`, which stays impatient to surface typos.
+   *
+   * @throws {ClientUnavailableError} `client_unavailable` when `timeoutMs`
+   * elapses, and `shutdown_aborted` when `signal` aborts, before or during the
+   * wait.
    */
   public async awaitClient(
     clientName: string,
@@ -1207,8 +1223,9 @@ export default class RequestHandler {
   /**
    * Removes a template instance everywhere: destroys its clients here, failing
    * their parked requests, deletes its stored credentials, settings and OAuth
-   * tokens, and tells every replica to destroy theirs. Starts the handler if
-   * needed. A no-op for an instance that does not exist.
+   * tokens, and tells every replica to destroy theirs. Starts the handler if it
+   * is `"stopped"`; one already starting is not awaited, so this is safe from a
+   * startup hook. A no-op for an instance that does not exist.
    *
    * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
    */

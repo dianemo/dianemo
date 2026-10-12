@@ -311,7 +311,7 @@ export function assertTemplateOptions(
             )}].`
           );
         }
-        // Names resolved first, as `createClient` will: a plan whose two limits
+        // Names resolved first, as `buildClient` will: a plan whose two limits
         // both take the default is a duplicate, and the deploy should say so.
         assertUsableRateLimits(normalizeRateLimit(rateLimit), label);
       }

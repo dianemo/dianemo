@@ -429,9 +429,9 @@ class RedisBackend implements DianemoBackend {
     // Cleared first, so a second close cannot quit the same connection twice.
     const listener = this.listener;
     this.listener = null;
-    // `quit()` sends QUIT and waits for the reply, which never arrives on a
-    // connection that never reached the server — closing after a failed start hung
-    // instead of releasing it. `disconnect()` tears down without a round trip.
+    // `quit()` sends QUIT and waits for a reply that never arrives on a
+    // connection that never reached the server. `disconnect()` tears down
+    // without a round trip.
     if (listener.status === "ready") {
       await listener.quit().catch(() => listener.disconnect());
       return;

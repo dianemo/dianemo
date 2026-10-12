@@ -42,7 +42,7 @@ class SharedLimitClient extends BaseClient {
   }
 
   /**
-   * Refuses the request when the budget owner is gone. `createClient` checks this at
+   * Refuses the request when the budget owner is gone. `buildClient` checks this at
    * registration, but removing the parent afterwards forces this child to `worker`,
    * so nobody drains its queue and every request waits out its admission timeout.
    */

@@ -82,11 +82,11 @@ function tombstoneKey(metadataKeyPrefix: string, requestId: string): string {
  * The score `updateRequest` re-writes, computed as the Lua re-score computes it:
  * the same clamps and the same float arithmetic, and no integer check.
  *
- * Not `calculateQueueScore`, which raises for a fractional priority or an
- * arrival past the retry band. That is right for an add and wrong here, where
- * the fields come back from shared state and the raise would fail the retry
- * being re-scored. Clamping the arrival keeps the entry inside its own band,
- * which is the property ordering depends on.
+ * Not `calculateQueueScore`, which raises for a score that is not a safe
+ * integer or an arrival past the retry band. That is right for an add and
+ * wrong here, where the fields come back from shared state and the raise would
+ * fail the retry being re-scored. Clamping the arrival keeps the entry inside
+ * its own band, which is the property ordering depends on.
  */
 function rescore(priority: number, retries: number, timestamp: number) {
   const p = Math.min(Math.max(priority, 0), MAX_QUEUE_PRIORITY);
@@ -270,8 +270,8 @@ class MemoryBackend implements DianemoBackend {
   }
 
   private expire(key: string, ttlSeconds: number) {
-    // Normalised through the same helper the Redis backend uses. A NaN deadline made
-    // `live()`'s `now >= expiresAt` false forever, so the key never expired at all.
+    // Normalised through the same helper the Redis backend uses, so a TTL
+    // either backend refuses throws here too.
     const ttl = normalizeTtlSeconds(ttlSeconds);
     const entry = this.live(key);
     if (!entry) return;
@@ -540,10 +540,8 @@ class MemoryBackend implements DianemoBackend {
     config: TokenBucketConfig,
     now: number
   ): { tokens: number; lastUpdate: number } {
-    // Parseability, not absence: `Number("")` is 0 and `Number("abc")` is NaN, and a
-    // NaN balance is written back on refusal, so one unparseable byte refused every
-    // later request forever. Finite too, as the Lua's `finiteNumber` reads both: an
-    // `Infinity` lastUpdate otherwise reaches the wait arithmetic as a NaN.
+    // Through the shared parse, not `Number`: an empty, unparseable or
+    // non-finite field reads as absent, as the Lua's `finiteNumber` reads it.
     let tokens = parseFiniteStored(this.hget(key, "tokens"), config.maxTokens);
     let lastUpdate = parseFiniteStored(this.hget(key, "lastUpdate"), now);
 
@@ -1680,6 +1678,11 @@ class MemoryBackend implements DianemoBackend {
     return Date.now();
   }
 
+  /**
+   * Stops the expiry sweep and drops every subscriber. The store is kept, as
+   * the Redis backend keeps its keys: a handler started again on this backend
+   * finds what it stored, and a later write re-arms the sweep.
+   */
   async close(): Promise<void> {
     if (this.sweeper) clearInterval(this.sweeper);
     this.sweeper = null;

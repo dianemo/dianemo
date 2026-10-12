@@ -70,4 +70,24 @@ describe("queue score packing", () => {
   it("clamps retries beyond the band", () => {
     expect(score(1, 999, NOW)).toBe(score(1, MAX_RETRIES, NOW));
   });
+
+  it("throws a RangeError for any NaN argument", () => {
+    expect(() => score(Number.NaN, 0, NOW)).toThrow(RangeError);
+    expect(() => score(1, Number.NaN, NOW)).toThrow(RangeError);
+    expect(() => score(1, 0, Number.NaN)).toThrow(RangeError);
+  });
+
+  it("throws a RangeError for an infinite timestamp of either sign", () => {
+    expect(() => score(1, 0, Infinity)).toThrow(/version-1/);
+    expect(() => score(1, 0, -Infinity)).toThrow(RangeError);
+  });
+
+  it("throws a RangeError for a fractional timestamp", () => {
+    expect(() => score(1, 0, NOW + 0.5)).toThrow(RangeError);
+  });
+
+  it("throws for a fractional priority only when its band leaves a fraction", () => {
+    expect(() => score(0.3, 0, NOW)).toThrow(RangeError);
+    expect(Number.isSafeInteger(score(0.5, 0, NOW))).toBe(true);
+  });
 });

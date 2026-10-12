@@ -1,8 +1,14 @@
 /**
- * Base class for everything this library throws. Carries `statusCode` and `code` so
- * a host can map errors structurally without importing these types — duck-type on
- * those two fields when the handler and the catch site may resolve to different
- * copies of the package. See docs/concepts.md#errors.
+ * Base class for the errors the handler raises about its own state and
+ * configuration. Carries `statusCode` and `code` so a host can map errors
+ * structurally without importing these types — duck-type on those two fields
+ * when the handler and the catch site may resolve to different copies of the
+ * package. See docs/concepts.md#errors.
+ *
+ * Not everything that reaches a caller extends it: {@link RequestError} (from
+ * `tryHandleRequest`) does not, an upstream failure arrives as the axios error
+ * itself, and the backend helpers and backends throw a plain `RangeError` for
+ * an unusable TTL, score or lock argument.
  */
 export class RequestHandlerError extends Error {
   constructor(
@@ -26,7 +32,12 @@ export class ClientNotFoundError extends RequestHandlerError {
   }
 }
 
-/** A client with this name is already registered. */
+/**
+ * A client with this name is already registered.
+ *
+ * Effectively unreachable: building a client whose name is taken replaces the
+ * registered one rather than conflicting with it. Kept because it is exported.
+ */
 export class ClientConflictError extends RequestHandlerError {
   constructor(clientName: string) {
     super(
@@ -40,7 +51,14 @@ export class ClientConflictError extends RequestHandlerError {
 /**
  * The handler was constructed or driven with unusable configuration — a
  * template name containing `:`, a duplicate plugin registration, a missing
- * backend. Always a programming error, never a runtime condition.
+ * backend. `code` names which.
+ *
+ * Mostly a programming error caught on arrival, but not only. Some codes
+ * arise at runtime from what a vendor or shared state hands back:
+ * `invalid_token_response` for a token response with no usable
+ * `access_token`, `unusable_rate_limit` when the backend cannot claim from a
+ * client's budgets, and `invalid_request_cost` for an unspendable cost read
+ * back out of the shared queue.
  */
 export class ConfigurationError extends RequestHandlerError {
   constructor(code: string, message: string) {
@@ -59,7 +77,13 @@ export class RequestTimeoutError extends RequestHandlerError {
   }
 }
 
-/** Every retry attempt failed without producing a response. */
+/**
+ * The retry loop ended without a response or an error to rethrow.
+ *
+ * When retries run out normally the last axios error is rethrown instead, so
+ * this is reachable only with an unusable `retryOptions.maxRetries`, such as
+ * `NaN`, that ends the loop before any attempt is judged final.
+ */
 export class NoResponseError extends RequestHandlerError {
   constructor() {
     super(500, "no_response", "No response received after maximum retries.");
@@ -68,8 +92,19 @@ export class NoResponseError extends RequestHandlerError {
 
 /**
  * A client did not become available in time, or the wait was cancelled by
- * shutdown. Distinct from `ClientNotFoundError`: this is a transient
- * availability problem, not a misconfigured name.
+ * shutdown or removal. Distinct from `ClientNotFoundError`: this is a transient
+ * availability problem, not a misconfigured name. `code` is one of:
+ *
+ * - `client_unavailable` — `awaitClient` timed out.
+ * - `shutdown_aborted` — the `signal` passed to `awaitClient` aborted.
+ * - `handler_stopping` — a request or template mutation arrived during
+ *   `stop()`.
+ * - `handler_stopped` — a queued request was failed because the handler
+ *   stopped or its client was removed.
+ * - `client_removed` — grant tokens were stored for a client that was removed
+ *   before or during the write; nothing is left stored.
+ * - `shared_limit_parent_missing` — a `sharedLimit` client's budget owner is
+ *   no longer registered.
  */
 export class ClientUnavailableError extends RequestHandlerError {
   constructor(code: string, message: string) {
@@ -115,11 +150,14 @@ export class RequestCostExceedsBudgetError extends RequestHandlerError {
 }
 
 /**
- * The caller's `AbortSignal` fired while the request was queued.
+ * The caller's `AbortSignal` fired before the request was dispatched: while it
+ * was queued, or after admission while the `requestInterceptor` or a token
+ * refresh ran. Whatever it had claimed is handed back.
  *
- * Raised instead of letting the request wait for capacity it will never use:
- * being admitted first would spend a token or a concurrency slot on a request
- * that axios then rejects anyway.
+ * Raised instead of letting the request wait for capacity it will never use,
+ * or spend a token or a concurrency slot on a request axios would then refuse.
+ * An abort once the request is upstream reaches axios and rejects with its
+ * own cancellation error.
  */
 export class RequestAbortedError extends RequestHandlerError {
   constructor(requestId: string) {

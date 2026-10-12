@@ -390,6 +390,27 @@ describe("a rebuild whose new config cannot be built", () => {
 // ---- sub-clients
 
 describe("a sub-client", () => {
+  it("is registered when declared on the default client", async () => {
+    const handler = new RequestHandler({
+      key: KEY,
+      backend: memoryBackend(),
+      keyPrefix: "dsc",
+      defaultClientOptions: {
+        name: "default",
+        rateLimit: PER_SECOND(5),
+        subClients: [{ name: "bulk" }],
+      },
+    });
+    try {
+      await handler.start();
+      expect(handler.getMetadata().registeredClients).toEqual(
+        expect.arrayContaining(["default", "default:bulk"])
+      );
+    } finally {
+      await handler.stop();
+    }
+  });
+
   it("uses its parent's httpAgent as the same object", async () => {
     const upstream = await startAuthServer();
     let connections = 0;

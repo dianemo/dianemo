@@ -3,11 +3,9 @@ import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 
 /**
- * One script, so the read, the merge, the write and the TTL cannot be split.
- *
- * This was three round trips with an `await now()` in the middle, and "take the
- * larger" cannot be layered on a separate read at all: two arms would both read
- * the old value and the loser would still win the write.
+ * One script, so the read, the merge, the write and the TTL cannot be split:
+ * "take the larger" cannot be layered on a separate read, because two arms
+ * would both read the old value and the loser would still win the write.
  */
 async function writeFreezeState(
   ctx: Ctx,

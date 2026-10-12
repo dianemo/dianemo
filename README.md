@@ -129,7 +129,7 @@ The manual lives in [`docs/`](docs/README.md).
 | Package                                            | What it is                                                                                     |
 | -------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | [`@dianemo/core`](packages/core)                   | The handler, the plugin system, and the in-memory backend. Depends only on `axios` and `@opentelemetry/api`. |
-| [`@dianemo/backend-redis`](packages/backend-redis) | Redis backend. Also covers Valkey and DragonflyDB, which are wire-compatible.                  |
+| [`@dianemo/backend-redis`](packages/backend-redis) | Redis backend. Also covers Valkey, which is wire-compatible.                                   |
 
 Integrations are published separately, one package per vendor, from
 [dianemo-plugins](https://github.com/vivo-us/dianemo-plugins) — FedEx, UPS, Shopify, Stripe, Amazon
@@ -158,7 +158,7 @@ fix to the Redis backend does not bump core.
 
 ```
 packages/core            @dianemo/core            interface + memory backend
-packages/backend-redis   @dianemo/backend-redis   Redis/Valkey/DragonflyDB backend
+packages/backend-redis   @dianemo/backend-redis   Redis/Valkey backend
 ```
 
 ```bash

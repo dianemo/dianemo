@@ -34,10 +34,12 @@ process count is not exactly one, or might not stay exactly one, use this packag
 It is also a fine choice for a single process. Being wrong in this direction costs one Redis
 connection; being wrong in the other direction costs your API access.
 
-## Valkey, DragonflyDB and friends
+## Valkey and DragonflyDB
 
-Both are wire-compatible with Redis, so no separate adapter exists or is needed — construct their
-connection with `ioredis` and pass it to `redisBackend()` unchanged.
+Valkey is wire-compatible with Redis, so no separate adapter exists or is needed — construct its
+connection with `ioredis` and pass it to `redisBackend()` unchanged. DragonflyDB is not a drop-in:
+some scripts touch keys they do not declare, which it refuses by default. See
+[the backend page](https://github.com/vivo-us/dianemo/blob/master/docs/backends/redis.md#valkey-and-dragonflydb).
 
 ## You own the connection
 

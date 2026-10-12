@@ -65,8 +65,8 @@ npm install @dianemo/plugin-kit
 
 `plugin-kit` ships from the plugins repo rather than this one, so its releases
 trail core's. `@dianemo/plugin-kit@1.0.0` declares a peer range of
-`@dianemo/core ^1.0.0`, and a core major outside that range needs a plugin-kit
-release that accepts it before the two install side by side. The `definePlugin`
+`@dianemo/core ^1.0.0`, so it will not install beside core 2.0 until a
+plugin-kit release widens that range. The `definePlugin`
 form above is in `@dianemo/core` and always available, so reach for it if the
 install fails — the two differ only in how `tryHandleRequest` arrives.
 

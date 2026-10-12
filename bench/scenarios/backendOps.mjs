@@ -6,8 +6,8 @@ import { Redis } from "ioredis";
 /**
  * Coordination cost with no HTTP in the path.
  *
- * Runs both backends regardless of `--backend`, because a one-sided number
- * answers nothing. See docs/benchmarks.md for why the other scenarios cannot
+ * Runs the memory backend always and Redis whenever `REDIS_URL` is set,
+ * regardless of `--backend`, because a one-sided number answers nothing. See docs/benchmarks.md for why the other scenarios cannot
  * tell the backends apart.
  */
 const OPS = 20_000;

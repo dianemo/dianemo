@@ -80,8 +80,9 @@ second pod, a `pm2 -i 2` — switch to a distributed backend.** That is not an o
 only thing that makes the limit real. If you are unsure, use Redis: being wrong in that direction
 costs one connection, and being wrong in the other direction costs your API access.
 
-Anything wire-compatible with Redis works unchanged — **Valkey** and **DragonflyDB** both speak the
-same protocol, so `redisBackend()` takes their connections as-is.
+**Valkey** works unchanged, since it speaks the same protocol: `redisBackend()` takes its connection
+as-is. **DragonflyDB** refuses some of the backend's scripts by default; see
+[the Redis backend page](https://github.com/vivo-us/dianemo/blob/master/docs/backends/redis.md#valkey-and-dragonflydb).
 
 [Full comparison](https://github.com/vivo-us/dianemo/blob/master/docs/backends/README.md)
 

@@ -43,7 +43,7 @@ library and it is not a performance knob.
 
 - [Choosing a backend](backends/README.md) — start here
 - [Memory backend](backends/memory.md) — single process **only**
-- [Redis backend](backends/redis.md) — anything larger, plus Valkey/DragonflyDB
+- [Redis backend](backends/redis.md) — anything larger, plus Valkey
 
 ## Integrations
 

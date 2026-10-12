@@ -13,8 +13,9 @@ that fits rather than working from memory:
   backends, error classes and their `code` strings, where shared code lives.
 - **`pre-commit-checks`** — the full command sequence, what each command does *not* cover,
   and the two ways a green local run differs from CI.
-- **`pull-requests`** — title format, branch naming, the body shape this repo uses, and the
-  version plan CI demands.
+- **`pull-requests`** — title format, branch naming, the body shape this repo uses, the
+  version plan CI demands, and why a PR body is never hard-wrapped and stays under 5,000
+  characters.
 
 ## Comments — read `CONTRIBUTING.md` before adding one
 

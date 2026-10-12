@@ -135,6 +135,8 @@ interface Ctx {
   /** Every `requestDone` this client published, in order. */
   completions: () => RequestDoneData[];
   bucket: (grantId?: string) => Promise<{ tokens: number }>;
+  /** Hands `cost` back to the bucket under its freeze, as an unsent claim is. */
+  refund: (cost: number) => Promise<void>;
   freeze: (grantId?: string) => Promise<{
     frozenUntil: number;
     thawRequestCount: number;
@@ -246,7 +248,7 @@ async function withClient(
     (() => [
       {
         name: CLIENT,
-        rateLimit: { type: "requestLimit", ...options.rateLimit },
+        rateLimit: [{ type: "requestLimit", ...options.rateLimit }],
         ...options.client,
         requestOptions: {
           ...(options.client?.requestOptions as object),
@@ -276,7 +278,20 @@ async function withClient(
       enqueues: () => enqueues,
       completions: () => [...completions],
       bucket: (grantId) =>
-        raw.getTokenBucketState(grantPath(grantId, "rateLimit"), config),
+        // Every limit is named internally, and a client declaring one is given
+        // the default name — so its bucket lives one segment deeper than the
+        // freeze state beside it.
+        raw.getTokenBucketState(
+          grantPath(grantId, "rateLimit:default"),
+          config
+        ),
+      refund: (cost) =>
+        raw.refundTokens!(
+          grantPath(undefined, "rateLimit:default"),
+          cost,
+          config.maxTokens,
+          grantPath(undefined, "freezeState")
+        ),
       freeze: (grantId) =>
         raw.getFreezeState(grantPath(grantId, "freezeState")),
       frozenGrants: () => raw.smembers(`${base}:frozenGrants`),
@@ -333,27 +348,14 @@ async function waitFor(
 
 describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
   /**
-   * The retry wait and the freeze are paid once between them, not stacked.
-   *
-   * `requestLimit` is the only type where the question is decidable: its retry
-   * wait honours the configured back-off for a non-429 failure while its freeze
-   * is floored at the refill interval, so the two are genuinely different
-   * numbers. Everywhere else they read the same field.
-   *
-   * Both windows open at the moment of refusal, so the caller owes the LARGER of
-   * the two. A change that made the local wait run after the freeze rather than
-   * inside it would double every 5xx retry's latency and pass every other
-   * assertion in this suite. Deliberately far apart — overlapping costs ~2500ms,
-   * stacking ~4500ms — because an earlier draft using interval 3000 / base 200
-   * left only 200ms between the two hypotheses and was measuring the machine.
+   * Both windows open at the moment of refusal, so the caller owes the larger
+   * of its own retry wait and the fleet's freeze, not their sum. Deliberately
+   * long, so overlapping (~2000ms) and stacking (~4000ms) cannot be confused.
    */
   it("pays the retry wait and the freeze once, not twice", async () => {
     const upstream = await startScriptedUpstream();
-    const INTERVAL = 2500;
     const BACKOFF = 2000;
     try {
-      // 503, not 429: for a rate-limit response the retry wait is floored at the
-      // interval too, which makes the two numbers equal and the question moot.
       upstream.onlyOnce("/pay", 503);
       await withClient(
         harness,
@@ -361,7 +363,7 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
         {
           rateLimit: {
             type: "requestLimit",
-            interval: INTERVAL,
+            interval: 250,
             tokensToAdd: 100,
             maxTokens: 100,
           },
@@ -381,10 +383,8 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
 
           expect(result.status).toBe(200);
           expect(upstream.calls("/pay")).toBe(2);
-          // The freeze is the longer of the two, so it sets the floor.
-          expect(elapsed).toBeGreaterThanOrEqual(INTERVAL - 150);
-          // And it is not charged on top of the local wait.
-          expect(elapsed).toBeLessThan(INTERVAL + BACKOFF - 500);
+          expect(elapsed).toBeGreaterThanOrEqual(BACKOFF - 150);
+          expect(elapsed).toBeLessThan(2 * BACKOFF - 500);
         },
         "rlpay"
       );
@@ -533,7 +533,11 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
       await run(
         {
           rateLimit: { interval: 250, tokensToAdd: 5, maxTokens: 5 },
-          client: { retryOptions: { maxRetries: 2, retryBackoffBaseTime: 20 } },
+          // Long enough for the freeze, which now takes this back-off, to be
+          // observed before it lapses.
+          client: {
+            retryOptions: { maxRetries: 2, retryBackoffBaseTime: 400 },
+          },
         },
         async (ctx) => {
           const inFlight = send(ctx.handler, url);
@@ -828,12 +832,14 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
       (() => [
         {
           name: CLIENT,
-          rateLimit: {
-            type: "requestLimit",
-            interval: 30_000,
-            tokensToAdd: 1,
-            maxTokens: 1,
-          },
+          rateLimit: [
+            {
+              type: "requestLimit",
+              interval: 30_000,
+              tokensToAdd: 1,
+              maxTokens: 1,
+            },
+          ],
           requestOptions: { defaults: { baseURL: upstream.baseURL } },
         },
       ]) as never
@@ -1331,8 +1337,7 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
    * `pending` — which wakes the drain loop — and then flipped it to `pending` a
    * second time. The flip landed after the loop had claimed it, un-claiming a
    * request mid-admission, and the next pass claimed and paid for the very same
-   * request again. Nothing gave that token back: `requestLimit` overrides
-   * neither `releaseAdmission` nor `handleOwnTypeRequestDone`.
+   * request again, and nothing gave that token back.
    *
    * The vendor never saw extra traffic — the leak cost throughput, not
    * politeness — but on a `tokensToAdd: 1` client every retried request quietly
@@ -1423,12 +1428,14 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
           `rls:requestHandler:rateLimitUpdated`,
           JSON.stringify({
             clientName: CLIENT,
-            rateLimit: {
-              type: "requestLimit",
-              interval: 500,
-              tokensToAdd: 4,
-              maxTokens: 4,
-            },
+            rateLimit: [
+              {
+                type: "requestLimit",
+                interval: 500,
+                tokensToAdd: 4,
+                maxTokens: 4,
+              },
+            ],
             source: "operator",
             publisherInstanceId: "operator-console",
           })
@@ -1466,6 +1473,7 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
   it("does not let a failed bucket reset escape as an unhandled rejection", async () => {
     const escaped: unknown[] = [];
     const record = (error: unknown) => escaped.push(error);
+    let injected = 0;
     process.on("unhandledRejection", record);
     try {
       upstream.code("/hiccup", 429);
@@ -1478,7 +1486,11 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
           // Only the bucket reset fails. What happens to the rest of the
           // freeze is the implementation's business; what must not happen is
           // a rejection nobody owns.
-          failHsetOn: (key) => key.endsWith(":rateLimit"),
+          failHsetOn: (key) => {
+            const hit = key.endsWith(":rateLimit:default");
+            if (hit) injected++;
+            return hit;
+          },
         },
         async (ctx) => {
           await sendCatching(ctx.handler, "/hiccup");
@@ -1488,28 +1500,20 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
     } finally {
       process.off("unhandledRejection", record);
     }
+    // Counted, so a change to the key layout cannot turn this into a test of
+    // nothing: the reset must actually have failed.
+    expect(injected).toBeGreaterThan(0);
     // One "backend unavailable (injected)" rejection with no handler, before
     // the fix — which under Node's default policy ends the process.
     expect(escaped).toHaveLength(0);
   }, 30_000);
 
   /**
-   * A 5xx or a dropped socket is not a budget problem, so it is backed off by
-   * the time the operator configured.
-   *
-   * `getRetryBackoffBaseTime` used to return `max(interval, base)` for every
-   * failure. That floor is honest only after a 429, which empties the bucket —
-   * for an upstream failure the bucket is untouched, and flooring at the
-   * interval stopped the whole fleet for a full window over one bad response.
-   * On a client transcribing an hourly vendor limit literally, one 502 stopped
-   * it for an hour.
-   *
-   * Read off the `requestDone` payload rather than timed, because the two
-   * durations are now different numbers and only the payload separates them:
-   * `waitTime` is this request's own back-off, `freezeTime` is how long the
-   * fleet stands down. Wall-clock latency conflates them with the next refill.
+   * Read off the `requestDone` payload rather than timed: `waitTime` is this
+   * request's own back-off and `freezeTime` how long the fleet stands down, and
+   * wall-clock latency conflates them with the next refill.
    */
-  it("backs a 502 off by the configured base time, not the refill interval", async () => {
+  it("backs a 502 and its freeze off by the configured base time, not the refill interval", async () => {
     upstream.onlyOnce("/coarse", 502);
     await run(
       {
@@ -1521,15 +1525,9 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
         const failure = ctx
           .completions()
           .find((done) => done.httpStatus === 502);
-        // A 5xx is still a fleet-wide statement about the upstream...
         expect(failure?.freezeClient).toBe(true);
         expect(failure?.isRateLimited).toBe(false);
-        // ...so the freeze it arms still outlasts a refill, because freezing is
-        // what emptied the bucket...
-        expect(failure?.freezeTime).toBe(400);
-        // ...but this request's own back-off is the 20ms that was configured.
-        // Charging it a refill interval was the defect: the bucket had a full
-        // twenty tokens and the upstream, not the budget, was the problem.
+        expect(failure?.freezeTime).toBe(20);
         expect(failure?.waitTime).toBe(20);
       }
     );
@@ -1685,7 +1683,7 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
         // An explicit balance, because an untouched bucket initialises itself to
         // `maxTokens` — which after the raise below would be enough to admit the
         // head, and this test is about pricing it, not about serving it.
-        await ctx.backend.resetTokenBucket(`${base}:rateLimit`, 5);
+        await ctx.backend.resetTokenBucket(`${base}:rateLimit:default`, 5);
         await ctx.backend.addRequest(queueKey, prefix, {
           requestId: "skipped",
           clientName: CLIENT,
@@ -1705,7 +1703,7 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
               string,
               {
                 processRequests: () => Promise<void>;
-                rateLimit: Record<string, unknown>;
+                rateLimit: Record<string, unknown>[];
               }
             >;
           }
@@ -1720,12 +1718,15 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
 
         // Same client, same entry, a ceiling that now fits. One more pass is all
         // that should be needed for the head to be considered again.
-        client.rateLimit = {
-          type: "requestLimit",
-          interval: 60_000,
-          tokensToAdd: 5,
-          maxTokens: 20,
-        };
+        client.rateLimit = [
+          {
+            name: "default",
+            type: "requestLimit",
+            interval: 60_000,
+            tokensToAdd: 5,
+            maxTokens: 20,
+          },
+        ];
         await client.processRequests();
         // Priced, not admitted: 9 against the 5 tokens in the bucket is still a
         // decline. Reaching the bucket at all is the property.
@@ -1921,5 +1922,215 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
         );
       }
     );
+  }, 30_000);
+
+  it("leaves the bucket untouched when a 5xx freezes the client", async () => {
+    upstream.onlyOnce("/unavailable", 503);
+    await run(
+      {
+        rateLimit: { interval: 60_000, tokensToAdd: 5, maxTokens: 5 },
+        client: {
+          retryOptions: { maxRetries: 0, retryBackoffBaseTime: 2_000 },
+        },
+      },
+      async (ctx) => {
+        const failure = await sendCatching(ctx.handler, "/unavailable");
+        expect(failure?.response?.status).toBe(503);
+        const froze = await waitFor(async () => {
+          const state = await ctx.freeze();
+          return !!state && state.frozenUntil > Date.now();
+        }, 2_000);
+        expect(froze).toBe(true);
+        // Only the failed request's own token is spent: the upstream was down,
+        // which says nothing about how much budget is left.
+        expect((await ctx.bucket()).tokens).toBe(4);
+      }
+    );
+  }, 30_000);
+
+  it("still refunds an unsent claim while a 5xx freeze stands", async () => {
+    upstream.onlyOnce("/refund.5xx", 503);
+    await run(
+      {
+        rateLimit: { interval: 60_000, tokensToAdd: 5, maxTokens: 5 },
+        client: {
+          retryOptions: { maxRetries: 0, retryBackoffBaseTime: 2_000 },
+        },
+      },
+      async (ctx) => {
+        await sendCatching(ctx.handler, "/refund.5xx");
+        expect(await waitFor(async () => !!(await ctx.freeze()), 2_000)).toBe(
+          true
+        );
+        // The 5xx left the bucket alone, so a token handed back under it is a
+        // token the budget really has.
+        await ctx.refund(1);
+        expect((await ctx.bucket()).tokens).toBe(5);
+      }
+    );
+  }, 30_000);
+
+  it("refuses to refund into a bucket a 429 freeze emptied", async () => {
+    upstream.onlyOnce("/refund.429", 429);
+    await run(
+      {
+        rateLimit: { interval: 60_000, tokensToAdd: 5, maxTokens: 5 },
+        client: { retryOptions: { maxRetries: 0, retryBackoffBaseTime: 20 } },
+      },
+      async (ctx) => {
+        await sendCatching(ctx.handler, "/refund.429");
+        expect(
+          await waitFor(async () => (await ctx.bucket()).tokens === 0, 2_000)
+        ).toBe(true);
+        await ctx.refund(1);
+        expect((await ctx.bucket()).tokens).toBe(0);
+      }
+    );
+  }, 30_000);
+
+  it("does not let cheaper, lower-priority work overtake a grant-scoped head on a shared budget", async () => {
+    await run(
+      { rateLimit: { interval: 1_500, tokensToAdd: 5, maxTokens: 5 } },
+      async (ctx) => {
+        const order: string[] = [];
+        const fire = (url: string, extra: Record<string, unknown>) =>
+          send(ctx.handler, url, extra).then(() => order.push(url));
+        await Promise.all([1, 2, 3, 4].map(() => fire("/ord.warm", {})));
+        order.length = 0;
+
+        const expensive = fire("/ord.expensive", {
+          grantId: "g1",
+          cost: 5,
+          priority: 9,
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        const cheap = fire("/ord.cheap", { cost: 1, priority: 0 });
+        await Promise.all([expensive, cheap]);
+
+        expect(order).toEqual(["/ord.expensive", "/ord.cheap"]);
+      }
+    );
+  }, 30_000);
+});
+
+describe.each(harnesses(10))("requestLimit thaw probing — $name", (harness) => {
+  it("probes one request at a time on a shared client, whatever grants the queue holds", async () => {
+    let calls = 0;
+    let inFlight = 0;
+    let peak = 0;
+    const server = createServer(async (_req, res) => {
+      calls++;
+      if (calls === 1) {
+        res.writeHead(429);
+        res.end();
+        return;
+      }
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 300));
+      inFlight--;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("{}");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    try {
+      await withClient(
+        harness,
+        `http://127.0.0.1:${port}`,
+        {
+          rateLimit: { interval: 300, tokensToAdd: 10, maxTokens: 10 },
+          client: {
+            retryOptions: {
+              maxRetries: 0,
+              retryBackoffBaseTime: 300,
+              thawRequestCount: 10,
+            },
+            requestOptions: { cleanupTimeout: 10_000 },
+          },
+        },
+        async (ctx) => {
+          await sendCatching(ctx.handler, "/thaw.limited");
+          await new Promise((r) => setTimeout(r, 30));
+          const results = await Promise.all(
+            [1, 2, 3, 4, 5].map((i) =>
+              send(ctx.handler, "/thaw.probe", { grantId: `g${i}` })
+            )
+          );
+          expect(results.every((res) => res.status === 200)).toBe(true);
+          expect(peak).toBe(1);
+        },
+        "rlthaw"
+      );
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 30_000);
+});
+
+describe.each(harnesses(10))("requestLimit shutdown — $name", (harness) => {
+  it("leaves no freeze timer behind when a 429 lands while stop() waits on it", async () => {
+    const server = createServer(async (_req, res) => {
+      await new Promise((r) => setTimeout(r, 300));
+      res.writeHead(429);
+      res.end();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    const { backend, cleanup } = await harness.create();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend,
+      keyPrefix: "rlstop",
+    });
+    try {
+      await handler.registerClientTemplate(
+        "rl" as never,
+        (() => [
+          {
+            name: CLIENT,
+            rateLimit: [
+              {
+                type: "requestLimit",
+                maxTokens: 10,
+                tokensToAdd: 10,
+                interval: 4_000,
+              },
+            ],
+            retryOptions: { maxRetries: 0, retryBackoffBaseTime: 100 },
+            requestOptions: {
+              defaults: { baseURL: `http://127.0.0.1:${port}` },
+            },
+          },
+        ]) as never
+      );
+      handler.setDrainTimeout(200);
+      await handler.start();
+      await handler.addTemplateClient(
+        "rl" as never,
+        { instanceId: "a" } as never
+      );
+      const client = (
+        handler as unknown as {
+          clients: Map<string, { freezeTimers: Set<unknown> }>;
+        }
+      ).clients.get(CLIENT)!;
+
+      const inFlight = sendCatching(handler, "/stop.limited");
+      await new Promise((r) => setTimeout(r, 50));
+      await handler.stop();
+      await inFlight;
+      // The completion's cleanup runs after the caller is answered.
+      await new Promise((r) => setTimeout(r, 200));
+      expect(client.freezeTimers.size).toBe(0);
+    } finally {
+      await handler.stop().catch(() => undefined);
+      await cleanup();
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
   }, 30_000);
 });

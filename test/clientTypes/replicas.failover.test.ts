@@ -1,7 +1,7 @@
 import type { DianemoBackend } from "../../packages/core/src/backend/types.js";
+import { createServer, globalAgent, type ServerResponse } from "node:http";
 import type RequestHandler from "../../packages/core/src/index.js";
 import { fire, startUpstream, withReplicas } from "./harness.js";
-import { createServer, type ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
 import { Redis } from "ioredis";
 
@@ -325,7 +325,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           clients: [
             {
               name: "remote-done",
-              rateLimit: { type: "concurrencyLimit", maxConcurrency: 1 },
+              rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 1 }],
             },
           ],
           redisDb: REDIS_DB,
@@ -369,7 +369,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           clients: [
             {
               name: "fo1",
-              rateLimit: { type: "concurrencyLimit", maxConcurrency: 2 },
+              rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 2 }],
             },
           ],
           redisDb: REDIS_DB,
@@ -435,8 +435,15 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
   }, 90_000);
 
   it("does not hand the survivor a fresh token budget when the controller dies", async () => {
-    const upstream = await startUpstream(0);
+    // The whole budget is admitted at once. Uncapped, its 200 connects overflow
+    // a listen backlog clamped by `kern.ipc.somaxconn` (128 on macOS) and the
+    // excess fail with ECONNRESET, each having spent a token. axios's Node
+    // adapter uses the global agent when the client configures none. The delay
+    // keeps the drain going long enough for the kill to land inside it.
+    const upstream = await startUpstream(50);
     const raw = new Redis(`${REDIS_URL}/${REDIS_DB}`);
+    const maxSockets = globalAgent.maxSockets;
+    globalAgent.maxSockets = 32;
     try {
       await withReplicas(
         {
@@ -450,12 +457,14 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
               // budget is large so that draining it takes long enough for the
               // kill below to land while the controller is still admitting.
               name: "fo2",
-              rateLimit: {
-                type: "requestLimit",
-                maxTokens: 200,
-                tokensToAdd: 200,
-                interval: 60_000,
-              },
+              rateLimit: [
+                {
+                  type: "requestLimit",
+                  maxTokens: 200,
+                  tokensToAdd: 200,
+                  interval: 60_000,
+                },
+              ],
             },
           ],
           redisDb: REDIS_DB,
@@ -506,10 +515,11 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           expect(tally.ok).toBe(served);
 
           const stats = await worker.getClientStats(client);
-          expect(stats.rateLimit).toMatchObject({ tokens: 0 });
+          expect(stats.rateLimit[0]).toMatchObject({ tokens: 0 });
         }
       );
     } finally {
+      globalAgent.maxSockets = maxSockets;
       await raw.quit();
       await upstream.close();
     }
@@ -525,12 +535,14 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           clients: [
             {
               name: "fo3",
-              rateLimit: {
-                type: "requestLimit",
-                maxTokens: 4,
-                tokensToAdd: 4,
-                interval: 60_000,
-              },
+              rateLimit: [
+                {
+                  type: "requestLimit",
+                  maxTokens: 4,
+                  tokensToAdd: 4,
+                  interval: 60_000,
+                },
+              ],
             },
           ],
           redisDb: REDIS_DB,
@@ -582,7 +594,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           clients: [
             {
               name: "fo4",
-              rateLimit: { type: "concurrencyLimit", maxConcurrency: 2 },
+              rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 2 }],
             },
           ],
           redisDb: REDIS_DB,
@@ -632,12 +644,14 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
               // survival of the queue entry is measured while the budget is
               // still empty, and the request is then served on the refill.
               name: "fo5",
-              rateLimit: {
-                type: "requestLimit",
-                maxTokens: 1,
-                tokensToAdd: 1,
-                interval: 4000,
-              },
+              rateLimit: [
+                {
+                  type: "requestLimit",
+                  maxTokens: 1,
+                  tokensToAdd: 1,
+                  interval: 4000,
+                },
+              ],
             },
           ],
           redisDb: REDIS_DB,
@@ -724,12 +738,14 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
               // A refill soon enough that the controller admits the dead
               // owner's request during the test.
               name: "fo6",
-              rateLimit: {
-                type: "requestLimit",
-                maxTokens: 1,
-                tokensToAdd: 1,
-                interval: 1200,
-              },
+              rateLimit: [
+                {
+                  type: "requestLimit",
+                  maxTokens: 1,
+                  tokensToAdd: 1,
+                  interval: 1200,
+                },
+              ],
             },
           ],
           redisDb: REDIS_DB,
@@ -819,7 +835,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
               // One at a time, so "the survivor got the capacity" and "the cap
               // was not exceeded" are both single-request questions.
               name: "fo10",
-              rateLimit: { type: "concurrencyLimit", maxConcurrency: 1 },
+              rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 1 }],
             },
           ],
           redisDb: REDIS_DB,
@@ -837,7 +853,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           if (!controller) return;
           const worker = workersFor(client)[0];
           const namespace = controller.getNamespace();
-          const slotsKey = `${namespace}:${client}:concurrency`;
+          const slotsKey = `${namespace}:${client}:concurrency:default`;
           const queueKey = queueKeyFor(controller, client);
 
           const fireTo = (handler: RequestHandler, url: string) =>
@@ -906,11 +922,21 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           );
           // The upstream never saw two at once.
           expect(upstream.peakInFlight()).toBe(1);
-          // B's orphaned entry is gone. C's is NOT: it is deliberately still
-          // open at the upstream, and an admitted request keeps its queue entry
-          // while it runs — asserting an empty queue here measured C rather than
-          // the reclamation this test is about.
-          expect(await raw.zrange(queueKey, 0, -1)).not.toContain(requestId);
+          // B's orphaned entry is reclaimed. C's is NOT: it is deliberately
+          // still open at the upstream, and an admitted request keeps its queue
+          // entry while it runs — asserting an empty queue here would measure C
+          // rather than the reclamation this test is about.
+          //
+          // Awaited rather than sampled: `forceOrphanCleanup` publishes, and the
+          // sweep it wakes runs on the controller's own schedule. Reading the
+          // queue at one instant asserts *when* cleanup ran, which is not a
+          // property this library offers — only that it does.
+          await waitFor(
+            "B's orphaned entry to be reclaimed",
+            async () => !(await raw.zrange(queueKey, 0, -1)).includes(requestId)
+          );
+          // And C's survives it, which is the half a blanket sweep would break.
+          expect(await raw.zrange(queueKey, 0, -1)).toHaveLength(1);
 
           upstream.release();
           await c;
@@ -946,7 +972,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
               // One at a time, so a second open request at the upstream is
               // over-admission with nothing to argue about.
               name: "fo9",
-              rateLimit: { type: "concurrencyLimit", maxConcurrency: 1 },
+              rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 1 }],
             },
           ],
           redisDb: REDIS_DB,
@@ -1026,7 +1052,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           clients: [
             {
               name: "fo8",
-              rateLimit: { type: "concurrencyLimit", maxConcurrency: 2 },
+              rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 2 }],
             },
           ],
           redisDb: REDIS_DB,
@@ -1039,7 +1065,7 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           if (!controller) return;
           const worker = workersFor(client)[0];
           const namespace = controller.getNamespace();
-          const concurrencyKey = `${namespace}:${client}:concurrency`;
+          const concurrencyKey = `${namespace}:${client}:concurrency:default`;
           const queueKey = queueKeyFor(controller, client);
 
           const tally = { ok: 0, failed: 0, statuses: [] as number[] };
@@ -1091,6 +1117,252 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
     }
   }, 90_000);
 
+  it("announces a worker-owned completion a bounded number of times", async () => {
+    const upstream = await startUpstream(0);
+    const raw = new Redis(`${REDIS_URL}/${REDIS_DB}`);
+    const sub = new Redis(`${REDIS_URL}/${REDIS_DB}`);
+    try {
+      await withReplicas(
+        {
+          count: 2,
+          baseURL: upstream.baseURL,
+          clients: [
+            {
+              name: "fo9",
+              rateLimit: [
+                {
+                  type: "requestLimit",
+                  maxTokens: 10,
+                  tokensToAdd: 10,
+                  interval: 1000,
+                },
+              ],
+              healthCheckIntervalMs: 200,
+            },
+          ],
+          redisDb: REDIS_DB,
+          keyPrefix: "fo9",
+        },
+        async ({ workersFor }) => {
+          const client = "fo9:_:a";
+          const worker = workersFor(client)[0];
+          const announced: string[] = [];
+          await sub.subscribe(`${worker.getNamespace()}:requestDone`);
+          sub.on("message", (_channel, message) =>
+            announced.push(JSON.parse(message).requestId)
+          );
+
+          expect((await fire(worker, client)).status).toBe(200);
+          // Fifteen health ticks: each was a re-announcement before.
+          await sleep(3_000);
+          expect(new Set(announced).size).toBe(1);
+          expect(announced.length).toBeLessThanOrEqual(2);
+        }
+      );
+    } finally {
+      await sub.quit();
+      await raw.quit();
+      await upstream.close();
+    }
+  }, 30_000);
+
+  it("re-announces a worker-owned completion until the controller applies it", async () => {
+    const upstream = await startUpstream(0);
+    const raw = new Redis(`${REDIS_URL}/${REDIS_DB}`);
+    try {
+      await withReplicas(
+        {
+          count: 2,
+          baseURL: upstream.baseURL,
+          clients: [
+            {
+              name: "fo11",
+              rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 1 }],
+              healthCheckIntervalMs: 200,
+            },
+          ],
+          redisDb: REDIS_DB,
+          keyPrefix: "fo11",
+        },
+        async ({ controllerFor, workersFor }) => {
+          const client = "fo11:_:a";
+          const controller = controllerFor(client);
+          expect(controller).toBeDefined();
+          if (!controller) return;
+          const owner = workersFor(client)[0];
+          const concurrencyKey = `${controller.getNamespace()}:${client}:concurrency:default`;
+
+          // The controller loses the first announcement, as one does that is
+          // mid-demotion or whose subscription dropped the message.
+          const target = (
+            controller as unknown as {
+              clients: Map<
+                string,
+                { finalizeOwnedRequest: (data: unknown) => Promise<void> }
+              >;
+            }
+          ).clients.get(client)!;
+          const original = target.finalizeOwnedRequest.bind(target);
+          let dropped = 0;
+          target.finalizeOwnedRequest = async (data) => {
+            if (dropped++ === 0) return;
+            return original(data);
+          };
+
+          expect((await fire(owner, client)).status).toBe(200);
+          await waitFor(
+            "the re-announced completion to release the slot",
+            async () => (await raw.zcard(concurrencyKey)) === 0,
+            5_000
+          );
+          expect(dropped).toBeGreaterThanOrEqual(2);
+        }
+      );
+    } finally {
+      await raw.quit();
+      await upstream.close();
+    }
+  }, 30_000);
+
+  it("delivers a worker-owned completion to the controller elected after the one that missed it", async () => {
+    const upstream = await startUpstream(400);
+    const raw = new Redis(`${REDIS_URL}/${REDIS_DB}`);
+    try {
+      await withReplicas(
+        {
+          count: 3,
+          baseURL: upstream.baseURL,
+          clients: [
+            {
+              name: "fo10",
+              rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 1 }],
+              healthCheckIntervalMs: 200,
+            },
+          ],
+          redisDb: REDIS_DB,
+          keyPrefix: "fo10",
+        },
+        async ({ replicas, backends, controllerFor, workersFor }) => {
+          const client = "fo10:_:a";
+          const controller = controllerFor(client);
+          expect(controller).toBeDefined();
+          if (!controller) return;
+          const owner = workersFor(client)[0];
+          const namespace = controller.getNamespace();
+          const concurrencyKey = `${namespace}:${client}:concurrency:default`;
+
+          const first = fire(owner, client);
+          await waitFor(
+            "the request to reach upstream",
+            () => upstream.inFlight() === 1
+          );
+          // The controller is gone before the completion is announced, so it
+          // is never applied by the replica that admitted it.
+          await hardKill(
+            controller,
+            backends[replicas.indexOf(controller)],
+            raw
+          );
+          expect((await first).status).toBe(200);
+          // Several ticks, so a non-owner's retained copy is long dropped and
+          // whichever survivor is elected, the owner's announcement is what
+          // has to reach it.
+          await sleep(1_000);
+
+          await forceElection(raw, namespace);
+          await waitFor("a survivor to take the controller role", () =>
+            replicas.some(
+              (w) =>
+                w !== controller &&
+                w.getMetadata().ownedClients.includes(client)
+            )
+          );
+          await waitFor(
+            "the completion to release its slot",
+            async () => (await raw.zcard(concurrencyKey)) === 0,
+            5_000
+          );
+          expect((await fire(owner, client)).status).toBe(200);
+        }
+      );
+    } finally {
+      await raw.quit();
+      await upstream.close();
+    }
+  }, 60_000);
+
+  it("does not re-apply a completion the old controller applied when a worker takes over", async () => {
+    let answered = 0;
+    const upstream = createServer((_req, res) => {
+      res.writeHead(answered++ === 0 ? 429 : 200).end("{}");
+    });
+    await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
+    const address = upstream.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    try {
+      await withReplicas(
+        {
+          count: 2,
+          baseURL: `http://127.0.0.1:${port}`,
+          clients: [
+            {
+              name: "fo11",
+              rateLimit: [
+                {
+                  name: "per_second",
+                  type: "requestLimit",
+                  interval: 1000,
+                  tokensToAdd: 10,
+                  maxTokens: 10,
+                },
+              ],
+              retryOptions: {
+                maxRetries: 0,
+                retryBackoffBaseTime: 100,
+                thawRequestCount: 1,
+              },
+              // Longer than the test, so the worker still holds its copy of
+              // the 429's completion when it is promoted.
+              healthCheckIntervalMs: 30_000,
+            },
+          ],
+          redisDb: REDIS_DB,
+          keyPrefix: "fo11",
+        },
+        async ({ controllerFor, workersFor }) => {
+          const client = "fo11:_:a";
+          const controller = controllerFor(client);
+          expect(controller).toBeDefined();
+          if (!controller) return;
+          const worker = workersFor(client)[0];
+
+          await fire(controller, client).catch(() => undefined);
+          await sleep(1_300);
+          expect((await fire(controller, client)).status).toBe(200);
+          await waitFor(
+            "the probe to thaw the client",
+            async () => !(await worker.getClientStats(client)).isFrozen
+          );
+
+          await controller.stop();
+          await waitFor("the worker to take the controller role", () =>
+            worker.getMetadata().ownedClients.includes(client)
+          );
+          await sleep(200);
+
+          const stats = await worker.getClientStats(client);
+          expect({
+            isFrozen: stats.isFrozen,
+            thawRequestCount: stats.thawRequestCount,
+          }).toEqual({ isFrozen: false, thawRequestCount: 0 });
+        }
+      );
+    } finally {
+      upstream.closeAllConnections();
+      await new Promise<void>((r) => upstream.close(() => r()));
+    }
+  }, 60_000);
+
   it("fails a stopping replica's queued work with a reason and lets the controller reclaim it", async () => {
     const upstream = await startUpstream(0);
     const raw = new Redis(`${REDIS_URL}/${REDIS_DB}`);
@@ -1102,12 +1374,14 @@ describe.skipIf(!HAS_REDIS)("multi-replica failover", () => {
           clients: [
             {
               name: "fo7",
-              rateLimit: {
-                type: "requestLimit",
-                maxTokens: 1,
-                tokensToAdd: 1,
-                interval: 60_000,
-              },
+              rateLimit: [
+                {
+                  type: "requestLimit",
+                  maxTokens: 1,
+                  tokensToAdd: 1,
+                  interval: 60_000,
+                },
+              ],
             },
           ],
           redisDb: REDIS_DB,

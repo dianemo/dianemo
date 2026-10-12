@@ -1,11 +1,19 @@
-import ConcurrencyLimitClient from "../client/clientTypes/concurrencyLimitClient.js";
-import RequestLimitClient from "../client/clientTypes/requestLimitClient.js";
 import SharedLimitClient from "../client/clientTypes/sharedLimitClient.js";
-import type { CreateClientData, RateLimitData } from "../client/types.js";
+import { inheritCredentialLine } from "../client/methods/authenticate.js";
 import { ClientConflictError, ConfigurationError } from "../errors.js";
-import NoLimitClient from "../client/clientTypes/noLimitClient.js";
+import MeteredClient from "../client/clientTypes/meteredClient.js";
 import type BaseClient from "../client/index.js";
 import type RequestHandler from "../index.js";
+import type {
+  CreateClientData,
+  DeclaredRateLimit,
+  SharedLimitClientOptions,
+} from "../client/types.js";
+import {
+  assertUsableRateLimits,
+  isSharedLimitOnly,
+  normalizeRateLimit,
+} from "./rateLimit.js";
 
 /**
  * Recursively collects all client names that a list of CreateClientData will produce,
@@ -36,30 +44,68 @@ export function collectClientNames(
  */
 export async function generateClients(
   this: RequestHandler,
-  clients: CreateClientData[],
-  parent?: CreateClientData
+  clients: CreateClientData[]
 ) {
-  for (const declared of clients) {
-    const client = parent
-      ? mergeChildParentClients.bind(this)(declared, parent)
-      : declared;
-    const existing = this.clients.get(client.name);
-    if (!existing || !clientDataEqual(existing.getSourceClientData(), client)) {
-      const previous = await resetClient.bind(this)(client.name);
-      await createClient.bind(this)(client);
-      // The replacement takes over the requests the old client had parked, so it
-      // can still fail them with a reason if the rebuilt budget cannot serve them.
-      if (previous)
-        this.clients.get(client.name)?.adoptWaitingRequests(previous);
+  await prepareClients.bind(this)(clients)();
+}
+
+/**
+ * Constructs every client `clients` declares that differs from the one
+ * registered under its name, and returns the step that swaps them in.
+ *
+ * Everything that can refuse a config runs here, before any client is torn
+ * down, so a rebuild whose new config cannot be built throws and leaves the
+ * working clients — and the requests they have parked — where they are.
+ * `retiring` names clients the caller is about to remove, which a `sharedLimit`
+ * in this build may not borrow from.
+ */
+export function prepareClients(
+  this: RequestHandler,
+  clients: CreateClientData[],
+  retiring: ReadonlySet<string> = new Set()
+): () => Promise<void> {
+  const built = new Map<string, BaseClient>();
+  const lookup = (name: string): BaseClient | undefined =>
+    built.get(name) ??
+    (retiring.has(name) ? undefined : this.clients.get(name));
+  const replacements: BaseClient[] = [];
+  const walk = (list: CreateClientData[], parent?: CreateClientData) => {
+    for (const declared of list) {
+      const client = parent
+        ? mergeChildParentClients(declared, parent)
+        : declared;
+      const existing = this.clients.get(client.name);
+      if (
+        !existing ||
+        !clientDataEqual(existing.getSourceClientData(), client)
+      ) {
+        const next = buildClient.bind(this)(client, lookup);
+        built.set(client.name, next);
+        replacements.push(next);
+      }
+      // Recursed from what was declared, not from the merged copy: the merge
+      // drops `subClients` so a child does not inherit its siblings, so reading
+      // them back off the merged object stops the recursion at depth one —
+      // while `collectClientNames` keeps going, reporting clients that were
+      // never built.
+      if (declared.subClients) walk(declared.subClients, client);
     }
-    // Recursed from what was declared, not from the merged copy: the merge drops
-    // `subClients` so a child does not inherit its siblings, so reading them back
-    // off the merged object stops the recursion at depth one — while
-    // `collectClientNames` keeps going, reporting clients that were never built.
-    if (declared.subClients) {
-      await generateClients.bind(this)(declared.subClients, client);
+  };
+  walk(clients);
+
+  return async () => {
+    for (const next of replacements) {
+      const previous = await resetClient.bind(this)(next.getName());
+      // Linked so that removing `next` also stops a refresh `previous` still
+      // has in flight from writing the tokens the removal purges.
+      if (previous) inheritCredentialLine(previous, next);
+      await registerClient.bind(this)(next);
+      // The replacement takes over the requests the old client had parked, so
+      // it can still fail them with a reason if the rebuilt budget cannot serve
+      // them.
+      if (previous) next.adoptWaitingRequests(previous);
     }
-  }
+  };
 }
 
 /**
@@ -81,6 +127,9 @@ function deepEqualIgnoringFunctionIdentity(a: unknown, b: unknown): boolean {
   }
   if (typeof a !== typeof b) return false;
   if (typeof a !== "object") return false;
+  // By identity, as the merge passes them: an `http.Agent` holding live sockets
+  // is cyclic, and comparing one field by field would never return.
+  if (!isPlainData(a) || !isPlainData(b)) return false;
   if (Array.isArray(a) !== Array.isArray(b)) return false;
   if (Array.isArray(a)) {
     const arrA = a as unknown[];
@@ -100,6 +149,10 @@ function deepEqualIgnoringFunctionIdentity(a: unknown, b: unknown): boolean {
   return true;
 }
 
+/**
+ * A sub-client as built: the parent's config with the child's on top, so it
+ * inherits everything it does not declare — `rateLimitChange` included.
+ */
 function mergeChildParentClients(
   child: CreateClientData,
   parent: CreateClientData
@@ -108,11 +161,6 @@ function mergeChildParentClients(
     ...deepCloneWithFunctions(parent),
     ...child,
     name: `${parent.name}:${child.name}`,
-    // Credentials belong to the client at the top of the sub-client chain, since
-    // a sub-client inherits its parent's authentication. Inheriting the parent's
-    // own owner rather than using `parent.name` keeps that true at any nesting
-    // depth. A `sharedLimit` child is not a sub-client and never reaches here.
-    authOwnerName: parent.authOwnerName ?? parent.name,
     metadata: {
       ...(parent.metadata ? deepCloneWithFunctions(parent.metadata) : {}),
       ...child.metadata,
@@ -143,24 +191,44 @@ function mergeChildParentClients(
     },
   } as unknown as CreateClientData;
   delete merged.subClients;
+  // Credentials belong to whoever declared the authentication: the parent's
+  // owner, inherited rather than `parent.name` so it holds at any depth, unless
+  // the child declares its own. See
+  // docs/design-notes.md#credential-keying-and-sub-clients.
+  if (child.authentication) delete merged.authOwnerName;
+  else merged.authOwnerName = parent.authOwnerName ?? parent.name;
   return merged;
 }
 
-function deepCloneWithFunctions<T>(obj: T): T {
-  if (obj === null || typeof obj !== "object") return obj;
+/**
+ * An array, or an object literal: the config shapes the merge copies. Anything
+ * else — an `http.Agent`, a Buffer, a Map — keeps its identity, since copying
+ * one field by field drops its prototype.
+ */
+function isPlainData(value: object): boolean {
+  if (Array.isArray(value)) return true;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
 
+/**
+ * Copies plain objects and arrays, so writing into the copy cannot reach the
+ * original: a child's merged config, or a template builder's output that a
+ * plan is placed on. Anything else is passed by reference: an
+ * `http.Agent`, a `Buffer` or a `Date` copied key by key loses its prototype,
+ * and Node's http module refuses an agent that is not an `Agent`.
+ */
+export function deepCloneWithFunctions<T>(obj: T): T {
+  if (obj === null || typeof obj !== "object") return obj;
   if (Array.isArray(obj)) {
     return obj.map((item) => deepCloneWithFunctions(item)) as T;
   }
+  if (!isPlainData(obj)) return obj;
 
   const cloned = {} as T;
   for (const key in obj) {
     if (Object.prototype.hasOwnProperty.call(obj, key)) {
-      const value = obj[key];
-      if (typeof value === "function") cloned[key] = value;
-      else if (value !== null && typeof value === "object") {
-        cloned[key] = deepCloneWithFunctions(value);
-      } else cloned[key] = value;
+      cloned[key] = deepCloneWithFunctions(obj[key]);
     }
   }
   return cloned;
@@ -168,10 +236,9 @@ function deepCloneWithFunctions<T>(obj: T): T {
 
 /**
  * Resets the client with the given name so a new client can take over.
- * Destroys the previous client first so its health-check interval and any
- * pending in-memory state (e.g. a concurrency client's backend-tracked slots)
- * are released — without this, every rebuild (template re-registration,
- * hot reload) leaks state that the new client can't see.
+ * Destroys the previous client first so its health-check interval and timers
+ * are released — without this, every rebuild (template re-registration, hot
+ * reload) leaks state that the new client can't see.
  */
 export async function resetClient(
   this: RequestHandler,
@@ -188,14 +255,17 @@ export async function resetClient(
   return client;
 }
 
-export async function createClient(
+/**
+ * Validates `data` and constructs its client without registering it, so a
+ * config that cannot be built throws before anything it would replace is
+ * touched. `lookup` resolves a `sharedLimit` owner, including one built
+ * alongside this client and not yet registered.
+ */
+function buildClient(
   this: RequestHandler,
-  data: CreateClientData
-) {
-  const existing = this.clients.get(data.name);
-  if (existing) {
-    throw new ClientConflictError(data.name);
-  }
+  data: CreateClientData,
+  lookup: (name: string) => BaseClient | undefined
+): BaseClient {
   const baseData = {
     client: data,
     backend: this.backend,
@@ -205,15 +275,6 @@ export async function createClient(
     emitter: this.emitter,
     instanceId: this.id,
   };
-  // Lets the health tick re-run election; see its call site.
-  const attachReconcile = <T extends { reconcileRole?: () => Promise<void> }>(
-    client: T
-  ): T => {
-    client.reconcileRole = async () => {
-      await this.scheduleClientRoles();
-    };
-    return client;
-  };
   // `"rateLimit" in data`, not `??`: only an absent property is the documented
   // `noLimit` default. A property that is present and null or undefined throws,
   // because `rateLimit: null` is what `JSON.parse` of a backend override or a
@@ -221,83 +282,82 @@ export async function createClient(
   // is worse still — the merge spread overwrites the parent's limit with it, so
   // `rateLimit: row.limit ?? undefined` would drop an inherited cap rather than
   // inherit it. Normalising either with `??` silently removes a cap.
-  const declared = "rateLimit" in data ? data.rateLimit : { type: "noLimit" };
+  const declared = "rateLimit" in data ? data.rateLimit : [{ type: "noLimit" }];
   if (declared === null || declared === undefined) {
     throw new ConfigurationError(
       "unknown_rate_limit_type",
       `Client "${data.name}" declares rateLimit as ${JSON.stringify(
         declared ?? null
-      )}. Omit the property entirely for the noLimit default, or name a type: requestLimit, concurrencyLimit, sharedLimit, noLimit.`
+      )}. Omit the property entirely for the noLimit default, or give a list of limits.`
     );
   }
-  const rateLimit = declared as RateLimitData;
-
-  switch (rateLimit.type) {
-    case "requestLimit": {
-      const rlClient = new RequestLimitClient(baseData, rateLimit);
-      this.clients.set(data.name, attachReconcile(rlClient));
-      await rlClient.init();
-      break;
-    }
-    case "concurrencyLimit": {
-      const clClient = new ConcurrencyLimitClient(baseData, rateLimit);
-      this.clients.set(data.name, attachReconcile(clClient));
-      await clClient.init();
-      break;
-    }
-    case "sharedLimit": {
-      // A child whose parent does not exist is forced to `worker` by the
-      // election and so is never drained by anyone: it accepts requests, sends
-      // none, and grows its queue by one permanent entry per request.
-      const parentName = rateLimit.clientName;
-      const parent = this.clients.get(parentName);
-      if (!parent) {
-        throw new ConfigurationError(
-          "shared_limit_parent_not_found",
-          `Client "${data.name}" shares the rate limit of "${parentName}", which is not registered. Register the parent client first — a sharedLimit client cannot draw on a budget that does not exist.`
-        );
-      }
-      if (parent.getRateLimit().type === "sharedLimit") {
-        throw new ConfigurationError(
-          "shared_limit_parent_is_shared",
-          `Client "${data.name}" shares the rate limit of "${parentName}", which is itself a sharedLimit client. Point it at the client that owns the budget.`
-        );
-      }
-      const slClient = new SharedLimitClient(baseData, rateLimit);
-      // So the child can reject an oversized cost against its parent's ceiling.
-      slClient.getParentRateLimit = () =>
-        this.clients.get(parentName)?.getRateLimit();
-      // Grant isolation splits the budget keys, and the budget is the parent's.
-      // Answering from the child's own auth config would have a differently
-      // authenticated child resolve the un-isolated key while the parent
-      // resolved an isolated one, so grant traffic would stop being shared.
-      slClient.getBudgetOwnerAuthData = () =>
-        this.clients.get(parentName)?.getAuthData();
-      slClient.getBudgetOwnerClient = () => this.clients.get(parentName);
-      this.clients.set(data.name, attachReconcile(slClient));
-      await slClient.init();
-      break;
-    }
-    case "noLimit": {
-      const nlClient = new NoLimitClient(baseData, rateLimit);
-      this.clients.set(data.name, attachReconcile(nlClient));
-      await nlClient.init();
-      break;
-    }
-    default: {
-      // A NAMED type we do not recognise. Silently falling back to noLimit
-      // removes the cap: TypeScript covers hand-written config, but overrides
-      // come back from the backend as untyped JSON and template builders are
-      // routinely fed database rows, so a typo reaches here at runtime with the
-      // limit intact in the caller's mind and absent in fact.
-      throw new ConfigurationError(
-        "unknown_rate_limit_type",
-        `Client "${data.name}" has an unrecognised rateLimit.type ${JSON.stringify(
-          (rateLimit as { type?: unknown }).type
-        )}. Expected one of: requestLimit, concurrencyLimit, sharedLimit, noLimit.`
-      );
-    }
+  // A list, or nothing. Types cover hand-written config, but a template builder is
+  // routinely fed database rows and an override comes back from the backend as
+  // untyped JSON — so a bare limit object reaches here at runtime from code
+  // written against the shape this used to accept, and would otherwise fail deep
+  // inside normalisation with a message naming neither the client nor the fix.
+  if (!Array.isArray(declared)) {
+    throw new ConfigurationError(
+      "unknown_rate_limit_type",
+      `Client "${data.name}" declares rateLimit as a single limit. It takes a list, so wrap it: rateLimit: [${JSON.stringify(
+        declared
+      )}].`
+    );
   }
+  const rateLimit = declared as DeclaredRateLimit[];
 
-  this.emitter.emit(`clientRegistered:${data.name}`);
+  // Normalised once, here, so nothing past this point deals in an unnamed limit.
+  const limits = normalizeRateLimit(rateLimit);
+  // Here as well as in `MeteredClient`, which a `sharedLimit` never reaches: its
+  // name and owner would otherwise go unchecked when built directly, though the
+  // same entry in a template plan is checked at registration.
+  assertUsableRateLimits(limits, data.name);
+
+  if (!isSharedLimitOnly(limits)) return new MeteredClient(baseData, limits);
+
+  // A child whose owner does not exist is forced to `worker` by the election and
+  // so is never drained by anyone: it accepts requests, sends none, and grows its
+  // queue by one permanent entry per request.
+  const shared = limits[0] as SharedLimitClientOptions & { name: string };
+  const parentName = shared.clientName;
+  const parent = lookup(parentName);
+  if (!parent) {
+    throw new ConfigurationError(
+      "shared_limit_parent_not_found",
+      `Client "${data.name}" shares the rate limit of "${parentName}", which is not registered. Register the parent client first — a sharedLimit client cannot draw on a budget that does not exist.`
+    );
+  }
+  // A multi-limit owner is fine: this client takes the owner's queue as its own,
+  // so the owner's controller is what claims the budgets — all of them, however
+  // many the owner declares.
+  if (isSharedLimitOnly(parent.getRateLimit())) {
+    throw new ConfigurationError(
+      "shared_limit_parent_is_shared",
+      `Client "${data.name}" shares the rate limit of "${parentName}", which is itself a sharedLimit client. Point it at the client that owns the budget.`
+    );
+  }
+  const slClient = new SharedLimitClient(baseData, limits);
+  // So the child can reject an oversized cost against its parent's ceiling.
+  slClient.getParentRateLimit = () =>
+    this.clients.get(parentName)?.getRateLimit();
+  // Grant isolation splits the budget keys, and the budget is the parent's.
+  // Answering from the child's own auth config would have a differently
+  // authenticated child resolve the un-isolated key while the parent resolved an
+  // isolated one, so grant traffic would stop being shared.
+  slClient.getBudgetOwnerAuthData = () =>
+    this.clients.get(parentName)?.getAuthData();
+  slClient.getBudgetOwnerClient = () => this.clients.get(parentName);
+  return slClient;
+}
+
+async function registerClient(this: RequestHandler, client: BaseClient) {
+  const name = client.getName();
+  if (this.clients.has(name)) throw new ClientConflictError(name);
+  // Lets the health tick re-run election; see its call site.
+  client.reconcileRole = async () => {
+    await this.scheduleClientRoles();
+  };
+  this.clients.set(name, client);
+  await client.init();
+  this.emitter.emit(`clientRegistered:${name}`);
 }

@@ -1,4 +1,5 @@
 import type { RequestMetadata } from "../../request/types.js";
+import type { QueuedRequest } from "../../backend/types.js";
 import type BaseClient from "../index.js";
 import {
   ClientFrozenError,
@@ -70,6 +71,11 @@ async function processRequests(this: BaseClient) {
     // Without this the loop would re-select the same skipped head and spin.
     const skippedRequestIds = new Set<string>();
 
+    // Grants are scheduled apart only when they are metered apart. On a shared
+    // budget a grant-scoped head is just a head: skipping it would let cheaper,
+    // lower-priority work spend the budget it is waiting for.
+    const isolated = this.usesGrantIsolation();
+
     while (true) {
       const frozenGrantIds = await this.getFrozenGrantIds();
       const request = await this.getNextRequest(
@@ -105,9 +111,6 @@ async function processRequests(this: BaseClient) {
             `Client ${this.name} | request ${requestId} has a cost the client can never satisfy; failing it and moving on`
           );
           skippedRequestIds.add(requestId);
-          // A concurrency client decides admission here rather than in
-          // `tryAcquireTurn`, so it never reaches the throwing path and has to
-          // report the impossible cost itself.
           await failUnsatisfiable.bind(this)(requestMetadata);
           continue;
         }
@@ -115,12 +118,10 @@ async function processRequests(this: BaseClient) {
         // Booked above all three exits below, not beside the `break`: two are
         // `continue`s taken by grant-scoped and grant-isolated requests, so booking
         // only before the `break` leaves exactly the isolated-grant tenants
-        // recovering on the health tick. A refusal that is not a freeze carries no
-        // deadline and books nothing — a concurrency client's occupied slot is woken
-        // by the release instead.
+        // recovering on the health tick.
         await this.scheduleDrainForFreeze(res.frozenUntil, grantId);
 
-        if (grantId) {
+        if (grantId && isolated) {
           blockedGrantIds.add(grantId);
           continue;
         }
@@ -129,43 +130,11 @@ async function processRequests(this: BaseClient) {
         // own bucket, so breaking here would stall every tenant behind a
         // client-level head. Skip it and keep scanning instead; anything else on the
         // client-level budget declines in turn and is skipped too.
-        if (this.usesGrantIsolation()) {
+        if (isolated) {
           skippedRequestIds.add(requestId);
           continue;
         }
         break;
-      }
-
-      // The request may have finished between `getNextRequest` selecting it and the
-      // claim completing. Admission excludes a request's own id from the occupancy
-      // sum so a resubmit does not compete with itself, which means a claim for an
-      // id that has just released succeeds and re-creates its entry — and nothing
-      // is left to release it, so the capacity sits claimed until its TTL.
-      if (this.claimsOnAdmission()) {
-        // Narrows the window rather than closing it. A completion landing between
-        // this read and the notification below still strands the claim until the
-        // slot TTL; closing that would need the claim and the confirmation in one
-        // atomic operation, which is impossible while the claim and the queue entry
-        // are separate keys written by different callers.
-        //
-        // A read that failed is not evidence the request is gone, and this call sits
-        // outside the try below, so an escaping rejection would abandon the pass with
-        // the entry `inProgress` and its capacity claimed. Treating an unreadable
-        // entry as still queued keeps the claim, which is the recoverable error.
-        const stillQueued = await this.getRequestFromQueue(requestId).catch(
-          (error: unknown) => {
-            this.logger.warn(
-              { error },
-              `Client ${this.name} | could not confirm request ${requestId} is still queued; keeping its claim and continuing`
-            );
-            return "unreadable" as const;
-          }
-        );
-        // Only a definite absence releases.
-        if (stillQueued === null) {
-          await this.releaseAdmission(requestMetadata);
-          continue;
-        }
       }
 
       // Applies with or without a grant. Grants are opt-in, so gating this on
@@ -175,10 +144,6 @@ async function processRequests(this: BaseClient) {
         const thawResult = await this.tryStartThawRequest(grantId, requestId);
 
         if (thawResult === "exists") {
-          // `canProcessNextRequest` already claimed this request's slot and the
-          // request is going back in the queue, so without the release a concurrency
-          // client thawing behind an in-flight probe sheds a slot on every pass.
-          await this.releaseAdmission(requestMetadata);
           await this.updateRequestInQueue(requestId, { status: "pending" });
           // No `scheduleDrainForFreeze` here, unlike the three decline exits above:
           // this request is not waiting for the freeze to lapse but for a probe that
@@ -189,6 +154,18 @@ async function processRequests(this: BaseClient) {
         requestMetadata.isThawRequest = true;
       }
 
+      // A probe that does not go out must give the mark back: left set, it reads
+      // as a competing probe, and its eventual completion would be counted
+      // against whichever freeze is standing by then.
+      const returnToQueue = async () => {
+        const updates: Partial<QueuedRequest> = { status: "pending" };
+        if (requestMetadata.isThawRequest) {
+          updates.isThawRequest = false;
+          requestMetadata.isThawRequest = false;
+        }
+        await this.updateRequestInQueue(requestId, updates);
+      };
+
       // Between the claim above and the notification below the request exists
       // only in this loop — `getNextRequest` already marked it `inProgress`, so
       // no other controller reconsiders it and orphan cleanup skips it while its
@@ -196,24 +173,50 @@ async function processRequests(this: BaseClient) {
       try {
         const turn = await this.tryAcquireTurn(requestMetadata);
         if (!turn.acquired) {
-          await this.releaseAdmission(requestMetadata);
-          await this.updateRequestInQueue(requestId, { status: "pending" });
+          await returnToQueue();
           // Coming back later is the whole point: sleeping here would hold the
           // lock and stall every other grant and every cheaper or
           // higher-priority request behind this one.
           this.scheduleDrain(turn.waitTime ?? 0);
-          if (grantId) {
+          if (grantId && isolated) {
             blockedGrantIds.add(grantId);
             continue;
           }
           // Same reasoning as the `canProcess` branch above, repeated because that
           // branch only fires for a freeze: a token bucket discovers it has no
           // tokens here, one step later.
-          if (this.usesGrantIsolation()) {
+          if (isolated) {
             skippedRequestIds.add(requestId);
             continue;
           }
           break;
+        }
+
+        // The request may have completed between the claim above and here, and
+        // a claim for an id that has just released re-creates its slot with
+        // nothing left to release it. This re-read narrows that window; only a
+        // claim that checks the entry's status in the same operation closes it,
+        // as `acquireQueuedConcurrency` does for a sole concurrency limit. See
+        // docs/design-notes.md#claiming-and-then-verifying-leaves-a-residue
+        //
+        // A read that failed is not evidence the request is gone, so an
+        // unreadable entry is treated as still queued: keeping the claim is the
+        // recoverable error.
+        if (this.claimsReleasableCapacity()) {
+          const stillQueued = await this.getRequestFromQueue(requestId).catch(
+            (error: unknown) => {
+              this.logger.warn(
+                { error },
+                `Client ${this.name} | could not confirm request ${requestId} is still queued; keeping its claim and continuing`
+              );
+              return "unreadable" as const;
+            }
+          );
+          // Only a definite absence hands the claim back.
+          if (stillQueued === null) {
+            await this.releaseUnusedAdmission(requestMetadata);
+            continue;
+          }
         }
 
         // Addressed to the replica waiting on this request rather than broadcast,
@@ -228,10 +231,7 @@ async function processRequests(this: BaseClient) {
           );
         }
       } catch (error) {
-        await this.releaseAdmission(requestMetadata).catch(() => {});
-        await this.updateRequestInQueue(requestId, {
-          status: "pending",
-        }).catch(() => {});
+        await returnToQueue().catch(() => {});
 
         // A ceiling lowered while this request sat in the queue makes its cost
         // impossible. Stepping over it is what keeps everything behind it

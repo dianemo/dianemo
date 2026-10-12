@@ -108,4 +108,60 @@ describeIfRedis("redis key expiry", () => {
 
     await expectDayLongTtl("kt:bucket");
   });
+
+  // ---- buckets slower than a day
+
+  const WEEK_MS = 7 * 86_400_000;
+  const weekly = { maxTokens: 3, tokensToAdd: 3, interval: WEEK_MS };
+
+  /** At least a week: a bucket expiring sooner reads as full, six days early. */
+  const expectWeekLongTtl = async (key: string) => {
+    expect(await redis.ttl(key)).toBeGreaterThanOrEqual(WEEK_MS / 1000 - 5);
+  };
+
+  it("keeps a weekly bucket's key until it could have refilled", async () => {
+    await backend.acquireTokens("kt:weekly", 1, weekly);
+
+    await expectWeekLongTtl("kt:weekly");
+  });
+
+  it("keeps a weekly bucket's key on the fast path too", async () => {
+    await backend.tryAdmitImmediately(
+      "kt:queue",
+      "kt:weekly-fast",
+      "kt:freeze",
+      1,
+      weekly
+    );
+
+    await expectWeekLongTtl("kt:weekly-fast");
+  });
+
+  it("keeps a weekly bucket's key when it is one of several limits", async () => {
+    await backend.acquireMultiLimit!(
+      [
+        {
+          kind: "tokenBucket",
+          key: "kt:per_second",
+          config: { maxTokens: 10, tokensToAdd: 10, interval: 1000 },
+        },
+        { kind: "tokenBucket", key: "kt:per_week", config: weekly },
+      ],
+      1
+    );
+
+    await expectDayLongTtl("kt:per_second");
+    await expectWeekLongTtl("kt:per_week");
+  });
+
+  it("sizes a slow-refilling daily bucket to its refill from empty, not its interval", async () => {
+    // One token a day into a bucket of seven takes a week to fill.
+    await backend.acquireTokens("kt:trickle", 1, {
+      maxTokens: 7,
+      tokensToAdd: 1,
+      interval: 86_400_000,
+    });
+
+    await expectWeekLongTtl("kt:trickle");
+  });
 });

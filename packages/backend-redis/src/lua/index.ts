@@ -8,9 +8,15 @@ import {
 } from "./concurrency.js";
 import {
   refundTokens,
+  resetTokenBucket,
   tokenBucket,
   tryAdmitImmediately,
 } from "./tokenBucket.js";
+import {
+  acquireMultiLimit,
+  releaseMultiLimit,
+  tryAdmitMultiLimit,
+} from "./multiLimit.js";
 import {
   cleanupStaleFrozenGrants,
   hasThawRequestInProgress,
@@ -38,10 +44,19 @@ import {
  * splits a call's arguments into keys and ARGV on this number alone, so a wrong
  * count silently shifts every ARGV slot along — see `ttlArgvWarning` in
  * `fragments.ts` for how invisible that class of mistake is.
+ *
+ * `"variadic"` is for the multi-limit scripts alone, whose key count comes from
+ * a client's configuration. ioredis then expects the count as the call's first
+ * argument instead, so those callers pass it and everything after it shifts by
+ * one — `ctx.runVariadic` is the only way to invoke them.
  */
 export const SCRIPTS = {
   dianemoTokenBucket: { keys: 1, lua: tokenBucket },
+  dianemoAcquireMultiLimit: { keys: "variadic", lua: acquireMultiLimit },
+  dianemoReleaseMultiLimit: { keys: "variadic", lua: releaseMultiLimit },
+  dianemoTryAdmitMultiLimit: { keys: "variadic", lua: tryAdmitMultiLimit },
   dianemoRefundTokens: { keys: 2, lua: refundTokens },
+  dianemoResetTokenBucket: { keys: 1, lua: resetTokenBucket },
   dianemoAcquireConcurrency: { keys: 1, lua: acquireConcurrency },
   dianemoAcquireQueuedConcurrency: { keys: 2, lua: acquireQueuedConcurrency },
   dianemoReleaseConcurrency: { keys: 1, lua: releaseConcurrency },

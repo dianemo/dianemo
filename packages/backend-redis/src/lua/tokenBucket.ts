@@ -1,9 +1,12 @@
 import {
+  bucketTtlFn,
+  exactFn,
   finiteNumberFn,
   freezeGate,
   lazyRefill,
   queueEmptyGate,
   redisNow,
+  usableCostFn,
 } from "./fragments.js";
 
 /**
@@ -20,26 +23,28 @@ export const tokenBucket = `
   local maxTokens = tonumber(ARGV[2])
   local tokensToAdd = tonumber(ARGV[3])
   local interval = tonumber(ARGV[4])
-  -- ARGV is positional: this moved from [6] when the dead caller clock
-  -- at [5] was removed. See acquireConcurrency in concurrency.ts for the trap.
+  -- ARGV is positional; see ttlArgvWarning in fragments.ts for the trap.
   local ttl = tonumber(ARGV[5]) or 86400
 
 ${redisNow()}
 
 ${finiteNumberFn()}
+${usableCostFn()}
+${exactFn()}
   -- 'not (x > 0)', not 'x <= 0': a nan compares false either way round, so the
-  -- second form admits it and the division below yields a nan balance.
-  if not (tokensToAdd > 0) then
+  -- second form admits it and the division below yields a nan balance. The nil
+  -- test first, because comparing nil raises.
+  if tokensToAdd == nil or not (tokensToAdd > 0) then
     return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'tokensToAdd must be greater than 0' })
   end
   -- Reported through 'error' rather than raised: the contract says an unusable
   -- configuration is distinguishable from a merely empty bucket, and a non-finite
   -- maxTokens or cost would otherwise reach cjson.encode and throw.
-  if not (maxTokens > 0) or maxTokens == math.huge then
+  if maxTokens == nil or not (maxTokens > 0) or maxTokens == math.huge then
     return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'maxTokens must be a finite number greater than 0' })
   end
-  if cost == nil or cost ~= cost or cost == math.huge then
-    return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'cost must be a finite number' })
+  if not usableCost(cost) then
+    return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'cost must be a finite number that is not negative' })
   end
   -- Guarded even though the refill below tolerates it: waitTime is derived from
   -- interval, and a non-finite one clears the '< 0' clamp on the way to
@@ -48,46 +53,45 @@ ${finiteNumberFn()}
     return cjson.encode({ acquired = false, waitTime = 0, remainingTokens = 0, error = 'interval must be a finite number' })
   end
 
+${bucketTtlFn()}
+  ttl = bucketTtl(ttl, maxTokens, tokensToAdd, interval)
+
   -- finiteNumber, not tonumber: a stored 'nan' passes a nil test, survives every
   -- comparison and math.min, and then fails in cjson.encode below — so one corrupt
-  -- byte made every acquire on this bucket throw, with nothing rewriting the field.
+  -- byte would make every acquire on this bucket throw, with nothing rewriting
+  -- the field.
   local tokens = finiteNumber(redis.call('HGET', key, 'tokens'), maxTokens)
   local lastUpdate = finiteNumber(redis.call('HGET', key, 'lastUpdate'), now)
 
 ${lazyRefill()}
 
-  -- Check if we have enough tokens
   if tokens >= cost then
-    -- Deduct tokens and update state
     tokens = tokens - cost
     redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate)
     redis.call('EXPIRE', key, ttl)
-    return cjson.encode({ acquired = true, remainingTokens = tokens })
+    return cjson.encode({ acquired = true, remainingTokens = exact(tokens) })
   else
-    -- Wait until enough tokens have accrued.
-    --
-    -- lastUpdate only advances in whole intervals, so (now - lastUpdate)
-    -- is progress already made toward the next refill and must be
-    -- subtracted. Without that a bucket 9.9s into a 10s interval reported a
-    -- full 10s wait instead of 100ms, and the caller sleeps on this value
-    -- directly, so it became a real ten-second stall.
+    -- lastUpdate only advances in whole intervals, so (now - lastUpdate) is
+    -- progress already made toward the next refill and comes off the wait. The
+    -- caller sleeps on this value directly.
     local needed = cost - tokens
     local intervalsNeeded = math.ceil(needed / tokensToAdd)
     local waitTime = intervalsNeeded * interval - (now - lastUpdate)
     if waitTime < 0 then waitTime = 0 end
 
-    -- Update state to reflect any tokens that were added
+    -- Refill progress is persisted even on refusal.
     redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate)
     redis.call('EXPIRE', key, ttl)
 
-    return cjson.encode({ acquired = false, waitTime = waitTime, remainingTokens = tokens })
+    return cjson.encode({ acquired = false, waitTime = exact(waitTime), remainingTokens = exact(tokens) })
   end
 `;
 
 /**
- * Refuses while a freeze is in force: the freeze empties the bucket on
- * purpose, so crediting a refund into it would hand back budget the fleet has
- * just been told not to spend. A missing bucket is left missing rather than
+ * Refuses while a freeze that emptied the bucket is in force: crediting a
+ * refund into it would hand back budget the fleet has just been told not to
+ * spend. A freeze armed with `emptiesBucket: false` left the bucket alone, so a
+ * refund under it is credited as usual. A missing bucket is left missing rather than
  * created — an absent bucket already reads as full.
  *
  * `lastUpdate` is deliberately untouched. It marks where refill accounting has
@@ -98,11 +102,19 @@ export const refundTokens = `
   local freezeKey = KEYS[2]
   local cost = tonumber(ARGV[1])
   local maxTokens = tonumber(ARGV[2])
+${finiteNumberFn()}
+${usableCostFn()}
 
+  if not usableCost(cost) then return 0 end
+
+  -- Refused only under a standing freeze that emptied the bucket; an absent
+  -- emptiesBucket is a freeze from before the field existed, and those all did.
+  -- finiteNumber, as the memory twin's parseFiniteStored: an unusable deadline
+  -- is no freeze, as every freeze gate reads it.
   if freezeKey ~= '' then
-    local frozenUntil = tonumber(redis.call('HGET', freezeKey, 'frozenUntil')) or 0
+    local freeze = redis.call('HMGET', freezeKey, 'frozenUntil', 'emptiesBucket')
 ${redisNow("    ")}
-    if frozenUntil > now then return 0 end
+    if finiteNumber(freeze[1], 0) > now and freeze[2] ~= '0' then return 0 end
   end
 
   -- The raw reply distinguishes an absent bucket, which must stay absent because an
@@ -110,9 +122,22 @@ ${redisNow("    ")}
   -- 'abc' is truthy in Lua, so testing the string alone let a nil reach the addition.
   local raw = redis.call('HGET', key, 'tokens')
   if raw == false then return 0 end
-  local tokens = tonumber(raw)
-  if tokens == nil or tokens ~= tokens then tokens = 0 end
+  local tokens = finiteNumber(raw, 0)
   redis.call('HSET', key, 'tokens', math.min(maxTokens, tokens + cost))
+  return 1
+`;
+
+/**
+ * Writes a full bucket stamped with Redis's clock, in one step: reading `TIME`
+ * and then writing is two commands an acquire can land between, and its spend
+ * would be overwritten.
+ */
+export const resetTokenBucket = `
+  local key = KEYS[1]
+  local maxTokens = ARGV[1]
+${redisNow()}
+  redis.call('HSET', key, 'tokens', maxTokens, 'lastUpdate', now)
+  redis.call('EXPIRE', key, 86400)
   return 1
 `;
 
@@ -131,16 +156,20 @@ export const tryAdmitImmediately = `
   local maxTokens = tonumber(ARGV[2])
   local tokensToAdd = tonumber(ARGV[3])
   local interval = tonumber(ARGV[4])
-  -- Positional, and moved from [6]: see acquireConcurrency in concurrency.ts.
+  -- ARGV is positional; see ttlArgvWarning in fragments.ts for the trap.
   local ttl = tonumber(ARGV[5]) or 86400
 
 ${redisNow()}
 
 ${finiteNumberFn()}
-  if not (tokensToAdd > 0) then return 0 end
-  if not (maxTokens > 0) or maxTokens == math.huge then return 0 end
-  if cost == nil or cost ~= cost or cost == math.huge then return 0 end
+${usableCostFn()}
+  if tokensToAdd == nil or not (tokensToAdd > 0) then return 0 end
+  if maxTokens == nil or not (maxTokens > 0) or maxTokens == math.huge then return 0 end
+  if not usableCost(cost) then return 0 end
   if interval == nil or interval ~= interval or interval == math.huge or interval == -math.huge then return 0 end
+
+${bucketTtlFn()}
+  ttl = bucketTtl(ttl, maxTokens, tokensToAdd, interval)
 
 ${queueEmptyGate()}
 

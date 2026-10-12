@@ -3,6 +3,7 @@ import { memoryBackend } from "../packages/core/src/backend/memory.js";
 import { harnesses } from "./clientTypes/harness.js";
 import type {
   DianemoBackend,
+  MultiLimitSpec,
   QueuedRequest,
 } from "../packages/core/src/backend/types.js";
 
@@ -112,6 +113,41 @@ describe("memory backend: a decision does not straddle a suspension", () => {
 
     queueMicrotask(() => blockFor(400));
     expect(await backend.isFrozen(key)).toBe(true);
+  });
+});
+
+describe("memory backend: releasing several budgets", () => {
+  let backend: DianemoBackend;
+
+  beforeEach(() => {
+    backend = memoryBackend();
+  });
+  afterEach(async () => {
+    await backend.close();
+  });
+
+  it("releases every budget before a claim that starts after it can run", async () => {
+    const specs = (slotId: string): MultiLimitSpec[] => [
+      {
+        kind: "concurrency",
+        key: "r:slots",
+        config: { maxConcurrency: 1, requestTtl: 60_000 },
+        slotId,
+      },
+      {
+        kind: "tokenBucket",
+        key: "r:bucket",
+        config: { maxTokens: 1, tokensToAdd: 1, interval: 600_000 },
+      },
+    ];
+    expect(await backend.acquireMultiLimit!(specs("a"), 1)).toEqual({
+      acquired: true,
+    });
+    const [, claim] = await Promise.all([
+      backend.releaseMultiLimit!(specs("a"), 1),
+      backend.acquireMultiLimit!(specs("b"), 1),
+    ]);
+    expect(claim).toEqual({ acquired: true });
   });
 });
 
@@ -341,6 +377,51 @@ describe("memory backend: a backend written to after close()", () => {
   });
 });
 
+describe("memory backend: a bucket slower than a day", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const WEEK_MS = 7 * 86_400_000;
+  const weekly = { maxTokens: 3, tokensToAdd: 3, interval: WEEK_MS };
+  const DAY_AND_A_BIT = 86_401_000;
+
+  it("does not hand a spent weekly budget back after a day of quiet", async () => {
+    const backend = memoryBackend();
+    for (let i = 0; i < 3; i++) {
+      expect((await backend.acquireTokens("mk:week", 1, weekly)).acquired).toBe(
+        true
+      );
+    }
+    vi.setSystemTime(Date.now() + DAY_AND_A_BIT);
+
+    expect((await backend.acquireTokens("mk:week", 1, weekly)).acquired).toBe(
+      false
+    );
+    await backend.close();
+  });
+
+  it("does not hand a spent weekly budget back when it is one of several limits", async () => {
+    const backend = memoryBackend();
+    const specs = [
+      {
+        kind: "tokenBucket" as const,
+        key: "mk:per_second",
+        config: { maxTokens: 10, tokensToAdd: 10, interval: 1000 },
+      },
+      { kind: "tokenBucket" as const, key: "mk:per_week", config: weekly },
+    ];
+    await backend.acquireMultiLimit!(specs, 3);
+    vi.setSystemTime(Date.now() + DAY_AND_A_BIT);
+
+    expect((await backend.acquireMultiLimit!(specs, 1)).acquired).toBe(false);
+    await backend.close();
+  });
+});
+
 // ------------------------------------------------------------ backend parity
 
 describe.each(harnesses(0))(
@@ -457,3 +538,66 @@ describe.each(harnesses(0))(
     });
   }
 );
+
+describe("memory backend: one clock sample per decision", () => {
+  let backend: DianemoBackend;
+  const DEADLINE_MS = 500;
+
+  /**
+   * Every read after the first lands past the deadline, so a decision that
+   * samples the clock twice sees the freeze lapse partway through.
+   */
+  const advanceAfterFirstRead = () => {
+    const start = Date.now();
+    let reads = 0;
+    vi.spyOn(Date, "now").mockImplementation(() =>
+      reads++ === 0 ? start : start + 2 * DEADLINE_MS
+    );
+  };
+
+  beforeEach(async () => {
+    backend = memoryBackend();
+    await backend.setFreezeState("oc:fz", Date.now() + DEADLINE_MS, 0);
+  });
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await backend.close();
+  });
+
+  it("decides canProcessRequest on the instant it read the state", async () => {
+    advanceAfterFirstRead();
+    expect(await backend.canProcessRequest("oc:fz")).toMatchObject({
+      canProcess: false,
+      isThawRequest: false,
+    });
+  });
+
+  it("decides isFrozen on the instant it read the state", async () => {
+    advanceAfterFirstRead();
+    expect(await backend.isFrozen("oc:fz")).toBe(true);
+  });
+});
+
+describe("memory backend: the frozen-grants set", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("expires a day after a probe adds to it, as the Redis twin's does", async () => {
+    const backend = memoryBackend();
+    await backend.addRequest(
+      "fg:q",
+      "fg:m",
+      queued("a", { status: "inProgress", grantId: "g" })
+    );
+    await backend.tryStartThawRequest("fg:set", "fg:q", "fg:m", "a", "g");
+    expect(await backend.smembers("fg:set")).toEqual(["g"]);
+
+    vi.setSystemTime(Date.now() + 86_401_000);
+    expect(await backend.smembers("fg:set")).toEqual([]);
+    await backend.close();
+  });
+});

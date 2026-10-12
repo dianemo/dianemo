@@ -7,8 +7,14 @@ import { RequestError } from "./errors.js";
 import type { Logger } from "./logger.js";
 import { AxiosError } from "axios";
 
+/** Extra detail a `tryHandleRequest` call attaches to the error it throws. */
 export interface TryHandleRequestOptions {
+  /**
+   * What the call was doing, logged and stored as `metadata.context`. Defaults
+   * to the underlying error's message.
+   */
   context?: string;
+  /** Merged into the `RequestError`'s `metadata`. */
   metadata?: Record<string, unknown>;
 }
 
@@ -30,7 +36,8 @@ export type BoundTryHandleRequest = <T = unknown, D = unknown>(
 
 /**
  * Builds the `tryHandleRequest` bound to a specific handler. Called once per
- * plugin during `use()`; plugins receive the result via their context.
+ * `use()` call, and the result is shared by every plugin that call registers,
+ * through its context.
  *
  * Logging happens here rather than in `RequestError`'s constructor so that
  * building or rethrowing an error emits nothing — one failed call produces

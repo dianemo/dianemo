@@ -28,14 +28,17 @@ export interface RequestConfig<
    */
   cost?: number;
   /**
-   * Set by the `Request` constructor before any `requestInterceptor` runs. An
-   * interceptor needing a correlation id should read this rather than mint one: it is
-   * already unique per outbound call, including retries.
+   * Set by the handler before any `requestInterceptor` runs, and unique per
+   * `handleRequest` call: every retry of that call carries the same id. A value
+   * the caller sets is replaced. An interceptor needing a correlation id should
+   * read this rather than mint one.
    */
   requestId?: string;
   /**
-   * Cancels the request at every stage: aborted before dispatch it fails with
-   * `RequestAbortedError` having spent no budget, and after dispatch axios cancels
+   * Cancels the request at every stage. Aborted before dispatch — while queued,
+   * or after admission while the `requestInterceptor` or a token refresh runs —
+   * it rejects with `RequestAbortedError` and whatever it claimed is handed
+   * back. Once the request is upstream the abort reaches axios, which cancels
    * the call. See docs/concepts.md#cancellation.
    *
    * Narrower than axios's `GenericAbortSignal`, which makes `addEventListener`
@@ -65,6 +68,14 @@ export interface RequestMetadata {
   isThawRequest: boolean;
   /** Admitted without queueing; no queue entry exists for it. */
   fastPath?: boolean;
+  /**
+   * The budget keys this attempt claimed from, set by whoever claimed it.
+   * Release and refund act on these rather than on the keys the client's
+   * current limits name, which differ once an override or `rateLimitChange`
+   * has renamed or removed a limit while the request ran. Absent from a replica
+   * predating the field, where both fall back to the current limits.
+   */
+  claimedKeys?: string[];
   /** Whoever originated it. Orphan cleanup spares an entry whose owner is alive. */
   ownerId: string;
 }

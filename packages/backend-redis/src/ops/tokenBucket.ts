@@ -1,5 +1,6 @@
 import type { AcquireTokensResult, TokenBucketConfig } from "@dianemo/core";
-import { normalizeTtlSeconds, parseStoredNumber } from "@dianemo/core";
+import { normalizeTtlSeconds, parseFiniteStored } from "@dianemo/core";
+import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 
 /** Token-bucket operations. Twin of the memory backend's token-bucket section. */
@@ -50,7 +51,14 @@ export function tokenBucketOps(ctx: Ctx) {
         86400 // TTL for the key
       );
 
-      return JSON.parse(result as string) as AcquireTokensResult;
+      const parsed = JSON.parse(result as string) as AcquireTokensResult;
+      if (parsed.remainingTokens !== undefined) {
+        parsed.remainingTokens = parseLuaNumber(parsed.remainingTokens);
+      }
+      if (parsed.waitTime !== undefined) {
+        parsed.waitTime = parseLuaNumber(parsed.waitTime);
+      }
+      return parsed;
     },
 
     async getTokenBucketState(
@@ -80,14 +88,13 @@ export function tokenBucketOps(ctx: Ctx) {
       const now = Number(seconds) * 1000 + Math.floor(Number(micros) / 1000);
       const [tokens, lastUpdate] = results[1][1] as (string | null)[];
 
-      // parseStoredNumber, not parseFloat: it is the one reading of a stored number
-      // both backends share, and it keeps a fractional balance that truncation would
-      // disagree with the memory twin about.
-      let currentTokens = parseStoredNumber(
+      // The shared parse, not parseFloat: it keeps a fractional balance that
+      // truncation would disagree with the memory twin about.
+      let currentTokens = parseFiniteStored(
         tokens ?? undefined,
         config.maxTokens
       );
-      let currentLastUpdate = parseStoredNumber(lastUpdate ?? undefined, now);
+      let currentLastUpdate = parseFiniteStored(lastUpdate ?? undefined, now);
 
       const elapsed = now - currentLastUpdate;
       if (elapsed > 0 && config.interval > 0) {
@@ -98,8 +105,8 @@ export function tokenBucketOps(ctx: Ctx) {
             config.maxTokens
           );
           // Advanced with the credit, as the acquire scripts and the memory twin
-          // both do. Reporting the un-advanced value left a caller deriving the
-          // progress already made toward the next refill a whole interval out.
+          // both do, so a caller deriving progress toward the next refill from
+          // it is not a whole interval out.
           currentLastUpdate += intervalsElapsed * config.interval;
         }
       }
@@ -110,16 +117,13 @@ export function tokenBucketOps(ctx: Ctx) {
       return { tokens: currentTokens, lastUpdate: currentLastUpdate };
     },
 
+    /**
+     * Expires the bucket too, so one reset and then never acquired against does
+     * not outlive every other write to it. The memory twin sizes the same 86400
+     * through `writeBucket`.
+     */
     async resetTokenBucket(key: string, maxTokens: number): Promise<void> {
-      // Expiry set here too, so a bucket reset and then never acquired against
-      // does not outlive every other write to it. The memory twin sizes the same
-      // 86400 through `writeBucket`.
-      const pipeline = ctx.redis.pipeline();
-      pipeline.hset(key, "tokens", maxTokens, "lastUpdate", await ctx.now());
-      pipeline.expire(key, 86400);
-      const results = await pipeline.exec();
-      const failed = results?.find(([error]) => error);
-      if (failed?.[0]) throw failed[0];
+      await ctx.run("dianemoResetTokenBucket", key, maxTokens);
     },
 
     /**

@@ -47,16 +47,54 @@ function handleBasic(authData: AuthDataBasic) {
 }
 
 /**
- * Coalesces refreshes running in this process, keyed by credential cache key.
+ * Coalesces refreshes running in this handler, keyed by credential cache key.
  *
  * Without it, every in-flight request misses the cache the moment a token enters its
  * renewal window and refreshes independently — unmetered, and on a provider that
  * rotates refresh tokens each surplus call replays a redeemed token, which replay
  * detection is specified to answer by revoking the whole family.
  *
- * Module scope, so two client objects sharing one cache key still coalesce.
+ * Module scope, so two client objects sharing one cache key still coalesce; keyed
+ * by handler too, since a second handler is another replica and meets this one at
+ * the backend lock.
  */
 const inFlightRefreshes = new Map<string, Promise<string>>();
+
+/**
+ * One flag per line of rebuilds: a client and every client it replaced share
+ * it, so a removal retires the predecessors whose refreshes are still in flight
+ * along with the client it found registered.
+ */
+const credentialLines = new WeakMap<Client, { retired: boolean }>();
+
+function lineOf(client: Client): { retired: boolean } {
+  let line = credentialLines.get(client);
+  if (!line) {
+    line = { retired: false };
+    credentialLines.set(client, line);
+  }
+  return line;
+}
+
+/**
+ * Stops `client`, and every client it replaced, writing OAuth credentials from
+ * now on. For a client being removed: a refresh still in flight would otherwise
+ * write its tokens back after the removal purged them, under a key nothing will
+ * look up again.
+ */
+export function retireCredentialWrites(client: Client): void {
+  lineOf(client).retired = true;
+}
+
+/** Whether `client` was retired by {@link retireCredentialWrites}. */
+export function isCredentialWriteRetired(client: Client): boolean {
+  return credentialLines.get(client)?.retired === true;
+}
+
+/** Puts `next`, which replaces `previous`, on the same line of rebuilds. */
+export function inheritCredentialLine(previous: Client, next: Client): void {
+  credentialLines.set(next, lineOf(previous));
+}
 
 /** How long one replica may hold the refresh lock before others assume it died. */
 const REFRESH_LOCK_TTL_MS = 30_000;
@@ -74,6 +112,11 @@ const DEFAULT_TOKEN_LIFETIME_SECONDS = 3600;
  */
 const MAX_TOKEN_LIFETIME_SECONDS = 60 * 60 * 24 * 365 * 10;
 
+/**
+ * A renewal that fails while the cached token has not yet expired is logged and
+ * the cached token used: the margin exists to renew early, not to fail requests a
+ * valid token would serve. Only an expired token makes the failure the request's.
+ */
 async function handleOAuth2(
   this: Client,
   authData: AuthDataOAuth2,
@@ -85,26 +128,41 @@ async function handleOAuth2(
   const cacheKey = `${this.authNamespace}:oauth2${
     grantId ? `:${grantId}` : ""
   }`;
+  const coalesceKey = `${this.instanceId}|${cacheKey}`;
 
-  const running = inFlightRefreshes.get(cacheKey);
-  if (running) return running;
-
-  const refresh = refreshWithLock
-    .bind(this)(authData, cacheKey, grantId)
-    .finally(() => {
-      inFlightRefreshes.delete(cacheKey);
-    });
-  inFlightRefreshes.set(cacheKey, refresh);
-  return refresh;
+  let refresh = inFlightRefreshes.get(coalesceKey);
+  if (!refresh) {
+    refresh = refreshWithLock
+      .bind(this)(authData, cacheKey, grantId)
+      .finally(() => {
+        inFlightRefreshes.delete(coalesceKey);
+      });
+    inFlightRefreshes.set(coalesceKey, refresh);
+  }
+  try {
+    return await refresh;
+  } catch (error) {
+    const unexpired = await getUnexpiredToken.bind(this)(grantId);
+    if (unexpired === undefined) throw error;
+    this.logger.warn(
+      { error },
+      `Client ${this.name} | token renewal failed; using the cached token until it expires`
+    );
+    return unexpired;
+  }
 }
 
 /**
  * Performs the refresh under a backend lock so replicas don't duplicate it.
  *
  * The lock is an optimisation, not a correctness requirement: if it cannot be
- * taken we wait briefly for whoever holds it to publish a token, and failing
- * that refresh anyway. Blocking indefinitely on a peer that may have crashed
- * would be a worse failure than an extra token call.
+ * taken we wait for whoever holds it to publish a token, and failing that
+ * refresh anyway. Blocking indefinitely on a peer that may have crashed would be
+ * a worse failure than an extra token call.
+ *
+ * A holder whose refresh fails says so under `failedKey` before releasing, so a
+ * waiter that takes the lock next uses the still-unexpired token rather than
+ * calling an endpoint that has just failed.
  */
 async function refreshWithLock(
   this: Client,
@@ -113,28 +171,20 @@ async function refreshWithLock(
   grantId?: string
 ): Promise<string> {
   const lockKey = `${cacheKey}:refreshLock`;
+  const failedKey = `${lockKey}:failed`;
   const lockToken = `${this.instanceId}:${Date.now()}`;
-  const acquired = await this.backend
-    .acquireLock(lockKey, lockToken, REFRESH_LOCK_TTL_MS)
-    .catch(() => false);
-
-  let holdsLock = acquired;
-  if (!acquired) {
-    const peerToken = await waitForPeerRefresh.bind(this)(grantId);
-    if (peerToken) return peerToken;
-
-    // The wait ran out without a token, so the holder died or is slower than the
-    // lock's own lifetime. Retry the lock before refreshing anyway: it has very
-    // likely expired, so exactly one waiter takes it and the rest wait on that one.
-    // Every waiter falling through instead means simultaneous token-endpoint calls,
-    // which on a provider that rotates refresh tokens replays a redeemed token.
-    holdsLock = await this.backend
+  const tryLock = () =>
+    this.backend
       .acquireLock(lockKey, lockToken, REFRESH_LOCK_TTL_MS)
       .catch(() => false);
-    if (!holdsLock) {
-      const second = await waitForPeerRefresh.bind(this)(grantId);
-      if (second) return second;
-    }
+
+  let holdsLock = await tryLock();
+  let waited = false;
+  if (!holdsLock) {
+    waited = true;
+    const outcome = await waitForPeerRefresh.bind(this)(grantId, tryLock);
+    if (outcome.token) return outcome.token;
+    holdsLock = outcome.locked;
   }
 
   try {
@@ -144,9 +194,26 @@ async function refreshWithLock(
     const fresh = await getExistingToken.bind(this)(grantId);
     if (fresh) return fresh;
 
+    if (waited && (await this.backend.get(failedKey).catch(() => null))) {
+      const unexpired = await getUnexpiredToken.bind(this)(grantId);
+      if (unexpired !== undefined) {
+        this.logger.warn(
+          `Client ${this.name} | a peer's token renewal failed; using the cached token until it expires`
+        );
+        return unexpired;
+      }
+    }
+
     const newToken = await handleRefreshMethod.bind(this)(authData, grantId);
     await saveOAuthData.bind(this)(newToken, grantId);
     return newToken.access_token;
+  } catch (error) {
+    if (holdsLock) {
+      await this.backend
+        .set(failedKey, "1", REFRESH_LOCK_TTL_MS / 1000)
+        .catch(() => undefined);
+    }
+    throw error;
   } finally {
     if (holdsLock) {
       await this.backend.releaseLock(lockKey, lockToken).catch(() => false);
@@ -155,19 +222,26 @@ async function refreshWithLock(
 }
 
 /**
- * Polls for a token written by whichever replica holds the lock. The deadline tracks
- * the lock's own TTL, not an unrelated constant: giving up while the holder still
- * holds it sends every waiter off to refresh anyway.
+ * Polls for a token written by whichever replica holds the lock, and for the
+ * lock coming free without one — which means the holder failed or died, and
+ * this waiter now holds it. The deadline tracks the lock's own TTL, not an
+ * unrelated constant: by then the lock has lapsed even if its holder never
+ * released it.
  */
-async function waitForPeerRefresh(this: Client, grantId?: string) {
+async function waitForPeerRefresh(
+  this: Client,
+  grantId: string | undefined,
+  tryLock: () => Promise<boolean>
+): Promise<{ token?: string; locked: boolean }> {
   const POLL_MS = 100;
   const deadline = Date.now() + REFRESH_LOCK_TTL_MS;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, POLL_MS));
     const token = await getExistingToken.bind(this)(grantId);
-    if (token) return token;
+    if (token) return { token, locked: false };
+    if (await tryLock()) return { locked: true };
   }
-  return undefined;
+  return { locked: false };
 }
 
 /**
@@ -244,6 +318,17 @@ async function getExistingToken(this: Client, grantId?: string) {
   if (!expired) {
     return decryptCached.bind(this)(existing.accessToken, "access token");
   }
+}
+
+/** The cached access token until it expires, renewal margin or not. */
+async function getUnexpiredToken(this: Client, grantId?: string) {
+  const existing = await this.backend.hgetall(
+    `${this.authNamespace}:oauth2${grantId ? `:${grantId}` : ""}`
+  );
+  const expiresAt = Number(existing.expiresAt);
+  if (!existing.accessToken || !Number.isFinite(expiresAt)) return;
+  if (expiresAt <= Date.now()) return;
+  return decryptCached.bind(this)(existing.accessToken, "access token");
 }
 
 async function handleRefreshMethod(
@@ -464,6 +549,14 @@ async function saveOAuthData(
       ? storedRefreshTtl
       : undefined);
 
+  // Checked after the last await before the write: a removal retires the
+  // client before purging, so nothing written past this point outlives it.
+  if (isCredentialWriteRetired(this)) {
+    this.logger.debug(
+      `Client ${this.name} | removed while refreshing; discarding the new token`
+    );
+    return;
+  }
   await this.backend.hset(
     key,
     {
@@ -484,7 +577,9 @@ async function saveOAuthData(
     },
     credentialTtlSeconds(expires_in, hasRefreshToken, refreshTtlSeconds)
   );
-  if (grantId) await this.trackGrantId(grantId);
+  if (grantId && !isCredentialWriteRetired(this)) {
+    await this.trackGrantId(grantId);
+  }
 }
 
 export default authenticate;

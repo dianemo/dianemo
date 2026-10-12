@@ -1,26 +1,27 @@
 import type { FreezeState } from "@dianemo/core";
+import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 
 /**
- * One script, so the read, the merge, the write and the TTL cannot be split.
- *
- * This was three round trips with an `await now()` in the middle, and "take the
- * larger" cannot be layered on a separate read at all: two arms would both read
- * the old value and the loser would still win the write.
+ * One script, so the read, the merge, the write and the TTL cannot be split:
+ * "take the larger" cannot be layered on a separate read, because two arms
+ * would both read the old value and the loser would still win the write.
  */
 async function writeFreezeState(
   ctx: Ctx,
   key: string,
   frozenUntil: number,
   thawRequestCount: number,
-  mode: "set" | "max"
+  mode: "set" | "max",
+  options: { emptiesBucket?: boolean }
 ): Promise<FreezeState> {
   const result = (await ctx.run(
     "dianemoWriteFreezeState",
     key,
     frozenUntil,
     thawRequestCount,
-    mode
+    mode,
+    options.emptiesBucket === false ? "0" : "1"
   )) as [number, number];
   return { frozenUntil: result[0], thawRequestCount: result[1] };
 }
@@ -34,11 +35,11 @@ async function readFreezeState(
   inFreezeWindow: boolean;
 } | null> {
   const result = (await ctx.run("dianemoReadFreezeState", key)) as
-    [number, number, number] | null;
+    [string, string, number] | null;
   if (!result) return null;
   return {
-    frozenUntil: result[0],
-    thawRequestCount: result[1],
+    frozenUntil: parseLuaNumber(result[0]),
+    thawRequestCount: parseLuaNumber(result[1]),
     inFreezeWindow: result[2] === 1,
   };
 }
@@ -62,9 +63,17 @@ export function freezeOps(ctx: Ctx) {
     async setFreezeState(
       key: string,
       frozenUntil: number,
-      thawRequestCount: number
+      thawRequestCount: number,
+      options: { emptiesBucket?: boolean } = {}
     ): Promise<void> {
-      await writeFreezeState(ctx, key, frozenUntil, thawRequestCount, "set");
+      await writeFreezeState(
+        ctx,
+        key,
+        frozenUntil,
+        thawRequestCount,
+        "set",
+        options
+      );
     },
 
     /**
@@ -82,9 +91,17 @@ export function freezeOps(ctx: Ctx) {
     async armFreeze(
       key: string,
       frozenUntil: number,
-      thawRequestCount: number
+      thawRequestCount: number,
+      options: { emptiesBucket?: boolean } = {}
     ): Promise<FreezeState> {
-      return writeFreezeState(ctx, key, frozenUntil, thawRequestCount, "max");
+      return writeFreezeState(
+        ctx,
+        key,
+        frozenUntil,
+        thawRequestCount,
+        "max",
+        options
+      );
     },
 
     async getFreezeState(key: string): Promise<FreezeState | null> {
@@ -107,17 +124,18 @@ export function freezeOps(ctx: Ctx) {
       success: boolean,
       completionId?: string
     ): Promise<FreezeState | null> {
-      const raw = (await ctx.run(
+      const result = (await ctx.run(
         "dianemoUpdateThawProgress",
         key,
         `${key}:thawCompletions`,
         completionId ?? "",
         success ? "1" : "0"
-      )) as string | null;
-      if (!raw) return null;
-      const parsed = JSON.parse(raw) as FreezeState | { cleared: true };
-      if ("cleared" in parsed) return null;
-      return parsed;
+      )) as [string, string] | null;
+      if (!result) return null;
+      return {
+        frozenUntil: Number(result[0]),
+        thawRequestCount: Number(result[1]),
+      };
     },
 
     /** Clear the freeze state (client is no longer frozen). */
@@ -168,13 +186,15 @@ export function freezeOps(ctx: Ctx) {
     async hasThawRequestInProgress(
       queueKey: string,
       metadataKeyPrefix: string,
-      grantId: string
+      grantId: string,
+      options: { anyGrant?: boolean } = {}
     ): Promise<boolean> {
       const result = await ctx.run(
         "dianemoHasThawRequestInProgress",
         queueKey,
         metadataKeyPrefix,
-        grantId
+        grantId,
+        options.anyGrant ? "1" : "0"
       );
 
       return result === 1;
@@ -191,7 +211,8 @@ export function freezeOps(ctx: Ctx) {
       queueKey: string,
       metadataKeyPrefix: string,
       requestId: string,
-      grantId: string
+      grantId: string,
+      options: { anyGrant?: boolean } = {}
     ): Promise<"started" | "exists"> {
       const metadataKey = `${metadataKeyPrefix}:${requestId}`;
       const result = await ctx.run(
@@ -201,7 +222,8 @@ export function freezeOps(ctx: Ctx) {
         metadataKeyPrefix,
         metadataKey,
         grantId,
-        requestId
+        requestId,
+        options.anyGrant ? "1" : "0"
       );
 
       return result as "started" | "exists";

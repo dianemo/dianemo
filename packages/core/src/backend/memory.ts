@@ -1,4 +1,3 @@
-import { normalizeTtlSeconds, REQUEST_TOMBSTONE_TTL_SECONDS } from "./ttl.js";
 import { EventEmitter } from "node:events";
 import {
   parseFiniteStored,
@@ -7,32 +6,32 @@ import {
 } from "./parseStored.js";
 import {
   calculateQueueScore,
+  MAX_QUEUE_PRIORITY,
+  MAX_QUEUE_RETRIES,
+  QUEUE_PRIORITY_BAND,
   QUEUE_RETRY_BAND,
   QUEUE_SCORE_EPOCH_MS,
 } from "./queueScore.js";
 import type {
   AcquireConcurrencyResult,
+  AcquireMultiLimitResult,
   AcquireTokensResult,
   BatchOp,
   ConcurrencyConfig,
   DianemoBackend,
   FreezeState,
   MessageHandler,
+  MultiLimitSpec,
   QueueStats,
   QueuedRequest,
   TokenBucketConfig,
 } from "./types.js";
-
-/**
- * In-process coordination, for a deployment that is exactly one process.
- *
- * **Every process running this gets its own private copy of every limit**, so two
- * processes send twice the agreed rate and nothing reports it. See
- * docs/backends/memory.md before choosing it.
- *
- * Every operation here is synchronous, which is what makes it atomic — a function
- * body runs to completion before anything else does — so there is no locking below.
- */
+import {
+  normalizeTombstoneTtl,
+  normalizeTtlSeconds,
+  REDIS_MAX_TTL_SECONDS,
+  REQUEST_TOMBSTONE_TTL_SECONDS,
+} from "./ttl.js";
 
 interface Entry {
   expiresAt?: number;
@@ -63,6 +62,15 @@ function usableCost(cost: number): boolean {
 }
 
 /**
+ * Whether a slot's lease can be measured. A `NaN` cutoff loses every comparison,
+ * so a slot claimed under one is never reaped. Twin of the concurrency Lua's
+ * `usableRequestTtl`.
+ */
+function usableRequestTtl(requestTtl: number): boolean {
+  return Number.isFinite(requestTtl) && requestTtl > 0;
+}
+
+/**
  * Marks an id as removed, so a later add for it is refused rather than creating an
  * entry nobody awaits. Same layout as the Redis backend's.
  */
@@ -71,21 +79,27 @@ function tombstoneKey(metadataKeyPrefix: string, requestId: string): string {
 }
 
 /**
- * A stored arrival timestamp held inside the version-1 score epoch.
+ * The score `updateRequest` re-writes, computed as the Lua re-score computes it:
+ * the same clamps and the same float arithmetic, and no integer check.
  *
- * `calculateQueueScore` raises for an arrival past the retry band, which is right for
- * a constant a maintainer chose and wrong for a field read back from shared state:
- * the raise would fail the retry being re-scored. Clamping keeps the entry inside its
- * own band, which is the property ordering depends on. The Lua re-score clamps to
- * match.
+ * Not `calculateQueueScore`, which raises for a score that is not a safe
+ * integer or an arrival past the retry band. That is right for an add and
+ * wrong here, where the fields come back from shared state and the raise would
+ * fail the retry being re-scored. Clamping the arrival keeps the entry inside
+ * its own band, which is the property ordering depends on.
  */
-function clampArrival(timestamp: number): number {
-  const arrival = timestamp - QUEUE_SCORE_EPOCH_MS;
-  if (arrival < 0) return QUEUE_SCORE_EPOCH_MS;
-  if (arrival > QUEUE_RETRY_BAND - 1) {
-    return QUEUE_SCORE_EPOCH_MS + QUEUE_RETRY_BAND - 1;
-  }
-  return timestamp;
+function rescore(priority: number, retries: number, timestamp: number) {
+  const p = Math.min(Math.max(priority, 0), MAX_QUEUE_PRIORITY);
+  const r = Math.min(Math.max(retries, 0), MAX_QUEUE_RETRIES);
+  const arrival = Math.min(
+    Math.max(timestamp - QUEUE_SCORE_EPOCH_MS, 0),
+    QUEUE_RETRY_BAND - 1
+  );
+  return (
+    (MAX_QUEUE_PRIORITY - p) * QUEUE_PRIORITY_BAND +
+    (MAX_QUEUE_RETRIES - r) * QUEUE_RETRY_BAND +
+    arrival
+  );
 }
 
 /**
@@ -95,10 +109,38 @@ function clampArrival(timestamp: number): number {
  * Lua's `nil` test: it otherwise survived every comparison and reported a client
  * frozen with no deadline a wake-up could be booked against.
  */
-function usableDeadline(raw: string): number | undefined {
+function usableDeadline(raw: string | undefined): number | undefined {
   // Through the shared parse, so an empty field reads as unusable rather than as 0.
   const parsed = parseStoredNumber(raw, NaN);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * A freeze field as both backends store and return it exactly: truncated toward
+ * zero, as Lua 5.1's `string.format('%d')` truncates, and clamped to
+ * `[min, 2^53-1]`. Twin of the Lua `storable` in `lua/freeze.ts`.
+ */
+function storable(value: number, min: number): number {
+  return Math.min(Math.max(Math.trunc(value), min), Number.MAX_SAFE_INTEGER);
+}
+
+/**
+ * A bucket key's lifetime in seconds: `ttlSeconds`, or longer for a bucket that
+ * takes longer than that to refill from empty. An expired bucket reads as full,
+ * so a key outliving only part of the refill hands a spent per-week budget back
+ * after a day of quiet. Twin of the Lua `bucketTtl` in `fragments.ts`.
+ *
+ * Clamped to the longest TTL a backend can store, so a valid configuration whose
+ * refill takes longer than that still admits. `!(refill > ttlSeconds)` rather
+ * than `Math.max`, which returns `NaN` for the `Infinity * 0` of a zero interval
+ * where Lua's `math.max` returns the other argument.
+ */
+function bucketTtl(ttlSeconds: number, config: TokenBucketConfig): number {
+  const refill = Math.ceil(
+    (Math.ceil(config.maxTokens / config.tokensToAdd) * config.interval) / 1000
+  );
+  if (!(refill > ttlSeconds)) return ttlSeconds;
+  return Math.min(refill, REDIS_MAX_TTL_SECONDS);
 }
 
 /**
@@ -116,7 +158,9 @@ function unusableBudget(
   if (!Number.isFinite(config.maxTokens) || config.maxTokens <= 0) {
     return "maxTokens must be a finite number greater than 0";
   }
-  if (!Number.isFinite(cost)) return "cost must be a finite number";
+  if (!usableCost(cost)) {
+    return "cost must be a finite number that is not negative";
+  }
   // Guarded even though `refill` tolerates it — its `interval > 0` test is false
   // for a NaN, so the bucket simply never refills. The waiting caller is what
   // breaks: `waitTime` is derived from `interval` and clears the `>= 0` clamp.
@@ -126,6 +170,16 @@ function unusableBudget(
   return undefined;
 }
 
+/**
+ * In-process coordination, for a deployment that is exactly one process.
+ *
+ * **Every process running this gets its own private copy of every limit**, so two
+ * processes send twice the agreed rate and nothing reports it. See
+ * docs/backends/memory.md before choosing it.
+ *
+ * Every operation here is synchronous, which is what makes it atomic — a function
+ * body runs to completion before anything else does — so there is no locking below.
+ */
 class MemoryBackend implements DianemoBackend {
   readonly kind = "memory";
   readonly distributed = false;
@@ -175,11 +229,14 @@ class MemoryBackend implements DianemoBackend {
     }
   }
 
-  /** Returns the live entry for `key`, dropping it first if it has expired. */
-  private live(key: string): Entry | undefined {
+  /**
+   * Returns the live entry for `key`, dropping it first if it has expired.
+   * `now` is for a decision that has already sampled the clock once.
+   */
+  private live(key: string, now = Date.now()): Entry | undefined {
     const entry = this.store.get(key);
     if (!entry) return undefined;
-    if (entry.expiresAt !== undefined && Date.now() >= entry.expiresAt) {
+    if (entry.expiresAt !== undefined && now >= entry.expiresAt) {
       this.store.delete(key);
       return undefined;
     }
@@ -213,8 +270,8 @@ class MemoryBackend implements DianemoBackend {
   }
 
   private expire(key: string, ttlSeconds: number) {
-    // Normalised through the same helper the Redis backend uses. A NaN deadline made
-    // `live()`'s `now >= expiresAt` false forever, so the key never expired at all.
+    // Normalised through the same helper the Redis backend uses, so a TTL
+    // either backend refuses throws here too.
     const ttl = normalizeTtlSeconds(ttlSeconds);
     const entry = this.live(key);
     if (!entry) return;
@@ -234,8 +291,31 @@ class MemoryBackend implements DianemoBackend {
       .map(([member]) => member);
   }
 
-  private hget(key: string, field: string): string | undefined {
-    return this.live(key)?.hash?.get(field);
+  private hget(
+    key: string,
+    field: string,
+    now = Date.now()
+  ): string | undefined {
+    return this.live(key, now)?.hash?.get(field);
+  }
+
+  /**
+   * Drops `key` once its set, sorted set or hash has no members left, as Redis
+   * does — so an emptied key neither answers an existence check nor keeps its
+   * old TTL for whatever is added to it next.
+   */
+  private dropIfEmpty(key: string) {
+    const entry = this.store.get(key);
+    if (!entry) return;
+    const size = entry.set?.size ?? entry.zset?.size ?? entry.hash?.size;
+    if (size === 0) this.store.delete(key);
+  }
+
+  private removeMember(key: string, member: string) {
+    const set = this.live(key)?.set;
+    if (!set) return;
+    set.delete(member);
+    this.dropIfEmpty(key);
   }
 
   /**
@@ -250,6 +330,19 @@ class MemoryBackend implements DianemoBackend {
     if (frozenUntil === undefined) return false;
     if (now < frozenUntil) return true;
     return parseFiniteStored(this.hget(freezeKey, "thawRequestCount"), 0) > 0;
+  }
+
+  /**
+   * Whether a refund must be refused: a freeze stands and emptied the bucket.
+   * An absent `emptiesBucket` field reads as emptying, as every freeze did
+   * before the field existed. Twin of the refund gate in `lua/tokenBucket.ts`.
+   */
+  private freezeEmptiedBucket(freezeKey: string, now: number): boolean {
+    const frozenUntil = parseFiniteStored(
+      this.hget(freezeKey, "frozenUntil"),
+      0
+    );
+    return frozenUntil > now && this.hget(freezeKey, "emptiesBucket") !== "0";
   }
 
   // ------------------------------------------------------------------ store
@@ -288,9 +381,12 @@ class MemoryBackend implements DianemoBackend {
     // Validated first: `expire` would otherwise raise with the fields already set.
     const ttl =
       ttlSeconds === undefined ? undefined : normalizeTtlSeconds(ttlSeconds);
-    const hash = this.hash(key);
-    for (const [field, value] of Object.entries(fields)) {
-      hash.set(field, String(value));
+    // No fields creates no key, as the `HSET` the Redis twin skips does not; the
+    // expiry still moves an existing hash's TTL there, and so here.
+    const entries = Object.entries(fields);
+    if (entries.length > 0) {
+      const hash = this.hash(key);
+      for (const [field, value] of entries) hash.set(field, String(value));
     }
     if (ttl !== undefined) this.expire(key, ttl);
   }
@@ -322,7 +418,7 @@ class MemoryBackend implements DianemoBackend {
   }
 
   async srem(key: string, member: string): Promise<void> {
-    this.live(key)?.set?.delete(member);
+    this.removeMember(key, member);
   }
 
   async smembers(key: string): Promise<string[]> {
@@ -358,7 +454,7 @@ class MemoryBackend implements DianemoBackend {
           this.setOf(op.key).add(op.member);
           break;
         case "srem":
-          this.live(op.key)?.set?.delete(op.member);
+          this.removeMember(op.key, op.member);
           break;
         case "hset":
           this.writeHash(op.key, op.fields, op.ttlSeconds);
@@ -444,11 +540,10 @@ class MemoryBackend implements DianemoBackend {
     config: TokenBucketConfig,
     now: number
   ): { tokens: number; lastUpdate: number } {
-    // Parseability, not absence: `Number("")` is 0 and `Number("abc")` is NaN, and a
-    // NaN balance is written back on refusal, so one unparseable byte refused every
-    // later request forever. The Lua defaults the same read.
-    let tokens = parseStoredNumber(this.hget(key, "tokens"), config.maxTokens);
-    let lastUpdate = parseStoredNumber(this.hget(key, "lastUpdate"), now);
+    // Through the shared parse, not `Number`: an empty, unparseable or
+    // non-finite field reads as absent, as the Lua's `finiteNumber` reads it.
+    let tokens = parseFiniteStored(this.hget(key, "tokens"), config.maxTokens);
+    let lastUpdate = parseFiniteStored(this.hget(key, "lastUpdate"), now);
 
     const elapsed = now - lastUpdate;
     if (elapsed > 0 && config.interval > 0) {
@@ -469,16 +564,26 @@ class MemoryBackend implements DianemoBackend {
     return { tokens, lastUpdate };
   }
 
+  /**
+   * `config` sizes the key to outlive a refill from empty, as the Lua's
+   * `bucketTtl` does; omitted only for a bucket written full.
+   */
   private writeBucket(
     key: string,
     tokens: number,
     lastUpdate: number,
-    ttlSeconds: number
+    ttlSeconds: number,
+    config?: TokenBucketConfig
   ) {
+    // Validated before the fields are set, so a TTL `expire` would refuse cannot
+    // leave the balance spent.
+    const ttl = normalizeTtlSeconds(
+      config ? bucketTtl(ttlSeconds, config) : ttlSeconds
+    );
     const hash = this.hash(key);
     hash.set("tokens", String(tokens));
     hash.set("lastUpdate", String(lastUpdate));
-    this.expire(key, ttlSeconds);
+    this.expire(key, ttl);
   }
 
   async acquireTokens(
@@ -499,7 +604,7 @@ class MemoryBackend implements DianemoBackend {
     const { tokens, lastUpdate } = this.refill(key, config, now);
 
     if (tokens >= cost) {
-      this.writeBucket(key, tokens - cost, lastUpdate, 86400);
+      this.writeBucket(key, tokens - cost, lastUpdate, 86400, config);
       return { acquired: true, remainingTokens: tokens - cost };
     }
 
@@ -512,7 +617,7 @@ class MemoryBackend implements DianemoBackend {
       0,
       intervalsNeeded * config.interval - (now - lastUpdate)
     );
-    this.writeBucket(key, tokens, lastUpdate, 86400);
+    this.writeBucket(key, tokens, lastUpdate, 86400, config);
     return { acquired: false, waitTime, remainingTokens: tokens };
   }
 
@@ -533,16 +638,28 @@ class MemoryBackend implements DianemoBackend {
     maxTokens: number,
     freezeKey?: string
   ): Promise<void> {
-    const frozenUntil = freezeKey
-      ? parseStoredNumber(this.hget(freezeKey, "frozenUntil"), 0)
-      : 0;
-    if (frozenUntil > Date.now()) return;
+    this.creditTokens(key, cost, maxTokens, freezeKey);
+  }
+
+  /**
+   * The body of {@link refundTokens}, synchronous so that
+   * {@link releaseMultiLimit} can hand back a whole claim without suspending,
+   * for the reason {@link writeString} carries.
+   */
+  private creditTokens(
+    key: string,
+    cost: number,
+    maxTokens: number,
+    freezeKey?: string
+  ) {
+    if (!usableCost(cost)) return;
+    if (freezeKey && this.freezeEmptiedBucket(freezeKey, Date.now())) return;
     const hash = this.live(key)?.hash;
     if (!hash) return;
     // An absent field leaves the bucket alone: the Lua returns early rather than
     // creating a balance, because a bucket with no `tokens` already reads as full.
     if (hash.get("tokens") === undefined) return;
-    const tokens = parseStoredNumber(hash.get("tokens"), 0);
+    const tokens = parseFiniteStored(hash.get("tokens"), 0);
     hash.set("tokens", String(Math.min(maxTokens, tokens + cost)));
   }
 
@@ -554,6 +671,8 @@ class MemoryBackend implements DianemoBackend {
     config: TokenBucketConfig,
     ttl = 86400
   ): Promise<boolean> {
+    // Before anything else, as the Redis twin reads it before its script runs.
+    const keyTtl = normalizeTtlSeconds(ttl);
     if (unusableBudget(cost, config)) return false;
     // Anything already waiting outranks a new arrival.
     if (this.sorted(queueKey).length > 0) return false;
@@ -563,10 +682,10 @@ class MemoryBackend implements DianemoBackend {
 
     const { tokens, lastUpdate } = this.refill(bucketKey, config, now);
     if (tokens < cost) {
-      this.writeBucket(bucketKey, tokens, lastUpdate, ttl);
+      this.writeBucket(bucketKey, tokens, lastUpdate, keyTtl, config);
       return false;
     }
-    this.writeBucket(bucketKey, tokens - cost, lastUpdate, ttl);
+    this.writeBucket(bucketKey, tokens - cost, lastUpdate, keyTtl, config);
     return true;
   }
 
@@ -575,6 +694,219 @@ class MemoryBackend implements DianemoBackend {
     // separated by another spender's write.
     if (this.sorted(queueKey).length > 0) return false;
     return !this.freezeBlocksAdmission(freezeKey, Date.now());
+  }
+
+  // ------------------------------------------------------------ several budgets
+
+  /**
+   * Evaluates every budget before committing to any of them, so a request that
+   * cannot have all of them spends none. Twin of the Redis backend's
+   * `acquireMultiLimit` Lua.
+   *
+   * Every branch below runs without suspending, which is what makes the two
+   * phases one operation here — an `await` between the checks and the writes
+   * would let another spender land in between.
+   */
+  async acquireMultiLimit(
+    specs: MultiLimitSpec[],
+    cost: number
+  ): Promise<AcquireMultiLimitResult> {
+    const now = Date.now();
+    const planned = this.planMultiLimit(specs, cost, now);
+    if (planned.error) return { acquired: false, error: planned.error };
+    if (!planned.acquired) {
+      // Refill progress is persisted even on refusal, as the single-budget path
+      // does: the credit is real whether or not this request gets to spend it.
+      for (const bucket of planned.buckets) {
+        this.writeBucket(
+          bucket.key,
+          bucket.tokens,
+          bucket.lastUpdate,
+          86400,
+          bucket.config
+        );
+      }
+      return {
+        acquired: false,
+        waitTime: planned.waitTime ?? 0,
+        blockedBy: planned.blockedBy,
+      };
+    }
+    for (const bucket of planned.buckets) {
+      this.writeBucket(
+        bucket.key,
+        bucket.tokens - cost,
+        bucket.lastUpdate,
+        86400,
+        bucket.config
+      );
+    }
+    for (const slot of planned.slots) {
+      this.claimSlot(slot.key, slot.slotId, cost, now, 86400);
+    }
+    return { acquired: true };
+  }
+
+  async releaseMultiLimit(
+    specs: MultiLimitSpec[],
+    cost: number
+  ): Promise<void> {
+    for (const spec of specs) {
+      if (spec.kind === "concurrency") {
+        this.releaseSlot(spec.key, spec.slotId);
+        continue;
+      }
+      this.creditTokens(spec.key, cost, spec.config.maxTokens, spec.freezeKey);
+    }
+  }
+
+  async tryAdmitMultiLimit(
+    queueKey: string,
+    freezeKeys: string[],
+    specs: MultiLimitSpec[],
+    cost: number,
+    ttl = 86400
+  ): Promise<boolean> {
+    // Before anything else, as the Redis twin reads it before its script runs.
+    const keyTtl = normalizeTtlSeconds(ttl);
+    if (this.sorted(queueKey).length > 0) return false;
+    const now = Date.now();
+    for (const freezeKey of freezeKeys) {
+      if (this.freezeBlocksAdmission(freezeKey, now)) return false;
+    }
+
+    const planned = this.planMultiLimit(specs, cost, now);
+    if (planned.error) return false;
+    if (!planned.acquired) {
+      for (const bucket of planned.buckets) {
+        this.writeBucket(
+          bucket.key,
+          bucket.tokens,
+          bucket.lastUpdate,
+          keyTtl,
+          bucket.config
+        );
+      }
+      return false;
+    }
+    for (const bucket of planned.buckets) {
+      this.writeBucket(
+        bucket.key,
+        bucket.tokens - cost,
+        bucket.lastUpdate,
+        keyTtl,
+        bucket.config
+      );
+    }
+    for (const slot of planned.slots) {
+      this.claimSlot(slot.key, slot.slotId, cost, now, keyTtl);
+    }
+    return true;
+  }
+
+  /**
+   * The check phase both multi-budget paths share: refills every bucket, reaps
+   * every slot ledger, and reports whether all of them could take `cost`.
+   *
+   * Returns the refilled balances rather than writing them, so the caller
+   * commits once it knows the whole set admitted. Reaping is a write and happens
+   * here regardless — an expired slot is expired whoever asked.
+   */
+  private planMultiLimit(
+    specs: MultiLimitSpec[],
+    cost: number,
+    now: number
+  ): {
+    acquired: boolean;
+    error?: string;
+    waitTime?: number;
+    blockedBy?: string;
+    buckets: {
+      key: string;
+      tokens: number;
+      lastUpdate: number;
+      config: TokenBucketConfig;
+    }[];
+    slots: { key: string; slotId: string }[];
+  } {
+    const buckets: {
+      key: string;
+      tokens: number;
+      lastUpdate: number;
+      config: TokenBucketConfig;
+    }[] = [];
+    const slots: { key: string; slotId: string }[] = [];
+    let acquired = true;
+    let waitTime: number | undefined;
+    let blockedBy: string | undefined;
+
+    for (const spec of specs) {
+      if (spec.kind === "tokenBucket") {
+        const error = unusableBudget(cost, spec.config);
+        if (error) return { acquired: false, error, buckets, slots };
+        const { tokens, lastUpdate } = this.refill(spec.key, spec.config, now);
+        buckets.push({
+          key: spec.key,
+          tokens,
+          lastUpdate,
+          config: spec.config,
+        });
+        if (tokens >= cost) continue;
+        const intervalsNeeded = Math.ceil(
+          (cost - tokens) / spec.config.tokensToAdd
+        );
+        const wait = Math.max(
+          0,
+          intervalsNeeded * spec.config.interval - (now - lastUpdate)
+        );
+        // The longest wait any budget asks for: coming back sooner only to be
+        // refused by this same budget is a wake-up that cannot succeed.
+        if (waitTime === undefined || wait > waitTime) {
+          waitTime = wait;
+          blockedBy = spec.key;
+        }
+        acquired = false;
+        continue;
+      }
+
+      if (!usableConcurrency(spec.config.maxConcurrency)) {
+        return {
+          acquired: false,
+          error: "maxConcurrency must be a finite number greater than 0",
+          buckets,
+          slots,
+        };
+      }
+      if (!usableCost(cost)) {
+        return {
+          acquired: false,
+          error: "cost must be a finite number that is not negative",
+          buckets,
+          slots,
+        };
+      }
+      if (!usableRequestTtl(spec.config.requestTtl)) {
+        return {
+          acquired: false,
+          error: "requestTtl must be a finite number greater than 0",
+          buckets,
+          slots,
+        };
+      }
+      this.reapConcurrency(spec.key, now - spec.config.requestTtl);
+      const currentCost = this.concurrencyCost(spec.key, spec.slotId);
+      if (currentCost + cost > spec.config.maxConcurrency) {
+        acquired = false;
+        // No deadline of its own: a slot is freed by a completion, and the
+        // caller decides what to fall back on. Recorded only if nothing with a
+        // real wait already claimed the report.
+        if (blockedBy === undefined) blockedBy = spec.key;
+        continue;
+      }
+      slots.push({ key: spec.key, slotId: spec.slotId });
+    }
+
+    return { acquired, waitTime, blockedBy, buckets, slots };
   }
 
   // ------------------------------------------------------------- concurrency
@@ -590,6 +922,8 @@ class MemoryBackend implements DianemoBackend {
         costs?.delete(member);
       }
     }
+    this.dropIfEmpty(key);
+    this.dropIfEmpty(`${key}:costs`);
   }
 
   /** Total cost in flight, ignoring `exceptId` so a resubmit is not counted twice. */
@@ -602,7 +936,7 @@ class MemoryBackend implements DianemoBackend {
       if (member === exceptId) continue;
       // This total feeds admission, not just stats: a NaN makes `total + cost > max`
       // false and the ceiling stops enforcing entirely. The Lua defaults to 1 here.
-      total += parseStoredNumber(costs?.get(member), 1);
+      total += parseFiniteStored(costs?.get(member), 1);
     }
     return total;
   }
@@ -614,10 +948,11 @@ class MemoryBackend implements DianemoBackend {
     now: number,
     keyTtl: number
   ) {
+    const ttl = normalizeTtlSeconds(keyTtl);
     this.zset(key).set(requestId, now);
     this.hash(`${key}:costs`).set(requestId, String(cost));
-    this.expire(key, keyTtl);
-    this.expire(`${key}:costs`, keyTtl);
+    this.expire(key, ttl);
+    this.expire(`${key}:costs`, ttl);
   }
 
   async acquireConcurrency(
@@ -639,6 +974,13 @@ class MemoryBackend implements DianemoBackend {
         acquired: false,
         currentConcurrency: 0,
         error: "cost must be a finite number that is not negative",
+      };
+    }
+    if (!usableRequestTtl(config.requestTtl)) {
+      return {
+        acquired: false,
+        currentConcurrency: 0,
+        error: "requestTtl must be a finite number greater than 0",
       };
     }
     this.reapConcurrency(key, now - config.requestTtl);
@@ -675,6 +1017,13 @@ class MemoryBackend implements DianemoBackend {
         error: "cost must be a finite number that is not negative",
       };
     }
+    if (!usableRequestTtl(config.requestTtl)) {
+      return {
+        acquired: false,
+        currentConcurrency: 0,
+        error: "requestTtl must be a finite number greater than 0",
+      };
+    }
     this.reapConcurrency(key, Date.now() - config.requestTtl);
     if (this.hget(metadataKey, "status") !== "inProgress") {
       // Excluding `requestId`, as the Lua's shared slot accounting does and as
@@ -697,9 +1046,12 @@ class MemoryBackend implements DianemoBackend {
     config: ConcurrencyConfig,
     ttl = 86400
   ): Promise<boolean> {
+    // Before anything else, as the Redis twin reads it before its script runs.
+    const keyTtl = normalizeTtlSeconds(ttl);
     if (this.sorted(queueKey).length > 0) return false;
     if (!usableConcurrency(config.maxConcurrency)) return false;
     if (!usableCost(cost)) return false;
+    if (!usableRequestTtl(config.requestTtl)) return false;
 
     const now = Date.now();
     if (this.freezeBlocksAdmission(freezeKey, now)) return false;
@@ -708,13 +1060,20 @@ class MemoryBackend implements DianemoBackend {
     const currentCost = this.concurrencyCost(concurrencyKey, requestId);
     if (currentCost + cost > config.maxConcurrency) return false;
 
-    this.claimSlot(concurrencyKey, requestId, cost, now, ttl);
+    this.claimSlot(concurrencyKey, requestId, cost, now, keyTtl);
     return true;
   }
 
   async releaseConcurrency(key: string, requestId: string): Promise<void> {
+    this.releaseSlot(key, requestId);
+  }
+
+  /** The body of {@link releaseConcurrency}; see {@link creditTokens}. */
+  private releaseSlot(key: string, requestId: string) {
     this.live(key)?.zset?.delete(requestId);
     this.live(`${key}:costs`)?.hash?.delete(requestId);
+    this.dropIfEmpty(key);
+    this.dropIfEmpty(`${key}:costs`);
   }
 
   async getConcurrencyState(
@@ -741,7 +1100,7 @@ class MemoryBackend implements DianemoBackend {
     return {
       currentConcurrency: activeRequests.reduce(
         (total, requestId) =>
-          total + parseStoredNumber(costs?.get(requestId), 1),
+          total + parseFiniteStored(costs?.get(requestId), 1),
         0
       ),
       activeRequests,
@@ -867,40 +1226,45 @@ class MemoryBackend implements DianemoBackend {
     updates: Partial<QueuedRequest>
   ): Promise<void> {
     const metadataKey = `${metadataKeyPrefix}:${requestId}`;
-    const entry = this.live(metadataKey);
-    if (!entry?.hash) return;
-    const hash = entry.hash;
+    const hash = this.live(metadataKey)?.hash;
+    if (!hash) return;
 
-    let needsScoreUpdate = false;
-    if (updates.status !== undefined) hash.set("status", updates.status);
     // Skipped rather than stored, matching the Lua's `type(x) == 'number'`:
     // `JSON.stringify` writes null for both NaN and Infinity, so a non-finite
     // field never reaches that script at all.
-    if (updates.retries !== undefined && Number.isFinite(updates.retries)) {
-      hash.set("retries", String(updates.retries));
-      needsScoreUpdate = true;
-    }
-    if (updates.priority !== undefined && Number.isFinite(updates.priority)) {
-      hash.set("priority", String(updates.priority));
-      needsScoreUpdate = true;
-    }
+    const retries =
+      updates.retries !== undefined && Number.isFinite(updates.retries)
+        ? updates.retries
+        : undefined;
+    const priority =
+      updates.priority !== undefined && Number.isFinite(updates.priority)
+        ? updates.priority
+        : undefined;
+    const needsScoreUpdate = retries !== undefined || priority !== undefined;
+    // The member the re-score writes, resolved before any field is: the Lua
+    // refuses the whole update without it, so the metadata and the order it
+    // carries change together or not at all.
+    const member = hash.get("requestId");
+    if (needsScoreUpdate && member === undefined) return;
+
+    if (updates.status !== undefined) hash.set("status", updates.status);
+    if (retries !== undefined) hash.set("retries", String(retries));
+    if (priority !== undefined) hash.set("priority", String(priority));
     if (updates.isThawRequest !== undefined) {
       hash.set("isThawRequest", updates.isThawRequest ? "true" : "false");
     }
 
-    if (!needsScoreUpdate) return;
+    if (!needsScoreUpdate || member === undefined) return;
     this.zset(queueKey).set(
-      requestId,
+      member,
       // Parsed exactly as the Lua re-score parses the same fields, which is the
       // only way the two agree about a corrupt one: `Number` alone reads an empty
       // field as 0 and an unparseable one as NaN, where `tonumber(...) or <d>`
       // reads both as missing.
-      calculateQueueScore(
+      rescore(
         parseStoredNumber(hash.get("priority"), 1),
         parseStoredNumber(hash.get("retries"), 0),
-        // Clamped into the arrival band rather than left to raise: a stored
-        // timestamp is not a constant a maintainer chose, and the Lua twin clamps.
-        clampArrival(parseStoredNumber(hash.get("timestamp"), 0))
+        parseStoredNumber(hash.get("timestamp"), 0)
       )
     );
   }
@@ -912,15 +1276,17 @@ class MemoryBackend implements DianemoBackend {
     tombstoneTtlSeconds: number = REQUEST_TOMBSTONE_TTL_SECONDS
   ): Promise<{ wasThawRequest: boolean }> {
     const metadataKey = `${metadataKeyPrefix}:${requestId}`;
+    const tombstoneTtl = normalizeTombstoneTtl(tombstoneTtlSeconds);
     const wasThawRequest = this.hget(metadataKey, "isThawRequest") === "true";
     this.live(queueKey)?.zset?.delete(requestId);
+    this.dropIfEmpty(queueKey);
     this.store.delete(metadataKey);
     // Written even when there was nothing to remove, which is the case the marker
     // exists for. See the Lua twin.
     const tombstone = tombstoneKey(metadataKeyPrefix, requestId);
     this.put(tombstone, {
       str: "1",
-      expiresAt: Date.now() + tombstoneTtlSeconds * 1000,
+      expiresAt: Date.now() + tombstoneTtl * 1000,
     });
     return { wasThawRequest };
   }
@@ -936,10 +1302,10 @@ class MemoryBackend implements DianemoBackend {
       const metadataKey = `${metadataKeyPrefix}:${requestId}`;
       const status = this.hget(metadataKey, "status");
       if (!status) continue;
-      // parseStoredNumber, not Number: `Number("")` is 0 and `Number("abc")` is
+      // The shared parse, not Number: `Number("")` is 0 and `Number("abc")` is
       // NaN, and a single NaN here poisons totalCost for the whole queue while
-      // the Redis twin's `tonumber(...) or 1` reports 1 for both.
-      totalCost += parseStoredNumber(this.hget(metadataKey, "cost"), 1);
+      // the Redis twin's `finiteNumber(..., 1)` reports 1 for both.
+      totalCost += parseFiniteStored(this.hget(metadataKey, "cost"), 1);
       if (status === "pending") pending++;
       else if (status === "inProgress") inProgress++;
     }
@@ -988,6 +1354,7 @@ class MemoryBackend implements DianemoBackend {
         cleanedUp++;
       }
     }
+    this.dropIfEmpty(queueKey);
     return cleanedUp;
   }
 
@@ -996,18 +1363,32 @@ class MemoryBackend implements DianemoBackend {
   async setFreezeState(
     key: string,
     frozenUntil: number,
-    thawRequestCount: number
+    thawRequestCount: number,
+    options: { emptiesBucket?: boolean } = {}
   ): Promise<void> {
-    this.writeFreezeState(key, frozenUntil, thawRequestCount, "set");
+    this.writeFreezeState(
+      key,
+      frozenUntil,
+      thawRequestCount,
+      "set",
+      options.emptiesBucket !== false
+    );
   }
 
   /** See the Redis twin: never shortens a standing freeze, and returns what won. */
   async armFreeze(
     key: string,
     frozenUntil: number,
-    thawRequestCount: number
+    thawRequestCount: number,
+    options: { emptiesBucket?: boolean } = {}
   ): Promise<FreezeState> {
-    return this.writeFreezeState(key, frozenUntil, thawRequestCount, "max");
+    return this.writeFreezeState(
+      key,
+      frozenUntil,
+      thawRequestCount,
+      "max",
+      options.emptiesBucket !== false
+    );
   }
 
   /**
@@ -1018,22 +1399,23 @@ class MemoryBackend implements DianemoBackend {
     key: string,
     frozenUntil: number,
     thawRequestCount: number,
-    mode: "set" | "max"
+    mode: "set" | "max",
+    emptiesBucket: boolean
   ): FreezeState {
+    const now = Date.now();
     // Sanitised before the merge: a NaN compares false against the standing value,
     // so the merge kept it and cancelled the probe budget a 429 was owed.
     if (!Number.isFinite(frozenUntil)) frozenUntil = 0;
     if (!Number.isFinite(thawRequestCount)) thawRequestCount = 0;
-    // Truncated toward zero, which is what the Lua's `string.format('%d', ...)`
-    // does to both fields on Lua 5.1 — a deadline in milliseconds is integral and
-    // a probe budget is a count, so the two backends must round them the same way
-    // or a merge against a stored value compares different numbers.
-    frozenUntil = Math.trunc(frozenUntil);
-    thawRequestCount = Math.trunc(thawRequestCount);
     if (mode === "max") {
-      const existingRaw = this.hget(key, "frozenUntil");
-      if (existingRaw !== undefined) {
-        const existingUntil = parseFiniteStored(existingRaw, 0);
+      // An unusable stored deadline is no freeze state to merge with, so the
+      // probe budget beside it is not consulted either — the reading every
+      // freeze gate gives it, and the Lua twin's.
+      const existingUntil = usableDeadline(this.hget(key, "frozenUntil"));
+      if (existingUntil !== undefined) {
+        if (existingUntil > now && this.hget(key, "emptiesBucket") !== "0") {
+          emptiesBucket = true;
+        }
         if (existingUntil > frozenUntil) frozenUntil = existingUntil;
         const existingThaw = parseFiniteStored(
           this.hget(key, "thawRequestCount"),
@@ -1042,22 +1424,21 @@ class MemoryBackend implements DianemoBackend {
         if (existingThaw > thawRequestCount) thawRequestCount = existingThaw;
       }
     }
-    // Clamped after the merge, so a deadline already stored past the ceiling is
-    // brought back down rather than carried forward by "keep the larger" — which
-    // is what lets a poisoned key heal. `Number.MAX_SAFE_INTEGER` is the 2^53-1
-    // the Lua twin inlines, and it is also what holds the TTL below inside the
+    // After the merge, so a stored value that won it is written back in range
+    // rather than carried forward by "keep the larger", and what is returned is
+    // what was stored. The 2^53-1 ceiling also holds the TTL below inside the
     // range `normalizeTtlSeconds` accepts.
-    if (frozenUntil > Number.MAX_SAFE_INTEGER) {
-      frozenUntil = Number.MAX_SAFE_INTEGER;
-    }
+    frozenUntil = storable(frozenUntil, -Number.MAX_SAFE_INTEGER);
+    thawRequestCount = storable(thawRequestCount, 0);
     // Derived and validated before the fields are set, as `writeHash` validates
     // its own: `expire` raises, and would otherwise leave the freeze half-written.
     const ttl = normalizeTtlSeconds(
-      Math.max(Math.ceil((frozenUntil - Date.now()) / 1000) + 60, 60)
+      Math.max(Math.ceil((frozenUntil - now) / 1000) + 60, 60)
     );
     const hash = this.hash(key);
     hash.set("frozenUntil", String(frozenUntil));
     hash.set("thawRequestCount", String(thawRequestCount));
+    hash.set("emptiesBucket", emptiesBucket ? "1" : "0");
     this.expire(key, ttl);
     return { frozenUntil, thawRequestCount };
   }
@@ -1067,22 +1448,20 @@ class MemoryBackend implements DianemoBackend {
    * decide on it do not sample the clock a suspension later than the state. See
    * the Redis twin's one-script `readFreezeState`.
    */
-  private readFreezeState(key: string): FreezeState | null {
-    const raw = this.hget(key, "frozenUntil");
-    if (raw === undefined) return null;
-    const frozenUntil = usableDeadline(raw);
+  private readFreezeState(key: string, now: number): FreezeState | null {
+    const frozenUntil = usableDeadline(this.hget(key, "frozenUntil", now));
     if (frozenUntil === undefined) return null;
     const thawRequestCount = parseFiniteStored(
-      this.hget(key, "thawRequestCount"),
+      this.hget(key, "thawRequestCount", now),
       0
     );
     // Reports expiry without deleting, matching Redis. See the comment there.
-    if (Date.now() >= frozenUntil && thawRequestCount <= 0) return null;
+    if (now >= frozenUntil && thawRequestCount <= 0) return null;
     return { frozenUntil, thawRequestCount };
   }
 
   async getFreezeState(key: string): Promise<FreezeState | null> {
-    return this.readFreezeState(key);
+    return this.readFreezeState(key, Date.now());
   }
 
   async updateThawProgress(
@@ -1123,8 +1502,9 @@ class MemoryBackend implements DianemoBackend {
     }
     if (!success) return { frozenUntil, thawRequestCount };
 
-    const newCount = thawRequestCount - 1;
-    if (newCount <= 0) {
+    const newCount = Math.max(0, thawRequestCount - 1);
+    // A window re-armed while this probe was in flight still stands.
+    if (newCount === 0 && Date.now() >= frozenUntil) {
       this.store.delete(key);
       return null;
     }
@@ -1137,9 +1517,12 @@ class MemoryBackend implements DianemoBackend {
   }
 
   async isFrozen(key: string): Promise<boolean> {
-    const state = this.readFreezeState(key);
+    // One clock sample for the read and the decision, as the Redis twin decides
+    // on one TIME.
+    const now = Date.now();
+    const state = this.readFreezeState(key, now);
     if (!state) return false;
-    if (Date.now() < state.frozenUntil) return true;
+    if (now < state.frozenUntil) return true;
     return state.thawRequestCount > 0;
   }
 
@@ -1148,12 +1531,13 @@ class MemoryBackend implements DianemoBackend {
     isThawRequest: boolean;
     frozenUntil?: number;
   }> {
-    const state = this.readFreezeState(key);
+    const now = Date.now();
+    const state = this.readFreezeState(key, now);
     if (!state) return { canProcess: true, isThawRequest: false };
     // `frozenUntil` accompanies both outcomes so a caller can book a wake-up
     // against the deadline rather than a locally computed delay. Here the two
     // clocks are the same one; the Redis twin is where it matters.
-    if (Date.now() < state.frozenUntil) {
+    if (now < state.frozenUntil) {
       return {
         canProcess: false,
         isThawRequest: false,
@@ -1167,22 +1551,34 @@ class MemoryBackend implements DianemoBackend {
     };
   }
 
+  /**
+   * Whether the entry at `metadataKey` is an in-progress probe that a claim for
+   * `grantId` must yield to — any grant's, under `anyGrant`.
+   */
+  private isCompetingProbe(
+    metadataKey: string,
+    grantId: string,
+    anyGrant: boolean
+  ): boolean {
+    // Normalised as the Lua twin's `fields[2] or ''` does: a client-level probe
+    // carries no `grantId` field, so an absent one has to match its own kind.
+    const otherGrantId = this.hget(metadataKey, "grantId") ?? "";
+    return (
+      this.hget(metadataKey, "status") === "inProgress" &&
+      (anyGrant || otherGrantId === grantId) &&
+      this.hget(metadataKey, "isThawRequest") === "true"
+    );
+  }
+
   async hasThawRequestInProgress(
     queueKey: string,
     metadataKeyPrefix: string,
-    grantId: string
+    grantId: string,
+    options: { anyGrant?: boolean } = {}
   ): Promise<boolean> {
     for (const requestId of this.sorted(queueKey)) {
       const metadataKey = `${metadataKeyPrefix}:${requestId}`;
-      // Normalised exactly as `tryStartThawRequest` normalises it, and as the
-      // Lua twin's `fields[2] or ''` does: a client-level probe carries no
-      // `grantId` field, so an absent one has to match its own kind.
-      const otherGrantId = this.hget(metadataKey, "grantId") ?? "";
-      if (
-        this.hget(metadataKey, "status") === "inProgress" &&
-        otherGrantId === grantId &&
-        this.hget(metadataKey, "isThawRequest") === "true"
-      ) {
+      if (this.isCompetingProbe(metadataKey, grantId, !!options.anyGrant)) {
         return true;
       }
     }
@@ -1194,21 +1590,22 @@ class MemoryBackend implements DianemoBackend {
     queueKey: string,
     metadataKeyPrefix: string,
     requestId: string,
-    grantId: string
+    grantId: string,
+    options: { anyGrant?: boolean } = {}
   ): Promise<"started" | "exists"> {
     // A client-level thaw has no grant to track; the frozen-grants set exists
     // so getNextRequest can skip individual grants.
-    if (grantId !== "") this.setOf(frozenGrantsKey).add(grantId);
+    // Expired as the Lua twin expires it: membership is normally dropped by
+    // `cleanupStaleFrozenGrants`, which only a running controller calls.
+    if (grantId !== "") {
+      this.setOf(frozenGrantsKey).add(grantId);
+      this.expire(frozenGrantsKey, 86400);
+    }
 
     for (const otherId of this.sorted(queueKey)) {
       if (otherId === requestId) continue;
       const metadataKey = `${metadataKeyPrefix}:${otherId}`;
-      const otherGrantId = this.hget(metadataKey, "grantId") ?? "";
-      if (
-        this.hget(metadataKey, "status") === "inProgress" &&
-        otherGrantId === grantId &&
-        this.hget(metadataKey, "isThawRequest") === "true"
-      ) {
+      if (this.isCompetingProbe(metadataKey, grantId, !!options.anyGrant)) {
         return "exists";
       }
     }
@@ -1249,7 +1646,7 @@ class MemoryBackend implements DianemoBackend {
         "frozenUntil"
       );
       if (raw === undefined || now >= parseFiniteStored(raw, 0)) {
-        this.live(frozenGrantsKey)?.set?.delete(grantId);
+        this.removeMember(frozenGrantsKey, grantId);
         cleaned++;
       }
     }
@@ -1270,7 +1667,7 @@ class MemoryBackend implements DianemoBackend {
       if (id === currentInstanceId) continue;
       const data = this.live(`${instanceKeyPrefix}${id}`)?.str;
       if (data) instances.push({ id, data });
-      else set.delete(id);
+      else this.removeMember(instanceSetKey, id);
     }
     return instances;
   }
@@ -1281,13 +1678,17 @@ class MemoryBackend implements DianemoBackend {
     return Date.now();
   }
 
+  /**
+   * Stops the expiry sweep and drops every subscriber. The store is kept, as
+   * the Redis backend keeps its keys: a handler started again on this backend
+   * finds what it stored, and a later write re-arms the sweep.
+   */
   async close(): Promise<void> {
     if (this.sweeper) clearInterval(this.sweeper);
     this.sweeper = null;
     this.bus.removeAllListeners();
     this.busListening = false;
     this.subscribed.clear();
-    this.store.clear();
   }
 }
 
@@ -1295,8 +1696,15 @@ class MemoryBackend implements DianemoBackend {
  * Coordinates in local memory — **single process only**.
  *
  * Each process gets its own copy of every rate limit, so running two of them
- * doubles what the vendor sees. Use {@link redisBackend} for anything that
- * scales past one process. See {@link MemoryBackend} for the full trade-offs.
+ * doubles what the vendor sees. Use `redisBackend` from
+ * `@dianemo/backend-redis` for anything that scales past one process. See
+ * {@link MemoryBackend} for the full trade-offs.
+ *
+ * ```ts
+ * import RequestHandler, { memoryBackend } from "@dianemo/core";
+ *
+ * const handler = new RequestHandler({ key, backend: memoryBackend() });
+ * ```
  */
 export function memoryBackend(): DianemoBackend {
   return new MemoryBackend();

@@ -4,7 +4,7 @@ Points a client at another client's budget. Several sets of credentials, one
 rate limit.
 
 ```ts
-{ type: "sharedLimit", clientName: "carrier:_:production" }
+rateLimit: [{ type: "sharedLimit", clientName: "carrier:_:production" }]
 ```
 
 ## When to use it
@@ -19,7 +19,13 @@ The vendor counts several credentials against **one** quota:
 If each credential has its own independent quota, do **not** use this — give
 each client its own [`requestLimit`](request-limit.md). If the credentials
 belong to different tenants of the same client and each has its own quota, use
-per-grant isolation instead.
+per-grant isolation instead — [grants](../concepts.md#grants) on an `oauth2`
+client with `grantRateLimitBehavior: "isolated"`.
+
+A client that needs the shared budget **and** a limit of its own is not
+supported: this type has no queue of its own, and a client with local budgets
+would need one. Model it as two clients instead. See
+[several limits on one client](multiple-limits.md).
 
 ## How it works
 
@@ -49,6 +55,11 @@ budget — which is usually right, because the vendor is counting them together.
 If a 429 on one credential should _not_ pause the others, they do not actually
 share a limit, and this is the wrong type.
 
+A 429's freeze is floored at the parent's shortest refill interval, matching the
+freeze the parent would arm itself; the child's own retry wait is not floored.
+A 5xx or a dropped connection freezes the shared budget for the child's
+configured back-off, `retryBackoffBaseTime`, with no floor at any interval.
+
 One consequence worth stating: a child with `retry429s: false` will not arm the
 freeze at all, so a 429 it receives does not pause its siblings. Turning off 429
 retries on one member of a shared budget disables the shared back-off with it.
@@ -67,3 +78,8 @@ The parent must exist before a client can share its limit. In a plugin's
 template builder, register the parent first: the child resolves the parent by
 name at construction, and a name that does not resolve is a configuration error
 rather than a silent fallback to unlimited.
+
+The parent must also own a budget in its own right: pointing at another
+`sharedLimit` client is refused, since that one owns nothing to share. A parent
+declaring [several limits](multiple-limits.md) is fine — the child takes the
+parent's queue as its own, so the parent's controller claims every one of them.

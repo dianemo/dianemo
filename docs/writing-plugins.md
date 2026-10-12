@@ -53,7 +53,7 @@ This is self-contained and puts no constraint on the host. It suits a plugin
 that lives in your own codebase, and a handful of request functions defined in
 one file.
 
-**From a module-scoped binding**, using
+**From a process-wide binding**, using
 [`@dianemo/plugin-kit`](https://github.com/vivo-us/dianemo-plugins/tree/master/packages/plugin-kit).
 Request functions import `tryHandleRequest` directly rather than receiving it,
 which is what lets them live in separate files without threading a context
@@ -63,10 +63,12 @@ through every one:
 npm install @dianemo/plugin-kit
 ```
 
-`plugin-kit` ships from the plugins repo rather than this one and may not be on npm
-yet. The `definePlugin` form above is in `@dianemo/core` and always available, so
-reach for it if the install fails — the two differ only in how `tryHandleRequest`
-arrives.
+`plugin-kit` ships from the plugins repo rather than this one, so its releases
+trail core's. `@dianemo/plugin-kit@1.0.0` declares a peer range of
+`@dianemo/core ^1.0.0`, so it will not install beside core 2.0 until a
+plugin-kit release widens that range. The `definePlugin`
+form above is in `@dianemo/core` and always available, so reach for it if the
+install fails — the two differ only in how `tryHandleRequest` arrives.
 
 This is what the published
 [dianemo-plugins](https://github.com/vivo-us/dianemo-plugins) catalogue uses,
@@ -99,9 +101,17 @@ export { registerAcmeTemplate } from "./client.js";
 export * from "./requests/index.js";
 ```
 
-`name` is not decoration. It is the first segment of every client name and the
-key credentials are filed under, so two plugins claiming one name would route
-one's credentials to the other's builder. `use()` refuses that.
+`name` is not decoration, and it must equal the template name the plugin passes
+to `registerClientTemplate`. That template name is the first segment of every
+client name and the key credentials are filed under. `use()` refuses two plugins
+with one `name`, but it never sees the template name, so a plugin registering a
+template under some other name escapes that check — and two templates of one
+name route one's credentials to the other's builder.
+
+Call `use()` before the first request where you can. Called on a handler that
+has already started, it registers the template there and then and builds any
+tenants already stored for it; since `use()` is synchronous, a registration
+that fails at that point is logged as an error rather than thrown.
 
 ## The template
 
@@ -123,12 +133,14 @@ export async function registerAcmeTemplate(handler: RequestHandler) {
   await handler.registerClientTemplate("acme", (creds): CreateClientData[] => [
     {
       name: buildClientName("acme", creds),
-      rateLimit: {
-        type: "requestLimit",
-        interval: 1000,
-        tokensToAdd: 100,
-        maxTokens: 100,
-      },
+      rateLimit: [
+        {
+          type: "requestLimit",
+          interval: 1000,
+          tokensToAdd: 100,
+          maxTokens: 100,
+        },
+      ],
       requestOptions: { defaults: { baseURL: creds.baseUrl } },
       authentication: {
         type: "oauth2",
@@ -149,23 +161,171 @@ export async function registerAcmeTemplate(handler: RequestHandler) {
 }
 ```
 
-Three things worth noting:
+Four things worth noting:
 
 - **The `declare module` block** is what gives `addTemplateClient("acme", …)`
   a typed credential shape at every call site. It is not optional polish:
   `ClientTemplates` is empty by design, so without it `keyof ClientTemplates` is
   `never` and neither `registerClientTemplate` nor `addTemplateClient` accepts
   the name at all.
-- **`{{clientId}}` placeholders** are substituted from the client's credentials
-  at refresh time. Write them as placeholders rather than interpolating the
-  values, so the config object never holds a secret.
+- **`{{clientId}}` placeholders** are substituted at refresh time from
+  `authentication`, which holds the secret itself in `clientSecret`. Write them
+  as placeholders rather than interpolating the values, so the secret appears
+  once there instead of being copied into the token request's `data`.
 - **The builder returns an array.** One credential set may produce several
   clients — a vendor with separate rate limits per region, or a
   [`sharedLimit`](rate-limits/shared-limit.md) child alongside its parent.
+- **What it returns is copied before core writes to it.** Plans and overrides
+  are placed on the copy, so a builder may return a module-level sub-client list
+  or a config it keeps per tenant. Under `addTemplateClient` its credentials
+  arrive as JSON reads them back from the backend: a `Date` is an ISO string by
+  then. `addLocalTemplateClient` stores nothing, so it hands the builder the
+  caller's own object unchanged.
 
 Pick the rate limit from what the vendor publishes — see
 [choosing a rate limit](rate-limits/README.md), and note that granularity
 matters more than most people expect.
+
+## Letting callers pick a plan
+
+Some vendors set the quota by subscription tier, so the template cannot know the
+right limit until it knows which plan a tenant is on. Declare the plans and let
+the caller name one:
+
+```ts
+await handler.registerClientTemplate(
+  "acme",
+  (creds): CreateClientData[] => [
+    {
+      name: buildClientName("acme", creds),
+      // …auth, baseURL, and everything else as before
+    },
+  ],
+  {
+    rateLimitOptions: {
+      free: FREE_TIER,
+      pro: [
+        { name: "per_second", type: "requestLimit", interval: 1000, tokensToAdd: 20, maxTokens: 20 },
+        { name: "per_day", type: "requestLimit", interval: 86_400_000, tokensToAdd: 50_000, maxTokens: 50_000 },
+      ],
+    },
+    defaultRateLimitOption: "free",
+  }
+);
+```
+
+The caller then names a key, and nothing else:
+
+```ts
+await handler.addTemplateClient("acme", credentials, {
+  rateLimitOption: "pro",
+});
+```
+
+What this does *not* let a caller do is supply a limit of their own. The options
+are the plugin author's constants, named by keys; a key the template does not
+declare is refused at `addTemplateClient`, and so is any key at all for a
+template that declares no options. That refusal is at the boundary rather than at
+build time on purpose — the key is stored beside the credentials, so one accepted
+now would be read back by every replica and every restart, leaving a client on
+the template default with its record saying otherwise.
+
+Operator [overrides](concepts.md#rate-limit-overrides) go beside the key, under
+`rateLimitOverrides`, and are checked at the same boundary: an override that is
+not a list or cannot be built, or an object mixing `rateLimitOption` with bare
+sub-client paths, is refused with a `ConfigurationError` before anything is
+stored.
+
+Six more things worth knowing:
+
+- **A plan may hold several limits.**
+  [A per-second and a per-day cap](rate-limits/multiple-limits.md) is exactly the
+  shape a paid tier tends to take.
+- **Plans are validated at registration.** A plan whose budget can never hand out
+  a token, a plan written as a single limit rather than a list, two unnamed
+  limits in one plan, or a `defaultRateLimitOption` naming a plan that is not
+  declared, fails the deploy that introduced it rather than the first tenant who
+  picks it.
+- **Renaming a plan does not strand its tenants, but it does change their
+  limits.** A stored key the template no longer declares is dropped, logged as an
+  error, and the client is built from the limits its builder declares — not from
+  `defaultRateLimitOption`. A builder that leaves limits to the plan declares
+  none, so its tenants on the old key run `noLimit` until they are re-added with
+  a key that exists. Keep the old key as an alias until every tenant has moved.
+- **A plan never changes what kind of client is built.** `""` reaches every root
+  client the builder returns except a
+  [`sharedLimit`](rate-limits/shared-limit.md) one, which keeps drawing on its
+  owner — and the owner is one of the roots `""` just retuned. A path whose only
+  match is a client of the other kind is skipped and logged, as an
+  [override](concepts.md#rate-limit-overrides) of that shape would be.
+- **One tenant cannot take the others down.** A tenant whose stored settings no
+  longer build is logged and skipped — at startup, and when the template is
+  registered after `start()` — and the tenants after it are built as usual.
+  Re-adding it with `addTemplateClient` replaces the stored settings.
+- **A re-add that cannot be built changes nothing.** `addTemplateClient` builds
+  the new credentials and settings before storing them, so one that throws is
+  refused with the tenant's running clients, their queued requests and the stored
+  record all left as they were.
+
+`handler.getRateLimitOptions("acme")` lists the keys, for a host rendering a
+picker.
+
+### A different limit per endpoint
+
+Vendors often publish a limit per endpoint rather than one for the account —
+Amazon's SP-API being the usual example — and a subscription tier then moves all
+of them at once. A plan can be keyed by sub-client path instead of being a single
+limit, using the same paths [overrides](concepts.md#rate-limit-overrides) use:
+`""` is the root client, `"orders"` its sub-client of that name, `"a:b"` a nested
+one.
+
+```ts
+await handler.registerClientTemplate(
+  "sp",
+  (creds): CreateClientData[] => [
+    {
+      name: buildClientName("sp", creds),
+      // The builder says which clients exist. It does not have to place a single
+      // limit — the chosen plan is applied to this tree by path.
+      subClients: [{ name: "orders" }, { name: "reports" }],
+    },
+  ],
+  {
+    rateLimitOptions: {
+      standard: {
+        "": [{ type: "requestLimit", interval: 1000, tokensToAdd: 1, maxTokens: 1 }],
+        orders: [{ type: "requestLimit", interval: 1000, tokensToAdd: 6, maxTokens: 6 }],
+        reports: [
+          { name: "per_second", type: "requestLimit", interval: 1000, tokensToAdd: 2, maxTokens: 2 },
+          { name: "per_day", type: "requestLimit", interval: 86_400_000, tokensToAdd: 500, maxTokens: 500 },
+        ],
+      },
+      premium: { /* the same paths, larger budgets */ },
+    },
+    defaultRateLimitOption: "standard",
+  }
+);
+```
+
+- **Every path of every plan is validated at registration**, which is the reason
+  to declare the tree here rather than keep it in a private constant the plugin
+  reads itself. A broken budget four endpoints deep fails the deploy.
+- **The plan applies before any operator override**, so an override still wins
+  for the one path it names and the plan holds everywhere else.
+- **A path matching no client is reported.** A renamed sub-client would otherwise
+  leave that endpoint running unlimited while the plan still claimed to cover it.
+- **The builder can still read the plan.** `ctx.rateLimits` is the whole resolved
+  map and `ctx.rateLimit` its `""` entry, for a builder that wants to decide
+  whether a sub-client should exist at all. Each build gets its own copy, so a
+  builder adjusting it for one tenant changes nothing for the others.
+  `ctx.rateLimitOption` is there for everything a tier changes that is *not* a
+  rate limit — a different base URL for enterprise, an endpoint an entry tier
+  does not get.
+
+Operator-side [rate-limit overrides](concepts.md#rate-limit-overrides) are a
+separate mechanism and need no permission from the template. Plans are the
+sanctioned choice offered to a caller; overrides are the escape hatch for whoever
+runs the deployment.
 
 ## Request functions
 
@@ -191,7 +351,7 @@ export const cancelShipment = async (
 ```
 
 A request function's signature is **its own domain arguments** — a client name
-and the data. No handler parameter. That is the whole point of the module-scoped
+and the data. No handler parameter. That is the whole point of the process-wide
 binding: `tryHandleRequest` is already bound to the owning handler, so a request
 function stays callable without threading a handler through every layer.
 
@@ -204,8 +364,10 @@ a failure greppable across services.
 
 ## The binding, and its one rule
 
-`bindTryHandleRequest(ctx)` establishes a **module-scoped** binding shared by
-every plugin in the process.
+`bindTryHandleRequest(ctx)` establishes a **process-wide** binding shared by
+every plugin in the process. It is kept on `globalThis` under a `Symbol.for`
+key rather than in a module variable, so two copies of plugin-kit installed side
+by side still see one binding.
 
 The cost is one handler per process. A second handler is refused loudly rather
 than silently rerouting the first one's traffic — which would be a genuinely
@@ -221,14 +383,17 @@ cache — a session cookie one replica logs in for and the rest reuse, a payment
 token with a server-side TTL:
 
 ```ts
-import { backend, acquireLock, releaseLock } from "@dianemo/plugin-kit";
+import { acquireLock, backend, pluginKey, releaseLock } from "@dianemo/plugin-kit";
 
-await backend().set(`acme:token:${clientName}`, token, ttlSeconds);
-const cached = await backend().get(`acme:token:${clientName}`);
+const key = pluginKey("acme", "token", clientName);
+await backend().set(key, token, ttlSeconds);
+const cached = await backend().get(key);
 ```
 
-Namespace keys by plugin name — the backend is shared with the handler's own
-bookkeeping and with every other plugin.
+Build keys with `pluginKey(plugin, ...parts)` rather than by hand. The backend
+is shared with the handler's own bookkeeping, with every other plugin, and — if
+the host set a `keyPrefix` — with every other handler on the same Redis.
+`pluginKey` folds that prefix in; a key written as a bare string skips it.
 
 **How far that sharing reaches is the host's choice, not yours.** Under
 [`@dianemo/backend-redis`](backends/redis.md) the cache is fleet-wide; under the
@@ -251,11 +416,12 @@ every consumer silently lost type safety.
 
 ## Checklist
 
-- [ ] `name` is unique and matches the client-name prefix
+- [ ] `name` is unique and equals the template name it registers
 - [ ] `declare module` block types the credentials
-- [ ] Secrets appear only as `{{placeholders}}` in refresh config
+- [ ] Secrets sit in `authentication` and appear only as `{{placeholders}}` in
+      refresh config
 - [ ] Rate limit reflects what the vendor actually publishes
 - [ ] `requestName` is dotted, namespaced, and describes the operation
 - [ ] Every request function takes domain arguments only, no handler
-- [ ] Backend keys are namespaced by plugin name
+- [ ] Backend keys are built with `pluginKey`
 - [ ] A test composes the plugin onto a handler and checks the namespace

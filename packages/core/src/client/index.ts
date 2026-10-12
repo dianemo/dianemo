@@ -1,6 +1,7 @@
 import type { RequestDoneData, RequestMetadata } from "../request/types.js";
 import { ClientUnavailableError, NotOAuth2ClientError } from "../errors.js";
-import type { DianemoBackend, FreezeState } from "../backend/types.js";
+import { costCeilingFor, normalizeRateLimit } from "../utils/rateLimit.js";
+import { isCredentialWriteRetired } from "./methods/authenticate.js";
 import { REQUEST_TOMBSTONE_TTL_SECONDS } from "../backend/ttl.js";
 import processRequests from "./methods/processRequests.js";
 import type { QueuedRequest } from "../backend/types.js";
@@ -15,6 +16,11 @@ import {
   credentialTtlSeconds,
   DEFAULT_REFRESH_TOKEN_TTL_SECONDS,
 } from "../utils/credentialTtl.js";
+import type {
+  DianemoBackend,
+  FreezeState,
+  MultiLimitSpec,
+} from "../backend/types.js";
 
 /**
  * Shortest base duration for a client-wide freeze, used when the configured
@@ -31,12 +37,22 @@ const MIN_FREEZE_BASE_MS = 1000;
  */
 const MAX_DRAIN_DELAY_MS = 60_000;
 
+/**
+ * How many times an owner re-announces a completion no controller has
+ * acknowledged before giving up on it, whatever kept it unacknowledged. Bounds
+ * the traffic and the memory; long past any election gap.
+ */
+const MAX_COMPLETION_FORWARDS = 30;
+
 interface PendingRequestDone {
   data: RequestDoneData;
   queueHandled: boolean;
   ownTypeHandled: boolean;
   freezeHandled: boolean;
   thawHandled: boolean;
+  /** When the owner next re-announces it, if still unacknowledged. */
+  forwardDueAt: number;
+  forwards: number;
 }
 
 abstract class BaseClient {
@@ -55,7 +71,7 @@ abstract class BaseClient {
   protected authNamespace: string;
   protected emitter: NodeJS.EventEmitter;
   protected logger: Logger;
-  protected abstract rateLimit: ClientTypes.RateLimitData;
+  protected abstract rateLimit: ClientTypes.NamedRateLimitData[];
   protected metadata?: { [key: string]: unknown };
   protected requestOptions: ClientTypes.RequestOptions;
   protected authData?: ClientTypes.AuthCreateData;
@@ -147,7 +163,9 @@ abstract class BaseClient {
   public abstract handleRateLimitUpdated(
     data: ClientTypes.RateLimitUpdatedData
   ): Promise<void> | void;
-  protected abstract getRateLimitStats(): Promise<ClientTypes.RateLimitStats>;
+  protected abstract getRateLimitStats(): Promise<
+    ClientTypes.NamedRateLimitStats[]
+  >;
 
   /**
    * Whether this request can skip the queue entirely.
@@ -163,19 +181,27 @@ abstract class BaseClient {
     return false;
   }
   /**
-   * Gives back whatever `canProcessNextRequest` claimed, when the caller then
-   * decides not to run the request after all.
+   * Returns capacity claimed for an attempt that will not be dispatched.
    *
-   * Admission and claiming are the same step for a concurrency client, so any
-   * path that admits and then backs out strands a slot until its TTL expires.
-   * No-op for the client types that claim nothing.
+   * Capacity is claimed only by `tryAcquireTurn` and the `tryAdmitImmediately`
+   * fast path, so this is the only path that gives it back outside of
+   * completion.
    */
-  protected async releaseAdmission(_request: RequestMetadata): Promise<void> {}
-
   protected async refundUnusedAdmission(
-    request: RequestMetadata
-  ): Promise<void> {
-    await this.releaseAdmission(request);
+    _request: RequestMetadata
+  ): Promise<void> {}
+
+  /**
+   * Whether a claim here has to be handed back explicitly, rather than simply
+   * being spent.
+   *
+   * True for a concurrency budget, whose slot is released on completion — so a
+   * request that completed while it was being admitted leaves a slot nothing
+   * will ever release. Only those clients pay the extra read that catches it;
+   * a token bucket's spend is not recoverable that way and never was.
+   */
+  protected claimsReleasableCapacity(): boolean {
+    return false;
   }
 
   /** Returns capacity claimed for an attempt that will not be dispatched. */
@@ -191,16 +217,6 @@ abstract class BaseClient {
    * and uninformatively. Subclasses with such a dependency throw here instead.
    */
   protected async assertReadyToQueue(): Promise<void> {}
-
-  /**
-   * Whether admission claims capacity that must later be handed back.
-   *
-   * Only these clients need the drain loop to confirm a request is still queued
-   * after claiming, so the rest do not pay the extra read on the hot path.
-   */
-  protected claimsOnAdmission(): boolean {
-    return false;
-  }
 
   /**
    * Claims whatever budget the request still needs, without ever blocking: the
@@ -275,11 +291,20 @@ abstract class BaseClient {
    * Subclasses override to raise the floor further and must fold this result in
    * rather than re-reading the raw field.
    */
-  protected getFreezeBaseTime(): number {
+  protected getFreezeBaseTime(_isRateLimited = false): number {
     const base = this.retryOptions.retryBackoffBaseTime;
     return Number.isFinite(base) && base > 0 ? base : MIN_FREEZE_BASE_MS;
   }
   protected abstract handleDestroy(finalRemoval: boolean): Promise<void> | void;
+
+  /**
+   * Whether a freeze of this kind empties a bucket here, recorded on the freeze
+   * so the backends refuse a refund under it only when there is a balance to
+   * protect. Nothing here owns a bucket.
+   */
+  protected freezeEmptiesBucket(_isRateLimited: boolean): boolean {
+    return false;
+  }
 
   // ------------------------------------------------------- key helpers
 
@@ -327,6 +352,14 @@ abstract class BaseClient {
     return `${this.getMetadataKeyPrefix()}:${requestId}`;
   }
 
+  /** Grant-isolated clients track slots per grant. */
+  protected getConcurrencyKey(grantId?: string): string {
+    const baseKey = `${this.namespace}:concurrency`;
+    if (!grantId) return baseKey;
+    if (!this.usesGrantIsolation()) return baseKey;
+    return `${this.namespace}:grant:${grantId}:concurrency`;
+  }
+
   /** Grant-isolated clients freeze each grant independently. */
   protected getFreezeStateKey(grantId?: string): string {
     const baseKey = `${this.namespace}:freezeState`;
@@ -349,12 +382,19 @@ abstract class BaseClient {
    * update local state.
    */
   protected async updateRateLimit(
-    data: ClientTypes.RateLimitData,
+    data: ClientTypes.DeclaredRateLimit[],
     source: ClientTypes.RateLimitUpdatedData["source"] = "operator"
   ) {
     const updatedData: ClientTypes.RateLimitUpdatedData = {
       clientName: this.name,
-      rateLimit: data,
+      // Normalised here rather than at each receiver, so every listener and every
+      // `handleRateLimitUpdated` sees the one shape. Against the budget owner's
+      // current limits, so an update that leaves a name out keeps that limit's
+      // budget — a `sharedLimit` child's own list names no budget at all.
+      rateLimit: normalizeRateLimit(
+        data,
+        this.getParentRateLimit?.() ?? this.rateLimit
+      ),
       source,
       publisherInstanceId: this.instanceId,
     };
@@ -475,12 +515,7 @@ abstract class BaseClient {
     }
   }
 
-  /**
-   * Destroys the client and cleans up resources. Async because
-   * `ConcurrencyLimitClient.handleDestroy` needs to release backend-tracked
-   * concurrency slots before the new client takes over — without the await
-   * the new client would see the old slots still held.
-   */
+  /** Destroys the client and cleans up resources. */
   public async destroy(reason: ClientTypes.ClientDestroyReason): Promise<void> {
     await this.handleDestroy(reason === "finalRemoval");
     this.removeHealthCheckInterval();
@@ -520,7 +555,7 @@ abstract class BaseClient {
 
   /** Records a grant id so removal can find its credentials later. */
   public async trackGrantId(grantId: string): Promise<void> {
-    if (!grantId) return;
+    if (!grantId || isCredentialWriteRetired(this)) return;
     const key = `${this.authNamespace}:grants`;
     await this.backend.sadd(key, grantId);
     // The index outlives the hashes it points at, so without a TTL it is the one
@@ -620,10 +655,14 @@ abstract class BaseClient {
    * Leaving it to time out told the caller the controller was slow, a minute
    * later, when the real answer — its cost no longer fits the budget — was known
    * immediately and is a different class of error.
+   *
+   * A waiter on another client of this replica is reached through the
+   * handler-wide emitter: a `sharedLimit` child registers its waiters on itself,
+   * while the budget owner is the one draining the queue.
    */
   public failWaitingRequest(requestId: string, error: Error): boolean {
     const cancel = this.waitingRequests.get(requestId);
-    if (!cancel) return false;
+    if (!cancel) return this.emitter.emit(`requestFailed:${requestId}`, error);
     this.waitingRequests.delete(requestId);
     cancel(error);
     return true;
@@ -646,7 +685,7 @@ abstract class BaseClient {
     }
     previous.pendingRequestDone.clear();
     for (const completionId of previous.completedRequestIds) {
-      this.completedRequestIds.add(completionId);
+      this.rememberCompleted(completionId);
     }
     previous.completedRequestIds.clear();
   }
@@ -695,7 +734,7 @@ abstract class BaseClient {
     return this.role;
   }
 
-  public getRateLimit() {
+  public getRateLimit(): ClientTypes.NamedRateLimitData[] {
     return this.rateLimit;
   }
 
@@ -714,6 +753,7 @@ abstract class BaseClient {
     const wasWorker = this.role === "worker";
     this.role = role;
     if (wasWorker && role === "controller") {
+      this.dropRetainedCopies();
       await this.flushPendingRequestDone();
       await this.cleanupOrphanedRequests();
       await this.cleanupStaleFrozenGrants();
@@ -798,25 +838,41 @@ abstract class BaseClient {
   /**
    * The largest `cost` this client could ever admit, or undefined when it has no
    * ceiling. A `sharedLimit` client answers for its parent, whose budget it
-   * spends; `noLimit` has none.
+   * spends; `noLimit` has none, and several limits are bounded by the tightest.
    */
   protected getCostCeiling(): number | undefined {
-    const limit = this.rateLimit;
-    if (limit.type === "requestLimit") return limit.maxTokens;
-    if (limit.type === "concurrencyLimit") return limit.maxConcurrency;
-    if (limit.type === "sharedLimit") {
-      const parent = this.getParentRateLimit?.();
-      if (parent?.type === "requestLimit") return parent.maxTokens;
-      if (parent?.type === "concurrencyLimit") return parent.maxConcurrency;
-    }
-    return undefined;
+    return costCeilingFor(this.rateLimit, () => this.getParentRateLimit?.());
   }
 
   /**
    * Resolves the rate limit this client draws on, for a `sharedLimit` child.
    * Injected by `createClients`, which is where the client registry lives.
    */
-  public getParentRateLimit?: () => ClientTypes.RateLimitData | undefined;
+  public getParentRateLimit?: () =>
+    ClientTypes.NamedRateLimitData[] | undefined;
+
+  /**
+   * The budgets a request must claim here, in the form the backend takes them.
+   * Empty for a client with nothing to meter against.
+   */
+  public getLimitSpecs(
+    _grantId: string | undefined,
+    _slotId: string
+  ): MultiLimitSpec[] {
+    return [];
+  }
+
+  /**
+   * Member id a request's capacity is recorded under. Each attempt claims and
+   * releases its own, so a retry cannot release the slot its predecessor holds.
+   */
+  protected getSlotId(
+    request: Pick<RequestMetadata, "requestId" | "retries">
+  ): string {
+    return request.retries === 0
+      ? request.requestId
+      : `${request.requestId}:retry:${request.retries}`;
+  }
 
   /**
    * Re-runs role election. Injected by the handler, which owns the instance
@@ -917,7 +973,8 @@ abstract class BaseClient {
 
   /**
    * Records a completion on every replica that observes it. Only the current
-   * controller applies cleanup; workers retain the record across election gaps.
+   * controller applies cleanup; the request's owner re-announces it until a
+   * controller acknowledges it. See docs/design-notes.md#completion-hand-off.
    */
   public async finalizeOwnedRequest(data: RequestDoneData): Promise<void> {
     if (this.replacementClient) {
@@ -936,16 +993,61 @@ abstract class BaseClient {
         return;
       }
     }
-    const completionId = `${data.requestId}:${data.retries}:${data.responseStatus}`;
-    if (this.completedRequestIds.has(completionId)) return;
+    const completionId = completionIdOf(data);
+    if (this.completedRequestIds.has(completionId)) {
+      // A re-announcement of something already applied: the owner missed the
+      // acknowledgement, and will keep re-announcing until it gets one.
+      if (this.role === "controller") await this.acknowledgeCompletion(data);
+      return;
+    }
     this.storePendingRequestDone(data);
     if (this.role === "controller") {
       await this.flushPendingRequestDone(completionId);
     }
   }
 
+  /**
+   * The controller's word to a completion's owner that it has been applied,
+   * which is what stops the owner re-announcing it. Never sent to itself.
+   */
+  private async acknowledgeCompletion(data: RequestDoneData): Promise<void> {
+    if (data.ownerId === this.instanceId) return;
+    await this.backend
+      .publish(
+        `${this.handlerNamespace}:requestDoneApplied:${data.ownerId}`,
+        JSON.stringify({
+          clientName: data.clientName,
+          completionId: completionIdOf(data),
+        })
+      )
+      .catch((error: unknown) => {
+        this.logger.debug(
+          { error },
+          `Client ${this.name} | could not acknowledge a completion; its owner will re-announce it`
+        );
+      });
+  }
+
+  /** A controller has applied this completion, so the owner stops announcing it. */
+  public handleRequestDoneApplied(completionId: string): void {
+    if (this.replacementClient) {
+      this.replacementClient.handleRequestDoneApplied(completionId);
+      return;
+    }
+    this.pendingRequestDone.delete(completionId);
+    this.rememberCompleted(completionId);
+  }
+
+  private rememberCompleted(completionId: string): void {
+    this.completedRequestIds.add(completionId);
+    if (this.completedRequestIds.size > 10_000) {
+      const oldest = this.completedRequestIds.values().next().value;
+      if (oldest) this.completedRequestIds.delete(oldest);
+    }
+  }
+
   private storePendingRequestDone(data: RequestDoneData): void {
-    const completionId = `${data.requestId}:${data.retries}:${data.responseStatus}`;
+    const completionId = completionIdOf(data);
     if (this.completedRequestIds.has(completionId)) return;
     if (!this.pendingRequestDone.has(completionId)) {
       this.pendingRequestDone.set(completionId, {
@@ -954,6 +1056,10 @@ abstract class BaseClient {
         ownTypeHandled: false,
         freezeHandled: false,
         thawHandled: false,
+        // A full tick's grace, so the acknowledgement of the original
+        // announcement normally arrives before any re-announcement is due.
+        forwardDueAt: Date.now() + this.healthCheckIntervalMs,
+        forwards: 0,
       });
       // New work gets its own retry budget: the cap in
       // `scheduleCompletionForward` is meant to bound one burst's spin while a
@@ -965,6 +1071,7 @@ abstract class BaseClient {
   private scheduleCompletionForward(): void {
     if (this.completionForwardTimer || this.completionForwardAttempts >= 50)
       return;
+    if (this.admissionHalted) return;
     this.completionForwardAttempts++;
     this.completionForwardTimer = setTimeout(() => {
       this.completionForwardTimer = undefined;
@@ -992,16 +1099,37 @@ abstract class BaseClient {
       return;
     }
 
+    this.dropRetainedCopies();
+    const now = Date.now();
     for (const [completionId, pending] of this.pendingRequestDone) {
-      if (pending.data.ownerId === this.instanceId) {
-        await this.backend.publish(
-          `${this.handlerNamespace}:requestDone`,
-          JSON.stringify(pending.data)
+      if (now < pending.forwardDueAt) continue;
+      if (pending.forwards >= MAX_COMPLETION_FORWARDS) {
+        this.logger.warn(
+          `Client ${this.name} | no controller acknowledged completion ${completionId} after ${pending.forwards} announcements; giving up on it`
         );
+        this.pendingRequestDone.delete(completionId);
+        this.rememberCompleted(completionId);
+        continue;
       }
-      // Role reconciliation above established that another replica is the
-      // controller, which now owns the retained copy.
-      this.pendingRequestDone.delete(completionId);
+      pending.forwards++;
+      pending.forwardDueAt = now + this.healthCheckIntervalMs;
+      await this.backend.publish(
+        `${this.handlerNamespace}:requestDone`,
+        JSON.stringify(pending.data)
+      );
+    }
+  }
+
+  /**
+   * Drops the copies of other replicas' completions this one retained; their
+   * owners re-announce them. See docs/design-notes.md#completion-hand-off.
+   */
+  private dropRetainedCopies(): void {
+    if (this.getBudgetOwnerClient) return;
+    for (const [completionId, pending] of this.pendingRequestDone) {
+      if (pending.data.ownerId !== this.instanceId) {
+        this.pendingRequestDone.delete(completionId);
+      }
     }
   }
 
@@ -1024,11 +1152,8 @@ abstract class BaseClient {
         try {
           await this.handleRequestDone(pending);
           this.pendingRequestDone.delete(completionId);
-          this.completedRequestIds.add(completionId);
-          if (this.completedRequestIds.size > 10_000) {
-            const oldest = this.completedRequestIds.values().next().value;
-            if (oldest) this.completedRequestIds.delete(oldest);
-          }
+          this.rememberCompleted(completionId);
+          await this.acknowledgeCompletion(pending.data);
         } catch (error) {
           this.logger.error(
             { error },
@@ -1089,19 +1214,24 @@ abstract class BaseClient {
       // through. This timer routinely outlives the handler that scheduled it, so
       // the rejection guard keeps an unheld promise from surfacing in the host
       // process, and the retained handle lets shutdown cancel a pending freeze.
-      const timer = setTimeout(() => {
-        this.freezeTimers.delete(timer);
-        void (async () => {
-          if (data.grantId) await this.removeFrozenGrantId(data.grantId);
-          await this.processRequests();
-        })().catch((error) => {
-          this.logger.error(
-            { error },
-            `Client ${this.name} | post-freeze processing failed`
-          );
-        });
-      }, waitFor);
-      this.freezeTimers.add(timer);
+      // A halted client books none: it admits nothing, shutdown has already
+      // cleared the timers this would join, and the next controller sweeps the
+      // frozen-grant mark.
+      if (!this.admissionHalted) {
+        const timer = setTimeout(() => {
+          this.freezeTimers.delete(timer);
+          void (async () => {
+            if (data.grantId) await this.removeFrozenGrantId(data.grantId);
+            await this.processRequests();
+          })().catch((error) => {
+            this.logger.error(
+              { error },
+              `Client ${this.name} | post-freeze processing failed`
+            );
+          });
+        }, waitFor);
+        this.freezeTimers.add(timer);
+      }
       pending.freezeHandled = true;
     } else if (!(data.freezeClient && freezeFor)) {
       pending.freezeHandled = true;
@@ -1144,7 +1274,7 @@ abstract class BaseClient {
       await this.backend.updateThawProgress(
         this.getFreezeStateKey(data.grantId),
         data.responseStatus === "success",
-        `${data.requestId}:${data.retries}:${data.responseStatus}`
+        completionIdOf(data)
       );
 
       // Clearing the frozen mark releases the single-probe claim, whether the
@@ -1193,14 +1323,18 @@ abstract class BaseClient {
     const state = await this.backend.armFreeze(
       this.getFreezeStateKey(data.grantId),
       requestedUntil,
-      thawCount
+      thawCount,
+      { emptiesBucket: this.freezeEmptiesBucket(data.isRateLimited) }
     );
     const frozenUntil = state.frozenUntil;
 
     // Arm first so no request or abort refund can enter between emptying a
     // token bucket and publishing the freeze. Admission consults this key, and
-    // shipped backends also refuse refunds while it is live.
-    await this.handleFreezeOwnTypeRequests(data.grantId);
+    // shipped backends also refuse refunds while it is live. Only a 429 says
+    // the budget was wrong; a 5xx or a dropped socket leaves it as it is.
+    if (data.isRateLimited) {
+      await this.handleFreezeOwnTypeRequests(data.grantId);
+    }
 
     if (data.grantId) await this.addFrozenGrantId(data.grantId);
 
@@ -1255,12 +1389,9 @@ abstract class BaseClient {
   // ---------------------------------------------- freeze state helpers
 
   /**
-   * Whether the next queued request may proceed now. With an isolated grant,
-   * the freeze state consulted is that grant's own.
-   *
-   * Takes the whole request because subclasses decide on more than the grant:
-   * a concurrency-limited client claims its slot here, so that a request which
-   * cannot proceed leaves the admission loop free instead of blocking it.
+   * Whether the next queued request may proceed now, judged on freeze state
+   * alone. With an isolated grant, the freeze state consulted is that grant's
+   * own. Claims nothing: every budget is claimed later, by `tryAcquireTurn`.
    */
   protected async canProcessNextRequest(request: RequestMetadata): Promise<{
     canProcess: boolean;
@@ -1298,11 +1429,9 @@ abstract class BaseClient {
         .canProcessRequest(this.getFreezeStateKey(grantId))
         .catch(() => undefined);
       // Only a freeze that still refuses carries a wake-up. `frozenUntil` is
-      // reported whenever freeze state exists at all, so a client whose freeze has
-      // lapsed with probes open reports a deadline in the past — and a refusal there
-      // came from something else, an occupied concurrency slot, which its release
-      // wakes. Booking on that past deadline instead made every pass re-decline and
-      // re-book against `scheduleDrain`'s 1ms floor.
+      // reported whenever freeze state exists at all, so a freeze that has
+      // lapsed reports a deadline in the past, and booking on it would
+      // re-decline and re-book every pass against `scheduleDrain`'s 1ms floor.
       if (!state || state.canProcess) return;
       deadline = state.frozenUntil;
     }
@@ -1313,9 +1442,20 @@ abstract class BaseClient {
     this.scheduleDrain(deadline - now);
   }
 
+  /** Public view of {@link getFreezeStateKey}, for a client spending this budget. */
+  public getFreezeStateKeyFor(grantId?: string): string {
+    return this.getFreezeStateKey(grantId);
+  }
+
+  /** Public view of {@link isFrozen}, for a client spending this one's budget. */
+  public async isBudgetFrozen(grantId?: string): Promise<boolean> {
+    return this.isFrozen(grantId);
+  }
+
   /**
-   * Whether the client is frozen right now. Unlike `canProcessNextRequest` this
-   * claims nothing, so it is safe to call repeatedly from inside a wait loop.
+   * Whether the client, or with an isolated grant that grant, is frozen right
+   * now. Claims nothing, so it is safe to call repeatedly from inside a wait
+   * loop.
    */
   protected async isFrozen(grantId?: string): Promise<boolean> {
     const { canProcess } = await this.backend.canProcessRequest(
@@ -1329,13 +1469,15 @@ abstract class BaseClient {
     return this.backend.hasThawRequestInProgress(
       this.getQueueKey(),
       this.getMetadataKeyPrefix(),
-      grantId
+      grantId,
+      { anyGrant: !this.usesGrantIsolation() }
     );
   }
 
   /**
-   * Claims this request as the grant's single thaw probe, returning "exists" if
-   * another already holds the claim.
+   * Claims this request as the single thaw probe for its freeze — the grant's
+   * with isolation, the client's without — returning "exists" if another
+   * already holds the claim.
    *
    * Marking the grant frozen, checking for an existing probe and staking the
    * claim have to be one atomic step, or two controllers racing each other
@@ -1345,12 +1487,16 @@ abstract class BaseClient {
     grantId: string | undefined,
     requestId: string
   ): Promise<"started" | "exists"> {
+    // Without isolation every grant shares the one freeze, so a probe of any
+    // grant holds the claim.
+    const isolated = this.usesGrantIsolation();
     return this.backend.tryStartThawRequest(
       this.getFrozenGrantsKey(),
       this.getQueueKey(),
       this.getMetadataKeyPrefix(),
       requestId,
-      grantId ?? ""
+      isolated ? (grantId ?? "") : "",
+      { anyGrant: !isolated }
     );
   }
 
@@ -1442,6 +1588,14 @@ abstract class BaseClient {
     if (!this.authData || this.authData.type !== "oauth2") {
       throw new NotOAuth2ClientError(this.name);
     }
+    // A removed client's credentials have been purged; writing these would
+    // leave a grant behind that no removal can find again.
+    if (isCredentialWriteRetired(this)) {
+      throw new ClientUnavailableError(
+        "client_removed",
+        `Client "${this.name}" has been removed, so grant tokens for "${grantId}" were not stored.`
+      );
+    }
     const key = `${this.authNamespace}:oauth2:${grantId}`;
     // One TTL covers the whole hash, and the hash holds the refresh token, so
     // it must be sized from the refresh token's lifetime. Sizing it from the
@@ -1474,11 +1628,25 @@ abstract class BaseClient {
     );
     // Nothing else knows which grants exist, and removal has to enumerate them.
     await this.trackGrantId(grantId);
+    // A removal that purged while the write was in flight never saw this
+    // grant, so the write has to undo itself.
+    if (isCredentialWriteRetired(this)) {
+      await this.backend.del(key);
+      throw new ClientUnavailableError(
+        "client_removed",
+        `Client "${this.name}" was removed while grant tokens for "${grantId}" were being stored; they were discarded.`
+      );
+    }
 
     this.logger.debug(
       `Set grant tokens for client ${this.name}, grant ${grantId}`
     );
   }
+}
+
+/** One attempt's outcome: a retry and the attempt after it are different. */
+function completionIdOf(data: RequestDoneData): string {
+  return `${data.requestId}:${data.retries}:${data.responseStatus}`;
 }
 
 /**

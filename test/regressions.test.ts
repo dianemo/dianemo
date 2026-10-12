@@ -86,6 +86,71 @@ describe.each(harnesses(8))("regressions — $name", (harness) => {
    * later request to that client timed out. Permanently, on the single most
    * ordinary sequence there is.
    */
+  it("refunds and reports an abort that lands after admission, before dispatch", async () => {
+    const { backend, cleanup } = await harness.create();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend,
+      keyPrefix: "abort",
+    });
+    const controller = new AbortController();
+    await handler.registerClientTemplate(
+      "abort" as never,
+      ((c: { instanceId: string }) => [
+        {
+          name: `abort:_:${c.instanceId}`,
+          rateLimit: [
+            {
+              type: "requestLimit",
+              maxTokens: 5,
+              tokensToAdd: 5,
+              interval: 600_000,
+            },
+          ],
+          requestOptions: {
+            defaults: { baseURL: upstream.baseURL },
+            requestInterceptor: (config: Record<string, unknown>) => {
+              controller.abort();
+              return config;
+            },
+          },
+        },
+      ]) as never
+    );
+    try {
+      await handler.addTemplateClient(
+        "abort" as never,
+        {
+          instanceId: "a",
+        } as never
+      );
+      const sent = upstream.seen().length;
+      await expect(
+        handler.handleRequest({
+          clientName: "abort:_:a",
+          requestName: "t",
+          method: "GET",
+          url: "/",
+          signal: controller.signal,
+        })
+      ).rejects.toMatchObject({ code: "request_aborted" });
+      expect(upstream.seen().length).toBe(sent);
+      expect(
+        await waitFor(
+          async () =>
+            (
+              (await handler.getClientStats("abort:_:a")).rateLimit[0] as {
+                tokens?: number;
+              }
+            ).tokens === 5
+        )
+      ).toBe(true);
+    } finally {
+      await handler.stop();
+      await cleanup();
+    }
+  });
+
   it("leaves no phantom queue entry when a fast-path request retries", async () => {
     upstream.script(429, 200);
     await withHandler(
@@ -100,12 +165,14 @@ describe.each(harnesses(8))("regressions — $name", (harness) => {
           // freeze landed before the retry re-checked admission, which is a
           // pub/sub round-trip on Redis and a microtask in memory — so the bug
           // reproduced on one backend and not the other.
-          rateLimit: {
-            type: "requestLimit",
-            maxTokens: 1,
-            tokensToAdd: 1,
-            interval: 150,
-          },
+          rateLimit: [
+            {
+              type: "requestLimit",
+              maxTokens: 1,
+              tokensToAdd: 1,
+              interval: 150,
+            },
+          ],
         },
       ],
       async (handler) => {
@@ -147,7 +214,7 @@ describe.each(harnesses(8))("regressions — $name", (harness) => {
     await withHandler(
       harness,
       upstream.baseURL,
-      [{ name: "nolimit", rateLimit: { type: "noLimit" } }],
+      [{ name: "nolimit", rateLimit: [{ type: "noLimit" }] }],
       async (_handler, backend) => {
         const freezeKey = "rg:requestHandler:nolimit:_:a:freezeState";
         await backend.setFreezeState(freezeKey, Date.now() + 60_000, 3);
@@ -235,18 +302,20 @@ describe("sharedLimit credential isolation", () => {
       (() => [
         {
           name: "isoparent:_:a",
-          rateLimit: {
-            type: "requestLimit",
-            maxTokens: 50,
-            tokensToAdd: 50,
-            interval: 1000,
-          },
+          rateLimit: [
+            {
+              type: "requestLimit",
+              maxTokens: 50,
+              tokensToAdd: 50,
+              interval: 1000,
+            },
+          ],
           authentication: oauth("PARENT_ID"),
           requestOptions: { defaults: { baseURL } },
         },
         {
           name: "isochild:_:a",
-          rateLimit: { type: "sharedLimit", clientName: "isoparent:_:a" },
+          rateLimit: [{ type: "sharedLimit", clientName: "isoparent:_:a" }],
           authentication: oauth("CHILD_ID"),
           requestOptions: { defaults: { baseURL } },
         },
@@ -327,7 +396,7 @@ describe("credential TTL", () => {
  * config at any layer.
  */
 describe("unusable rate limits", () => {
-  const build = async (rateLimit: Record<string, unknown>) => {
+  const build = async (rateLimit: Record<string, unknown>[]) => {
     const { memoryBackend } =
       await import("../packages/core/src/backend/memory.js");
     const backend = memoryBackend();
@@ -347,34 +416,40 @@ describe("unusable rate limits", () => {
 
   it("rejects tokensToAdd of 0 at construction", async () => {
     await expect(
-      build({
-        type: "requestLimit",
-        maxTokens: 10,
-        tokensToAdd: 0,
-        interval: 1000,
-      })
+      build([
+        {
+          type: "requestLimit",
+          maxTokens: 10,
+          tokensToAdd: 0,
+          interval: 1000,
+        },
+      ])
     ).rejects.toThrow(/tokensToAdd must be greater than 0/);
   });
 
   it("rejects a non-positive interval", async () => {
     await expect(
-      build({
-        type: "requestLimit",
-        maxTokens: 10,
-        tokensToAdd: 1,
-        interval: 0,
-      })
+      build([
+        {
+          type: "requestLimit",
+          maxTokens: 10,
+          tokensToAdd: 1,
+          interval: 0,
+        },
+      ])
     ).rejects.toThrow(/interval must be greater than 0/);
   });
 
   it("rejects a NaN budget rather than wedging later", async () => {
     await expect(
-      build({
-        type: "requestLimit",
-        maxTokens: Number.NaN,
-        tokensToAdd: 1,
-        interval: 1000,
-      })
+      build([
+        {
+          type: "requestLimit",
+          maxTokens: Number.NaN,
+          tokensToAdd: 1,
+          interval: 1000,
+        },
+      ])
     ).rejects.toThrow(/maxTokens must be greater than 0/);
   });
 });
@@ -425,7 +500,7 @@ async function withAttemptCounting(
     (() => [
       {
         name: "spin:_:a",
-        rateLimit: { type: "requestLimit", ...rateLimit },
+        rateLimit: [{ type: "requestLimit", ...rateLimit }],
         requestOptions: { defaults: { baseURL } },
       },
     ]) as never
@@ -598,7 +673,7 @@ describe("an absent rate limit is the only one that defaults", () => {
       const loaded = handler
         .getLoadedClients()
         .find((c) => c.name === "caps:_:a");
-      expect(loaded?.rateLimit.type).toBe("noLimit");
+      expect(loaded?.rateLimit).toEqual([{ type: "noLimit", name: "default" }]);
     } finally {
       await handler.stop();
     }
@@ -633,12 +708,14 @@ describe("an absent rate limit is the only one that defaults", () => {
   it("refuses an explicitly undefined rateLimit on a sub-client", async () => {
     const { handler, add } = await build(
       {
-        rateLimit: {
-          type: "requestLimit",
-          interval: 1_000,
-          tokensToAdd: 5,
-          maxTokens: 5,
-        },
+        rateLimit: [
+          {
+            type: "requestLimit",
+            interval: 1_000,
+            tokensToAdd: 5,
+            maxTokens: 5,
+          },
+        ],
       },
       { subClients: [{ name: "child", rateLimit: undefined }] }
     );
@@ -652,7 +729,7 @@ describe("an absent rate limit is the only one that defaults", () => {
   /** A misspelled type must not fall back to "no limit" either. */
   it("refuses a named rate-limit type it does not recognise", async () => {
     const { handler, add } = await build({
-      rateLimit: { type: "requestLimitt", interval: 1, tokensToAdd: 1 },
+      rateLimit: [{ type: "requestLimitt", interval: 1, tokensToAdd: 1 }],
     });
     try {
       await expect(add()).rejects.toThrow(/requestLimit/);

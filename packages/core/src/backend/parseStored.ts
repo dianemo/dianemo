@@ -2,14 +2,15 @@
  * Shared reads of numeric fields stored as strings, used by every backend.
  *
  * The Lua in the Redis backend is the reference implementation and this matches
- * it: docs/design-notes.md#numeric-field-parsing enumerates every place the rule
- * is written down and must agree.
+ * it. The rule, and how to find its sites:
+ * docs/design-notes.md#numeric-field-parsing
  */
 
 /**
  * Matches Lua's `tonumber` — absent, empty and unparseable all mean the default —
  * because `Number("")` is 0 and the two backends must read one stored field the same
- * way. Mirrored in three other places: docs/design-notes.md#numeric-field-parsing.
+ * way. The rule, and how to find its sites:
+ * docs/design-notes.md#numeric-field-parsing
  */
 export function parseStoredNumber(
   raw: string | undefined,

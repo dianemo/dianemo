@@ -159,17 +159,17 @@ export interface Harness {
  * `vitest.config.ts` is load-bearing, not a performance preference.
  *
  * All sixteen indices are taken, so a new suite shares one. db11 carries three
- * claimants; db3, db5, db6, db7, db10, db12, db13 and db14 carry two.
+ * claimants; db3, db5, db6, db7, db8, db10, db12, db13 and db14 carry two.
  *
  *    0  memoryAtomicity
  *    1  lifecycle.integration (direct)
  *    2  backendParity
  *    3  backendFailure (direct too) · coreRecovery (direct)
- *    4  noLimit.test
+ *    4  noLimit.test · multiLimit
  *    5  requestLimit.test · redisOps (direct)
  *    6  concurrencyLimit.test · luaGuards (direct)
  *    7  auditFixes · sharedLimit.test
- *    8  regressions
+ *    8  regressions · templatesApi
  *    9  auditRound2
  *   10  auditRound2 · requestLimit.scenarios
  *   11  auditRound2 · concurrencyLimit.scenarios · redisClock (direct)
@@ -269,7 +269,12 @@ export async function startUpstream(delayMs = 0) {
 
 export interface ClientSpec {
   name: string;
-  rateLimit: Record<string, unknown>;
+  /** Always a list, as the public API takes it — one limit or several. */
+  rateLimit: Record<string, unknown>[];
+  /** For a suite asserting what one attempt did, rather than what four did. */
+  retryOptions?: Record<string, unknown>;
+  /** For a suite whose behaviour turns on the health tick, at test speed. */
+  healthCheckIntervalMs?: number;
 }
 
 /**
@@ -294,6 +299,10 @@ export async function withHandler(
           name: `${spec.name}:_:${creds.instanceId}`,
           rateLimit: spec.rateLimit,
           requestOptions: { defaults: { baseURL } },
+          ...(spec.retryOptions ? { retryOptions: spec.retryOptions } : {}),
+          ...(spec.healthCheckIntervalMs
+            ? { healthCheckIntervalMs: spec.healthCheckIntervalMs }
+            : {}),
         },
       ]) as never
     );
@@ -388,7 +397,7 @@ export async function withReplicas(
     );
   }
   const shared = options.clients.find(
-    (c) => c.rateLimit.type === "sharedLimit"
+    (c) => c.rateLimit.length === 1 && c.rateLimit[0].type === "sharedLimit"
   );
   if (shared) {
     throw new Error(
@@ -439,6 +448,10 @@ export async function withReplicas(
                 concurrencySlotTtl: options.concurrencySlotTtl,
                 defaults: { baseURL: options.baseURL },
               },
+              ...(spec.retryOptions ? { retryOptions: spec.retryOptions } : {}),
+              ...(spec.healthCheckIntervalMs
+                ? { healthCheckIntervalMs: spec.healthCheckIntervalMs }
+                : {}),
             },
           ]) as never
         );

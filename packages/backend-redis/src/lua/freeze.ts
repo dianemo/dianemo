@@ -1,4 +1,5 @@
 import {
+  exactFn,
   finiteNumberFn,
   freezeGate,
   queueEmptyGate,
@@ -42,13 +43,23 @@ ${finiteNumberFn()}
   local frozenUntil = finiteNumber(ARGV[1], 0)
   local thawRequestCount = finiteNumber(ARGV[2], 0)
   local mode = ARGV[3]
+  local emptiesBucket = ARGV[4] ~= '0'
+
+  -- Sized against redis TIME, the same clock frozenUntil is written from: on a
+  -- caller's clock that runs behind, the key would expire before its freeze.
+${redisNow()}
 
   if mode == 'max' then
-    local existing = redis.call('HMGET', key, 'frozenUntil', 'thawRequestCount')
-    -- The nil test asks whether there is any state to merge with; finiteNumber then
-    -- decides what that state is worth.
-    if tonumber(existing[1]) ~= nil then
-      local existingUntil = finiteNumber(existing[1], 0)
+    local existing = redis.call('HMGET', key, 'frozenUntil', 'thawRequestCount', 'emptiesBucket')
+    -- An unusable stored deadline is no freeze state to merge with, so the probe
+    -- budget beside it is not consulted either — the reading freezeGate and
+    -- readFreezeState give it, and the memory twin's.
+    local existingUntil = finiteNumber(existing[1], nil)
+    if existingUntil ~= nil then
+      -- Carried only from a freeze still standing: a lapsed one's bucket has
+      -- been refilling since. An absent field is a freeze from before the
+      -- field existed, and every one of those emptied its bucket.
+      if existingUntil > now and existing[3] ~= '0' then emptiesBucket = true end
       -- Never shortened, and never a lower probe budget. See armFreeze.
       if existingUntil > frozenUntil then frozenUntil = existingUntil end
       local existingThaw = finiteNumber(existing[2], 0)
@@ -58,18 +69,22 @@ ${finiteNumberFn()}
     end
   end
 
-  -- Clamped after the merge, so a deadline already stored beyond the ceiling is
-  -- brought down rather than carried forward by "take the larger". 2^53-1 is
-  -- where an integer reply stops surviving the trip back into the caller's
-  -- Number; past it string.format('%d') clamps to 2^63-1 instead of raising,
-  -- and this is also what keeps the ttl below within EXPIRE's range.
-  if frozenUntil > 9007199254740991 then frozenUntil = 9007199254740991 end
+  -- After the merge, so a stored value that won it is written back in range
+  -- rather than carried forward by "take the larger". 2^53-1 is where an
+  -- integer reply stops surviving the trip into the caller's Number; past it
+  -- string.format('%d') saturates at 2^63-1 instead of raising. It also keeps
+  -- the ttl below within EXPIRE's range. Twin of the memory backend's storable.
+  local function storable(value, min)
+    if value >= 0 then value = math.floor(value) else value = math.ceil(value) end
+    if value < min then return min end
+    if value > 9007199254740991 then return 9007199254740991 end
+    return value
+  end
+  frozenUntil = storable(frozenUntil, -9007199254740991)
+  thawRequestCount = storable(thawRequestCount, 0)
 
-  -- Sized against redis TIME, the same clock frozenUntil is written from.
-  -- On the caller's clock, a process running behind sized the key to expire
-  -- BEFORE the freeze it was holding. Derived above the writes because EXPIRE
-  -- is what rejects an out-of-range ttl, and it runs second.
-${redisNow()}
+  -- Derived above the writes because EXPIRE is what rejects an out-of-range
+  -- ttl, and it runs second.
   local ttl = math.ceil((frozenUntil - now) / 1000) + 60
   if ttl < 60 then ttl = 60 end
 
@@ -78,7 +93,8 @@ ${redisNow()}
   -- the moment either value grows a digit or gains a fraction.
   redis.call('HSET', key,
     'frozenUntil', string.format('%d', frozenUntil),
-    'thawRequestCount', string.format('%d', thawRequestCount))
+    'thawRequestCount', string.format('%d', thawRequestCount),
+    'emptiesBucket', emptiesBucket and '1' or '0')
   redis.call('EXPIRE', key, ttl)
 
   return { frozenUntil, thawRequestCount }
@@ -87,20 +103,18 @@ ${redisNow()}
 /**
  * Reads the freeze state and decides, on Redis's clock, in one round trip.
  *
- * `getFreezeState`, `isFrozen` and `canProcessRequest` all answer questions
- * about the same two fields against the same clock, and each fetched TIME
- * separately — `canProcessRequest` twice, because it called `getFreezeState`
- * (which had already read TIME) and then read it again. Three commands for one
- * decision, and the decision was taken against a clock sampled AFTER the state,
- * so it leaned toward "lapsed" by a round trip. One script is one clock.
+ * `getFreezeState`, `isFrozen` and `canProcessRequest` all decide on these two
+ * fields, and one script samples the clock once, beside the state: a TIME read
+ * a round trip later leans every decision toward "lapsed".
  */
 export const readFreezeState = `
   local key = KEYS[1]
   local state = redis.call('HMGET', key, 'frozenUntil', 'thawRequestCount')
 ${finiteNumberFn()}
+${exactFn()}
   -- An unusable deadline counts as no freeze state at all. A nan parses through
-  -- tonumber and then survives every comparison, which reported a client frozen
-  -- with zero probes owed and no deadline any wake-up could be booked against.
+  -- tonumber and then survives every comparison, which would report a client
+  -- frozen with no deadline any wake-up could be booked against.
   local frozenUntil = finiteNumber(state[1], nil)
   if frozenUntil == nil then return nil end
   local thawRequestCount = finiteNumber(state[2], 0)
@@ -113,7 +127,9 @@ ${redisNow()}
   -- endpoint. updateThawProgress is the only place that deletes.
   if now >= frozenUntil and thawRequestCount <= 0 then return nil end
 
-  return { frozenUntil, thawRequestCount, (now < frozenUntil) and 1 or 0 }
+  -- Strings, because an integer reply truncates a stored fraction and
+  -- saturates a stored 1e300 where the memory twin reads both exactly.
+  return { exact(frozenUntil), exact(thawRequestCount), (now < frozenUntil) and 1 or 0 }
 `;
 
 export const updateThawProgress = `
@@ -123,14 +139,18 @@ export const updateThawProgress = `
   local success = ARGV[2] == '1'
 ${finiteNumberFn()}
 
+  -- '%.17g' strings, not cjson.encode: cjson writes numbers at 14 significant
+  -- digits, which rounds a deadline near 2^53 to a different millisecond, and
+  -- 17 is enough for any double to read back exactly.
+  local function reply(frozenUntil, thawRequestCount)
+    return { string.format('%.17g', frozenUntil), string.format('%.17g', thawRequestCount) }
+  end
+
   if completionId ~= '' and redis.call('SISMEMBER', completionKey, completionId) == 1 then
     local duplicateState = redis.call('HMGET', key, 'frozenUntil', 'thawRequestCount')
     local duplicateUntil = finiteNumber(duplicateState[1], nil)
     if duplicateUntil == nil then return nil end
-    return cjson.encode({
-      frozenUntil = duplicateUntil,
-      thawRequestCount = finiteNumber(duplicateState[2], 0)
-    })
+    return reply(duplicateUntil, finiteNumber(duplicateState[2], 0))
   end
   if completionId ~= '' then
     redis.call('SADD', completionKey, completionId)
@@ -147,21 +167,22 @@ ${redisNow()}
   -- The one place expiry deletes the key. A read must not: see getFreezeState.
   if now >= frozenUntil and thawRequestCount <= 0 then
     redis.call('DEL', key)
-    return cjson.encode({ cleared = true })
+    return nil
   end
 
   if not success then
-    return cjson.encode({ frozenUntil = frozenUntil, thawRequestCount = thawRequestCount })
+    return reply(frozenUntil, thawRequestCount)
   end
 
-  local newCount = thawRequestCount - 1
-  if newCount <= 0 then
+  local newCount = math.max(0, thawRequestCount - 1)
+  -- A window re-armed while this probe was in flight still stands.
+  if newCount == 0 and now >= frozenUntil then
     redis.call('DEL', key)
-    return cjson.encode({ cleared = true })
+    return nil
   end
 
   redis.call('HSET', key, 'thawRequestCount', newCount)
-  return cjson.encode({ frozenUntil = frozenUntil, thawRequestCount = newCount })
+  return reply(frozenUntil, newCount)
 `;
 
 /**
@@ -175,13 +196,15 @@ export const tryStartThawRequest = `
   local metadataKey = KEYS[4]
   local grantId = ARGV[1]
   local requestId = ARGV[2]
+  -- '1' matches a probe of any grant: one probe client-wide.
+  local anyGrant = ARGV[3] == '1'
 
   -- Step 1: Track the frozen grant. A client-level thaw (no grant) has no
   -- entry here — the frozen-grants set exists to let getNextRequest skip
   -- individual grants, and a client-level freeze blocks everything anyway.
   if grantId ~= '' then
     redis.call('SADD', frozenGrantsKey, grantId)
-    -- The 24 hours every other key in the system is sized to. Membership is
+    -- The 24 hours most keys in the system are sized to. Membership is
     -- normally dropped by cleanupStaleFrozenGrants, which only runs while a
     -- controller does; without an expiry a fleet that stops holds the set, and
     -- getNextRequest skips those grants for as long as it survives.
@@ -203,7 +226,7 @@ export const tryStartThawRequest = `
       local isThawRequest = fields[3]
 
       -- Check if this is an in-progress thaw request for the same grant
-      if status == 'inProgress' and reqGrantId == grantId and isThawRequest == 'true' then
+      if status == 'inProgress' and (anyGrant or reqGrantId == grantId) and isThawRequest == 'true' then
         return 'exists'
       end
     end
@@ -231,6 +254,7 @@ export const hasThawRequestInProgress = `
   local queueKey = KEYS[1]
   local metadataKeyPrefix = KEYS[2]
   local targetGrantId = ARGV[1]
+  local anyGrant = ARGV[2] == '1'
 
   -- Get all request IDs from the queue
   local requestIds = redis.call('ZRANGE', queueKey, 0, -1)
@@ -241,12 +265,11 @@ export const hasThawRequestInProgress = `
     local fields = redis.call('HMGET', metadataKey, 'status', 'grantId', 'isThawRequest')
     local status = fields[1]
     -- Normalised exactly as tryStartThawRequest does: HMGET yields false for an
-    -- absent field, and false is not equal to the empty string, so a client-level
-    -- probe went unnoticed here while that script counted it.
+    -- absent field, which is not equal to the '' a client-level probe carries.
     local grantId = fields[2] or ''
     local isThawRequest = fields[3]
 
-    if status == 'inProgress' and grantId == targetGrantId and isThawRequest == 'true' then
+    if status == 'inProgress' and (anyGrant or grantId == targetGrantId) and isThawRequest == 'true' then
       return 1
     end
   end

@@ -1,64 +1,161 @@
+/** A token bucket as the backend meters it: a `requestLimit` without its name. */
 export interface TokenBucketConfig {
+  /** Bucket ceiling; a bucket with no stored state reads as this full. */
   maxTokens: number;
+  /** Tokens credited per whole `interval` elapsed. */
   tokensToAdd: number;
   /** ms between token additions */
   interval: number;
 }
 
+/** A slot ledger as the backend meters it. */
 export interface ConcurrencyConfig {
+  /** Total cost that may be in flight at once. */
   maxConcurrency: number;
-  /** ms before a slot expires — reclaims slots held by a crashed process */
+  /**
+   * ms before a slot expires — reclaims slots held by a crashed process. Must
+   * be a finite number above 0; anything else is refused through
+   * {@link AcquireConcurrencyResult.error}, or `false` on the fast path, since
+   * a slot claimed against it would never be reaped.
+   */
   requestTtl: number;
 }
 
+/** What {@link DianemoBackend.acquireTokens} reports. */
 export interface AcquireTokensResult {
   acquired: boolean;
   remainingTokens?: number;
-  /** ms to wait before retrying, when not acquired */
-  waitTime?: number;
-  /** set when the configuration itself is unusable */
-  error?: string;
-}
-
-export interface AcquireConcurrencyResult {
-  acquired: boolean;
-  currentConcurrency?: number;
   /**
-   * Set when the ceiling itself is unusable, as opposed to merely full.
+   * ms to wait before retrying, when not acquired: the whole intervals the
+   * shortfall needs, less the time already served toward the next one.
    *
-   * Without this the two cases were indistinguishable to the caller, so a
-   * `maxConcurrency` of `NaN` or `0` looked exactly like a busy client and
-   * wedged it silently. Mirrors `AcquireTokensResult.error`.
+   * A cost above `maxTokens` still gets a finite wait, and the retry is
+   * declined again, since the bucket never holds more than `maxTokens`. The
+   * backend does not refuse such a cost; callers check that ceiling
+   * themselves. `Infinity` arises only from overflow — a shortfall so large,
+   * or a `tokensToAdd` so small, that the arithmetic leaves the number range.
+   */
+  waitTime?: number;
+  /**
+   * Set when the configuration itself is unusable. A cost that is negative or
+   * not finite is reported here too.
    */
   error?: string;
 }
 
+/** What {@link DianemoBackend.acquireConcurrency} reports. */
+export interface AcquireConcurrencyResult {
+  acquired: boolean;
+  currentConcurrency?: number;
+  /**
+   * Set when the configuration itself is unusable, as opposed to merely full,
+   * so a `maxConcurrency` or `requestTtl` of `NaN` or `0` is not mistaken for a
+   * busy client. Mirrors `AcquireTokensResult.error`.
+   */
+  error?: string;
+}
+
+/**
+ * One budget a request must claim, named by the key it lives under: a token
+ * bucket at `<client namespace>:rateLimit:<name>` or a slot ledger at
+ * `<client namespace>:concurrency:<name>`, each with `:grant:<grantId>` after
+ * the namespace for an isolated grant.
+ *
+ * A client with several limits presents the whole list to the backend at once,
+ * because claiming them one at a time is not the same operation: a peer can
+ * take the second budget between two calls, leaving the first spent on a
+ * request that is then declined. See docs/rate-limits/multiple-limits.md.
+ */
+export type MultiLimitSpec = {
+  /**
+   * The freeze governing this budget — the claiming client's, or its grant's.
+   * `releaseMultiLimit` withholds a refund while it stands.
+   */
+  freezeKey?: string;
+} & (
+  | { kind: "tokenBucket"; key: string; config: TokenBucketConfig }
+  | {
+      kind: "concurrency";
+      key: string;
+      config: ConcurrencyConfig;
+      /** Member id the slot is recorded under; released by the same id. */
+      slotId: string;
+    }
+);
+
+/** What {@link DianemoBackend.acquireMultiLimit} reports. */
+export interface AcquireMultiLimitResult {
+  acquired: boolean;
+  /**
+   * ms to wait before retrying — the longest any declining token bucket asked
+   * for. A full concurrency ledger has no deadline of its own, so a decline
+   * caused only by one carries `0`. A cost above a bucket's `maxTokens` gets a
+   * finite wait that never succeeds, and `Infinity` comes only from overflow,
+   * as in {@link AcquireTokensResult.waitTime}. Absent when acquired or on
+   * `error`.
+   */
+  waitTime?: number;
+  /** Set when one of the configurations is unusable, as opposed to merely full. */
+  error?: string;
+  /**
+   * Key of a budget that declined, for logs: the bucket with the longest wait,
+   * or the first full slot ledger when no bucket declined. Unset when every one
+   * admitted.
+   */
+  blockedBy?: string;
+}
+
+/** A queue entry as the backend stores it. */
 export interface QueuedRequest {
+  /** Unique per `handleRequest` call; the queue member and metadata key. */
   requestId: string;
   clientName: string;
+  /** The caller's label for the request, for logs and metrics. */
   requestName: string;
+  /**
+   * `pending` while it waits; `inProgress` once
+   * {@link DianemoBackend.getNextRequest} has handed it to the admission loop.
+   */
   status: "pending" | "inProgress";
+  /** Higher served first. Part of the queue score, which clamps it to 0-10. */
   priority: number;
+  /** Budget spent on admission. Read back as 1 if zero or unparseable. */
   cost: number;
+  /** Attempts already failed; more retries sort ahead. Part of the score. */
   retries: number;
+  /** Arrival in epoch ms; earlier sorts ahead at equal priority and retries. */
   timestamp: number;
+  /** The grant whose budget and freeze it uses; absent for the client's own. */
   grantId?: string;
+  /** Whether this entry holds its grant's single thaw probe. */
   isThawRequest: boolean;
+  /** Instance id of the replica that queued it, for orphan cleanup. */
   ownerId: string;
 }
 
+/** A client's or grant's freeze, as stored under its freeze key. */
 export interface FreezeState {
+  /** Epoch ms on the backend's clock — see {@link DianemoBackend.now}. */
   frozenUntil: number;
+  /** Successful probes still owed before the client runs at full rate again. */
   thawRequestCount: number;
 }
 
+/** Queue depth by status, and the total cost queued. */
 export interface QueueStats {
   pending: number;
   inProgress: number;
   totalCost: number;
 }
 
-/** A single write in a {@link DianemoBackend.batch} group. */
+/**
+ * A single write in a {@link DianemoBackend.batch} group.
+ *
+ * `ttlSeconds` is the key's lifetime in seconds, rounded up, as
+ * {@link DianemoBackend.set} reads it: zero or below deletes the key, and a
+ * non-finite value or one above `REDIS_MAX_TTL_SECONDS` throws a `RangeError`
+ * before any op in the group is applied.
+ */
 export type BatchOp =
   | { op: "set"; key: string; value: string; ttlSeconds?: number }
   | { op: "del"; key: string }
@@ -116,9 +213,25 @@ export interface DianemoBackend {
   // ---------------------------------------------------------------- store
 
   get(key: string): Promise<string | null>;
+  /**
+   * Writes `value` under `key`, replacing whatever was there.
+   *
+   * @param ttlSeconds The key's lifetime in seconds, rounded up; omitted, the
+   * key does not expire. Zero or below deletes the key instead of writing it.
+   * A non-finite value, or one above `REDIS_MAX_TTL_SECONDS`, throws a
+   * `RangeError` before anything is written.
+   */
   set(key: string, value: string, ttlSeconds?: number): Promise<void>;
   del(...keys: string[]): Promise<void>;
   hgetall(key: string): Promise<Record<string, string>>;
+  /**
+   * Sets `fields` on the hash at `key`, leaving its other fields alone. An
+   * empty `fields` writes nothing but still applies `ttlSeconds`.
+   *
+   * @param ttlSeconds As {@link DianemoBackend.set}'s: seconds, rounded up,
+   * and zero or below deletes the hash. A non-finite value, or one above
+   * `REDIS_MAX_TTL_SECONDS`, throws a `RangeError` before any field is set.
+   */
   hset(
     key: string,
     fields: Record<string, string | number>,
@@ -128,7 +241,14 @@ export interface DianemoBackend {
   srem(key: string, member: string): Promise<void>;
   smembers(key: string): Promise<string[]>;
 
-  /** Applies several writes together — one round-trip where that is a concept. */
+  /**
+   * Applies several writes together — one round-trip where that is a concept.
+   *
+   * Every `ttlSeconds` in the group is read as {@link DianemoBackend.set}
+   * reads it, and all of them are checked before the first write: one that is
+   * non-finite or above `REDIS_MAX_TTL_SECONDS` throws a `RangeError` with
+   * nothing applied.
+   */
   batch(ops: BatchOp[], options?: BatchOptions): Promise<void>;
 
   // ---------------------------------------------------------------- locks
@@ -136,6 +256,9 @@ export interface DianemoBackend {
   /**
    * Takes `key` for `ttlMs` if it is free. `token` identifies the holder so
    * that only the holder can release it.
+   *
+   * @throws {RangeError} for a `ttlMs` that is not a finite number above 0,
+   * which would otherwise take the lock with no lifetime.
    */
   acquireLock(key: string, token: string, ttlMs: number): Promise<boolean>;
   /** Releases `key` only if `token` still holds it. */
@@ -157,7 +280,16 @@ export interface DianemoBackend {
    *
    * Declining is not a failure; it means the caller should take the queued
    * path. Must refuse whenever anything is already queued, so a new arrival
-   * can never overtake work that has been waiting.
+   * can never overtake work that has been waiting. Also refuses inside
+   * `freezeKey`'s freeze window and, after it, while thaw probes are still
+   * owed, since only the queued path can send one probe at a time. Returns
+   * `false`, rather than throwing or reporting, for an unusable `config` or
+   * `cost`.
+   *
+   * @param ttl The bucket key's lifetime in seconds, default 86400, raised to
+   * cover a refill from empty. Normalised as {@link DianemoBackend.set}'s
+   * `ttlSeconds` is, so an unusable one throws a `RangeError` before anything
+   * is read.
    */
   tryAdmitImmediately(
     queueKey: string,
@@ -175,6 +307,21 @@ export interface DianemoBackend {
    */
   tryAdmitNoLimit(queueKey: string, freezeKey: string): Promise<boolean>;
 
+  /**
+   * The fast path for a slot ledger: claims a slot of `cost` under
+   * `requestId` and returns `true`, or declines with `false` and claims
+   * nothing.
+   *
+   * Refuses on the same terms as {@link DianemoBackend.tryAdmitImmediately}:
+   * anything queued, a standing freeze window, or thaw probes still owed. Slots
+   * older than `config.requestTtl` are reaped first, and a slot `requestId`
+   * already holds is not counted against it. Returns `false` for an unusable
+   * `config` or `cost`.
+   *
+   * @param ttl The ledger key's lifetime in seconds, default 86400. Normalised
+   * as {@link DianemoBackend.set}'s `ttlSeconds` is, so an unusable one throws
+   * a `RangeError` before anything is read.
+   */
   tryAdmitConcurrency(
     queueKey: string,
     concurrencyKey: string,
@@ -187,17 +334,47 @@ export interface DianemoBackend {
 
   // ------------------------------------------------------------ token bucket
 
+  /**
+   * Spends `cost` from the bucket at `key` if its balance covers it.
+   *
+   * Refills lazily first, crediting `tokensToAdd` per whole `interval` elapsed
+   * up to `maxTokens`; a bucket with no stored state reads as full. The refill
+   * is written back whether or not the spend succeeds. Never queues, and
+   * ignores freezes: those are the caller's to check.
+   *
+   * An unusable `config` or `cost` is reported through `error` rather than
+   * thrown.
+   */
   acquireTokens(
     key: string,
     cost: number,
     config: TokenBucketConfig
   ): Promise<AcquireTokensResult>;
+  /**
+   * The balance as {@link DianemoBackend.acquireTokens} would see it now,
+   * refilled and clamped to `maxTokens`, without writing anything. `lastUpdate`
+   * is the backend's clock for an empty key.
+   */
   getTokenBucketState(
     key: string,
     config: TokenBucketConfig
   ): Promise<{ tokens: number; lastUpdate: number }>;
+  /** Writes the bucket full at `maxTokens`, its refill clock restarted now. */
   resetTokenBucket(key: string, maxTokens: number): Promise<void>;
-  /** Returns budget claimed for a request that was never dispatched. */
+  /**
+   * Returns budget claimed for a request that was never dispatched, up to
+   * `maxTokens`, which must be a finite number above 0. A bucket with no stored
+   * balance is left alone, since it already reads as full.
+   *
+   * Refused while `freezeKey` holds a standing freeze that emptied the bucket —
+   * one armed without `emptiesBucket: false`, see
+   * {@link DianemoBackend.armFreeze}. A freeze that left the bucket alone
+   * refuses nothing, since the token was never taken from the budget the
+   * freeze is protecting.
+   *
+   * A cost that is negative or not finite credits nothing, as
+   * {@link DianemoBackend.acquireTokens} refuses to spend one.
+   */
   refundTokens?(
     key: string,
     cost: number,
@@ -205,8 +382,62 @@ export interface DianemoBackend {
     freezeKey?: string
   ): Promise<void>;
 
+  // ------------------------------------------------------------ several budgets
+
+  /**
+   * Claims every listed budget, or none of them.
+   *
+   * Optional so a backend written against an earlier version still satisfies the
+   * interface. A client declaring more than one limit is refused at
+   * construction — `ConfigurationError` `backend_missing_multi_limit` — by a
+   * backend lacking this or `releaseMultiLimit`, rather than silently metering
+   * against one budget. All-or-nothing is the whole contract: a partial claim
+   * leaks budget that no completion path hands back.
+   *
+   * An unusable configuration is reported through `error` rather than thrown,
+   * as {@link acquireTokens} does.
+   */
+  acquireMultiLimit?(
+    specs: MultiLimitSpec[],
+    cost: number
+  ): Promise<AcquireMultiLimitResult>;
+  /**
+   * Hands back what `acquireMultiLimit` claimed for a request that was never
+   * dispatched. Token buckets are credited, up to each spec's
+   * `config.maxTokens`, which must be a finite number above 0; concurrency
+   * slots are released.
+   *
+   * A spec's own `freezeKey` suppresses its refund while a freeze that emptied
+   * the bucket stands, matching {@link DianemoBackend.refundTokens}, as does a
+   * cost that is negative or not finite. Slots are released regardless.
+   */
+  releaseMultiLimit?(specs: MultiLimitSpec[], cost: number): Promise<void>;
+  /**
+   * The no-queue fast path for several budgets: admit only if nothing is queued,
+   * none of `freezeKeys` stands or owes thaw probes, and every budget can be
+   * claimed at once. `ttl` is the key lifetime in seconds, default 86400.
+   *
+   * Optional; without it a client with several limits always queues.
+   */
+  tryAdmitMultiLimit?(
+    queueKey: string,
+    freezeKeys: string[],
+    specs: MultiLimitSpec[],
+    cost: number,
+    ttl?: number
+  ): Promise<boolean>;
+
   // ------------------------------------------------------------- concurrency
 
+  /**
+   * Claims a slot of `cost` under `requestId` if the cost in flight leaves
+   * room for it under `maxConcurrency`.
+   *
+   * Slots older than `config.requestTtl` are reaped first. A slot `requestId`
+   * already holds is not counted against it, and is replaced by the new claim.
+   * Ignores the queue and freezes; those are the caller's to check. An
+   * unusable `config` or `cost` is reported through `error` rather than thrown.
+   */
   acquireConcurrency(
     key: string,
     cost: number,
@@ -224,11 +455,23 @@ export interface DianemoBackend {
     requestId: string,
     config: ConcurrencyConfig
   ): Promise<AcquireConcurrencyResult>;
+  /** Frees `requestId`'s slot. Idempotent: an absent slot is a no-op. */
   releaseConcurrency(key: string, requestId: string): Promise<void>;
+  /**
+   * The slots claimed within the last `requestTtl` ms, oldest first, and their
+   * total cost, without reaping anything.
+   *
+   * @throws {RangeError} for a `requestTtl` that is not finite, rather than
+   * reporting a busy ledger as idle.
+   */
   getConcurrencyState(
     key: string,
     requestTtl: number
   ): Promise<{ currentConcurrency: number; activeRequests: string[] }>;
+  /**
+   * Drops every slot in the ledger, peers' included, so the cap stops holding
+   * until their requests finish. Not for use while other replicas are running.
+   */
   clearConcurrency(key: string): Promise<void>;
 
   // ------------------------------------------------------------------- queue
@@ -246,6 +489,11 @@ export interface DianemoBackend {
    *
    * A retry is unaffected: it keeps its entry rather than removing and re-adding, so
    * a removal and a later add of one id never both happen.
+   *
+   * @param ttl Lifetime in seconds of the queue key and the entry's metadata,
+   * default 86400. Normalised as {@link DianemoBackend.set}'s `ttlSeconds` is.
+   * @throws {RangeError} before anything is written, for an unusable `ttl` or
+   * a request `calculateQueueScore` cannot score.
    */
   addRequest(
     queueKey: string,
@@ -253,6 +501,14 @@ export interface DianemoBackend {
     request: QueuedRequest,
     ttl?: number
   ): Promise<boolean>;
+  /**
+   * Claims the lowest-scored `pending` entry and returns it, flipping its
+   * status to `inProgress` in the same step so no other caller is handed it.
+   * `null` when nothing eligible is queued.
+   *
+   * @param skipGrantIds Grants whose entries to pass over, such as frozen
+   * ones. An entry with no grant is never skipped by this.
+   */
   getNextRequest(
     queueKey: string,
     metadataKeyPrefix: string,
@@ -264,10 +520,21 @@ export interface DianemoBackend {
      */
     skipRequestIds?: string[]
   ): Promise<QueuedRequest | null>;
+  /**
+   * The entry's stored metadata, or `null` when it is gone or lacks a required
+   * field. Reads only; the queue order is not consulted.
+   */
   getRequest(
     metadataKeyPrefix: string,
     requestId: string
   ): Promise<QueuedRequest | null>;
+  /**
+   * Updates `status`, `retries`, `priority` and `isThawRequest` on an existing
+   * entry; other fields in `updates` are ignored, as is a non-finite number. A
+   * change to `retries` or `priority` re-scores the entry in the same step,
+   * clamping rather than throwing where `calculateQueueScore` would. A no-op
+   * for an entry that is gone.
+   */
   updateRequest(
     queueKey: string,
     metadataKeyPrefix: string,
@@ -285,6 +552,8 @@ export interface DianemoBackend {
    * `REQUEST_TOMBSTONE_TTL_SECONDS`. It has to outlast the window in which an add
    * can still be outstanding, which is the caller's admission budget rather than a
    * constant, so a caller that lets a request wait longer must pass a longer value.
+   * Never refused: a fraction rounds up, a value with no lifetime (`NaN`, zero,
+   * negative) takes the default, and `Infinity` the longest TTL a key can hold.
    */
   removeRequest(
     queueKey: string,
@@ -292,6 +561,11 @@ export interface DianemoBackend {
     requestId: string,
     tombstoneTtlSeconds?: number
   ): Promise<{ wasThawRequest: boolean }>;
+  /**
+   * Counts the queued entries by status and sums their cost, reading each
+   * one's metadata; an entry with no stored status is not counted, and an
+   * unusable stored cost counts as 1.
+   */
   getQueueStats(
     queueKey: string,
     metadataKeyPrefix: string
@@ -301,12 +575,18 @@ export interface DianemoBackend {
    * observability: the fast paths ask the same question inside their own scripts.
    */
   getQueueLength(queueKey: string): Promise<number>;
+  /**
+   * Every queued entry in score order, as {@link DianemoBackend.getRequest}
+   * reads each; one whose metadata is gone or incomplete is left out.
+   */
   getAllRequests(
     queueKey: string,
     metadataKeyPrefix: string
   ): Promise<QueuedRequest[]>;
   /**
-   * Drops requests owned by instances that are no longer alive.
+   * Drops requests owned by instances that are no longer alive, along with
+   * queue members whose metadata has already expired, and returns how many
+   * entries it removed.
    *
    * Refused outright unless `aliveInstanceIds` contains `currentInstanceId`: an
    * instance registers itself on every heartbeat, so a set lacking the caller's
@@ -329,12 +609,14 @@ export interface DianemoBackend {
    *
    * The wrong operation for arming a freeze — see {@link armFreeze}. It exists
    * for callers that mean "the state is now this", such as a fixture moving a
-   * freeze from live to lapsed.
+   * freeze from live to lapsed. `options.emptiesBucket` is written as given,
+   * defaulting to `true`, with no merge.
    */
   setFreezeState(
     key: string,
     frozenUntil: number,
-    thawRequestCount: number
+    thawRequestCount: number,
+    options?: { emptiesBucket?: boolean }
   ): Promise<void>;
   /**
    * Arms a freeze, keeping the longer deadline and larger probe budget, and returns
@@ -344,19 +626,60 @@ export interface DianemoBackend {
    * Must be atomic: a read-then-write lets two concurrent arms read the same old
    * value and the loser still win. Aliasing this to `setFreezeState` is wrong in a
    * way no behaviour test will show; run the conformance suite.
+   *
+   * `options.emptiesBucket` records whether this freeze emptied the budget it
+   * governs, which is what makes {@link refundTokens} refuse under it. Pass
+   * `false` for a freeze that leaves the bucket alone — a 5xx or a dropped
+   * connection — so a refund under it is not lost. Defaults to `true`, the
+   * reading every freeze had before the option existed. The merge keeps `true`
+   * if either side has it, but only from a stored freeze that still stands: a
+   * lapsed one's bucket has been refilling since.
+   *
+   * A non-finite `frozenUntil` or `thawRequestCount` is read as 0 before the
+   * merge, so `Infinity` arms no window and owes no probes. After the merge
+   * both values are truncated toward zero and clamped — `frozenUntil` to
+   * ±(2^53-1), `thawRequestCount` to 0 through 2^53-1 — so the state returned
+   * is exactly the state stored.
    */
   armFreeze(
     key: string,
     frozenUntil: number,
-    thawRequestCount: number
+    thawRequestCount: number,
+    options?: { emptiesBucket?: boolean }
   ): Promise<FreezeState>;
+  /**
+   * The freeze in force: inside its window, or after it while probes are
+   * still owed. `null` when there is no usable stored deadline, or when the
+   * window has lapsed with no probes owed. Reads only; a lapsed freeze is
+   * left for {@link DianemoBackend.updateThawProgress} to delete.
+   */
   getFreezeState(key: string): Promise<FreezeState | null>;
+  /**
+   * Records a probe's outcome against the freeze at `key` and returns the
+   * state now in force, or `null` once none is.
+   *
+   * A success takes one off the probes owed. The freeze is deleted only once
+   * no probes are owed and its window has lapsed, so a window re-armed while
+   * the probe was in flight still stands. A failure changes nothing; the
+   * caller re-arms. A freeze found lapsed with nothing owed is deleted either
+   * way.
+   *
+   * @param completionId Makes the call idempotent: a repeat of an id already
+   * recorded returns the current state and changes nothing. Recorded even when
+   * no freeze stands, so a redelivery cannot count against one armed later.
+   */
   updateThawProgress(
     key: string,
     success: boolean,
     completionId?: string
   ): Promise<FreezeState | null>;
+  /** Deletes the freeze at `key`, window and probes owed alike. */
   clearFreezeState(key: string): Promise<void>;
+  /**
+   * Whether `key` holds a freeze in force, as
+   * {@link DianemoBackend.getFreezeState} reads it: inside its window, or
+   * owing probes.
+   */
   isFrozen(key: string): Promise<boolean>;
   /**
    * Whether the next request may go, and whether it would be the thaw probe.
@@ -371,10 +694,15 @@ export interface DianemoBackend {
     isThawRequest: boolean;
     frozenUntil?: number;
   }>;
+  /**
+   * Whether an in-progress thaw probe exists for `grantId` — or, with
+   * `options.anyGrant`, for any grant at all.
+   */
   hasThawRequestInProgress(
     queueKey: string,
     metadataKeyPrefix: string,
-    grantId: string
+    grantId: string,
+    options?: { anyGrant?: boolean }
   ): Promise<boolean>;
   /**
    * Nominates exactly one probe request per grant while frozen.
@@ -382,14 +710,28 @@ export interface DianemoBackend {
    * Returns `"started"` to the single winner and `"exists"` to everyone else.
    * A backend that lets two callers win turns a recovering vendor back into a
    * thundering herd, so this has to be genuinely exclusive.
+   *
+   * With `options.anyGrant`, any other in-progress probe refuses the claim
+   * whatever its `grantId`: one probe client-wide, for a client whose grants
+   * all share one freeze key. `grantId` is still recorded in the frozen-grants
+   * set as without it.
    */
   tryStartThawRequest(
     frozenGrantsKey: string,
     queueKey: string,
     metadataKeyPrefix: string,
     requestId: string,
-    grantId: string
+    grantId: string,
+    options?: { anyGrant?: boolean }
   ): Promise<"started" | "exists">;
+  /**
+   * Removes from the frozen-grants set every grant with no in-progress probe
+   * whose freeze window has lapsed or whose freeze state is gone, and returns
+   * how many it removed. The freeze state itself is not touched.
+   *
+   * @param freezeStateKeyPrefix A grant's freeze key is this, then the grant
+   * id, then `:freezeState`.
+   */
   cleanupStaleFrozenGrants(
     frozenGrantsKey: string,
     queueKey: string,
@@ -399,6 +741,12 @@ export interface DianemoBackend {
 
   // --------------------------------------------------------------- instances
 
+  /**
+   * The live instances registered in the set at `instanceSetKey`, each with
+   * the data stored under `instanceKeyPrefix` followed by its id. Excludes
+   * `currentInstanceId`, and prunes from the set any id whose data is gone or
+   * empty — an instance that stopped heartbeating.
+   */
   getInstances(
     instanceSetKey: string,
     instanceKeyPrefix: string,
@@ -417,8 +765,10 @@ export interface DianemoBackend {
   // --------------------------------------------------------------- lifecycle
 
   /**
-   * Releases whatever the backend itself opened. It must not close a
-   * connection handed in by the caller — that belongs to them.
+   * Releases whatever the backend itself opened — timers, a pub/sub
+   * connection — and drops every subscriber. Stored data is kept: a handler
+   * started again on the same backend, or the same store, finds it. It must
+   * not close a connection handed in by the caller — that belongs to them.
    */
   close(): Promise<void>;
 }

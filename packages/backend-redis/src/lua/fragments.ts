@@ -1,3 +1,5 @@
+import { REDIS_MAX_TTL_SECONDS } from "@dianemo/core";
+
 /**
  * Lua blocks that more than one script needs to agree on, character for
  * character.
@@ -42,9 +44,9 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)`,
  * The two adjacent, differently-denominated TTL arguments the concurrency scripts
  * take, included above the `requestTtl` binding.
  *
- * `acquireConcurrency` and `tryAdmitConcurrency` carry it. `acquireQueuedConcurrency`
- * takes the same `ARGV[4]`-ms / `ARGV[5]`-seconds pair and does NOT — it never had
- * the warning, and the omission is worth closing rather than copying.
+ * `acquireConcurrency`, `acquireQueuedConcurrency` and `tryAdmitConcurrency`
+ * each take the same `ARGV[4]`-ms / `ARGV[5]`-seconds pair, and each carries
+ * it.
  */
 export const ttlArgvWarning = (prefix = "  "): string =>
   indent(
@@ -83,11 +85,53 @@ end`,
   );
 
 /**
+ * Declares `exact(n)`, a number as a `'%.17g'` string for a reply.
+ *
+ * `cjson.encode` writes numbers at 14 significant digits and raises "Cannot
+ * serialise number" on a non-finite one, and an integer reply truncates. A
+ * string carries every double exactly, `inf` included; `parseLuaNumber` in
+ * `luaNumber.ts` reads it back.
+ *
+ * Requires: nothing. Declares `exact`.
+ */
+export const exactFn = (prefix = "  "): string =>
+  indent(
+    `local function exact(n)
+  return string.format('%.17g', n)
+end`,
+    prefix
+  );
+
+/**
+ * Declares `bucketTtl(ttl, maxTokens, tokensToAdd, interval)`, a bucket's key
+ * lifetime in seconds: `ttl`, or longer for a bucket that takes longer than that
+ * to refill from empty. An expired bucket reads as full, so a key outliving only
+ * part of the refill hands a spent per-week budget back after a day of quiet.
+ * Twin of the memory backend's `bucketTtl`.
+ *
+ * Clamped to `REDIS_MAX_TTL_SECONDS`, as the memory twin is: the `EXPIRE` runs after the `HSET` that
+ * spends the token, so a refill longer than Redis can store would otherwise
+ * fail every request on the bucket and still spend from it.
+ *
+ * Requires: nothing. Declares `bucketTtl`. Call only with validated config.
+ */
+export const bucketTtlFn = (prefix = "  "): string =>
+  indent(
+    `local function bucketTtl(ttl, maxTokens, tokensToAdd, interval)
+  local refill = math.ceil(math.ceil(maxTokens / tokensToAdd) * interval / 1000)
+  if not (refill > ttl) then return ttl end
+  if refill > ${REDIS_MAX_TTL_SECONDS} then return ${REDIS_MAX_TTL_SECONDS} end
+  return refill
+end`,
+    prefix
+  );
+
+/**
  * Declares `usableConcurrency(max)`, the one test for a ceiling that can admit.
  *
- * Each of the three concurrency scripts refuses differently — two encode an `error`
- * object, one returns `0` — so this declares a predicate rather than the gate itself,
- * and the caller supplies its own refusal.
+ * The scripts that include it refuse differently — some encode an `error`
+ * object, the fast paths return `0` — so this declares a predicate rather than
+ * the gate itself, and the caller supplies its own refusal.
  *
  * Requires: nothing. Declares `usableConcurrency`.
  */
@@ -117,6 +161,22 @@ export const usableCostFn = (prefix = "  "): string =>
   indent(
     `local function usableCost(cost)
   return cost ~= nil and cost == cost and cost ~= math.huge and cost >= 0
+end`,
+    prefix
+  );
+
+/**
+ * Declares `usableRequestTtl(ttl)`, the one test for a slot lease that can be
+ * measured. A `nan` reaches `ZRANGEBYSCORE` as a bound Redis rejects, after
+ * nothing has been written; refusing it here returns the same result the memory
+ * twin returns instead of raising.
+ *
+ * Requires: nothing. Declares `usableRequestTtl`.
+ */
+export const usableRequestTtlFn = (prefix = "  "): string =>
+  indent(
+    `local function usableRequestTtl(ttl)
+  return ttl ~= nil and ttl == ttl and ttl ~= math.huge and ttl > 0
 end`,
     prefix
   );

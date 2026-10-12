@@ -1,13 +1,16 @@
 # `noLimit`
 
 ```ts
-{
-  type: "noLimit";
-}
+rateLimit: [{ type: "noLimit" }]
 ```
 
-No budget, no queue, no coordination. Every request is admitted the moment it
-arrives.
+This is also what a root client gets when it omits `rateLimit` altogether. A
+[sub-client](../concepts.md#sub-clients) that omits it inherits its parent's
+limits instead, metered as a budget of its own under the sub-client's name.
+
+No budget to coordinate. A request is admitted the moment it arrives, unless
+the client is frozen or work is already queued ahead of it — see
+[cost](#cost) below.
 
 ## When to use it
 
@@ -23,8 +26,9 @@ arrives.
 - retries with backoff,
 - auth flows, including OAuth2 refresh,
 - OpenTelemetry spans and error wrapping,
-- freeze/thaw **if the upstream returns a hard rate-limit response** — a vendor
-  can still push back even when you were not throttling yourself.
+- freeze/thaw **if the upstream returns a 429, a 5xx or drops the
+  connection** — a vendor can still push back even when you were not
+  throttling yourself.
 
 So it remains worth routing through the handler rather than calling `axios`
 directly: you get uniform error semantics and instrumentation, and switching to
@@ -55,11 +59,11 @@ In the benchmark it runs at essentially the full upstream ceiling.
 
 ## Isolated grants share one queue
 
-With `grantRateLimitBehavior: "isolated"`, each grant gets its own freeze state —
-one tenant being rate limited does not freeze the others. The **queue** is still
-one queue per client, and ordering is a property of that queue: while one grant's
-backlog is draining, another grant's requests take the queued path rather than the
-fast path, so they cannot be served ahead of it.
+With `grantRateLimitBehavior: "isolated"` on an `oauth2` client, each grant gets
+its own freeze state — one tenant being rate limited does not freeze the others.
+The **queue** is still one queue per client, and ordering is a property of that
+queue: while one grant's backlog is draining, another grant's requests take the
+queued path rather than the fast path, so they cannot be served ahead of it.
 
 They are not blocked by it — the drain steps over frozen grants, so the other
 tenant's work is admitted in turn — but it costs the queue path (about a third of

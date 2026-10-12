@@ -48,9 +48,6 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
       },
     },
     async (span) => {
-      // A cost above the ceiling can never be admitted, so reject it here — to
-      // the caller — rather than letting it occupy the queue until it times out
-      // on whichever replica happens to be the controller.
       await this.assertReadyToQueue();
       // Constructed before the ceiling test, because its constructor validates the
       // shape of `cost`, `priority` and `grantId`. Testing the ceiling first makes
@@ -62,6 +59,9 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
         this.instanceId,
         this.requestOptions
       );
+      // A cost above the ceiling can never be admitted, so reject it here — to
+      // the caller — rather than letting it occupy the queue until it times out
+      // on whichever replica happens to be the controller.
       const ceiling = this.getCostCeiling();
       if (ceiling !== undefined && (config.cost ?? 1) > ceiling) {
         throw new RequestCostExceedsBudgetError(
@@ -82,6 +82,12 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
           // or spent tokens, so a throw has to hand those back explicitly.
           try {
             await handlePreRequest.bind(this)(request);
+            // The interceptor and a token refresh run after admission, and an
+            // abort landing there would otherwise reach axios as its own
+            // `CanceledError`, with the claim still spent.
+            if (request.config.signal?.aborted) {
+              throw new RequestAbortedError(request.id);
+            }
           } catch (error) {
             await releaseAbandonedRequest.bind(this)(request, error);
             throw error;
@@ -196,13 +202,11 @@ async function publishAbandoned(
   // mechanism that makes queue/slot state correct.
   void this.finalizeOwnedRequest(data).catch(() => undefined);
   try {
-    // Bounded, because this runs on the path that has ALREADY decided to give
-    // up. An unbounded await here held the caller's `RequestTimeoutError` behind
-    // a publish that never settled — so the admission deadline fired correctly
-    // and then could not escape, which is the whole point of having one. A Redis
-    // that is up but not answering (saturated, swapping, paused) leaves the
-    // command in ioredis's queue indefinitely rather than rejecting it, so only
-    // a deadline gets the caller its answer.
+    // Bounded, because this runs on a path that has already given up, and the
+    // caller's `RequestTimeoutError` waits behind it. A Redis that is up but
+    // not answering (saturated, swapping, paused) leaves the command in
+    // ioredis's queue indefinitely rather than rejecting it, so only a deadline
+    // gets the caller its answer.
     await withDeadline(
       this.backend.publish(
         `${this.handlerNamespace}:requestDone`,
@@ -273,13 +277,15 @@ async function withDeadline<T>(
 
 async function waitForRequestReady(this: BaseClient, request: Request) {
   const timeoutMs = this.requestOptions.cleanupTimeout || 60000;
-  const metadata = request.getMetadata();
 
-  // A retry re-enters on the same Request object and `fastPath` describes how
-  // *this* attempt was admitted, so it must be cleared first. A stale `true` makes
-  // `handleRequestDone` skip the queue removal, stranding an entry that keeps the
-  // queue non-empty — which disables the fast path for good.
+  // A retry re-enters on the same Request object, and `fastPath` and
+  // `claimedKeys` describe how *this* attempt was admitted, so both are cleared
+  // first. A stale `fastPath` makes `handleRequestDone` skip the queue removal,
+  // stranding an entry that disables the fast path for good; stale keys make an
+  // abandonment release the previous attempt's claims.
   request.fastPath = false;
+  request.claimedKeys = undefined;
+  const metadata = request.getMetadata();
 
   // Checked before the fast path, not after: the fast path spends, and a caller who
   // has already given up must not be charged a token or a slot for a request axios
@@ -314,6 +320,7 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
       throw new RequestAbortedError(request.id);
     }
     request.fastPath = true;
+    request.claimedKeys = metadata.claimedKeys;
     request.setStatus("inProgress");
     return true;
   }
@@ -332,7 +339,15 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
       clearTimeout(timeout);
       signal?.removeEventListener?.("abort", onAbort);
       this.emitter.off(`requestReady:${request.id}`, onReady);
+      this.emitter.off(`requestFailed:${request.id}`, onFailed);
       reject(error);
+    };
+
+    // What `failWaitingRequest` reaches when the client failing this request is
+    // not the one it was queued through — a `sharedLimit` budget's owner.
+    const onFailed = (error: Error) => {
+      this.unregisterWaitingRequest(request.id);
+      cancel(error);
     };
 
     // Aborting while queued releases the place rather than holding it until the
@@ -341,6 +356,7 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
       clearTimeout(timeout);
       this.unregisterWaitingRequest(request.id);
       this.emitter.off(`requestReady:${request.id}`, onReady);
+      this.emitter.off(`requestFailed:${request.id}`, onFailed);
       // Not awaited: an abort must return control promptly, and awaiting would
       // block up to ABANDONMENT_PUBLISH_TIMEOUT_MS on a wedged backend for a caller
       // who has stopped waiting. A request aborted while queued holds no slot, so
@@ -362,6 +378,7 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
       this.unregisterWaitingRequest(request.id);
       signal?.removeEventListener?.("abort", onAbort);
       this.emitter.off(`requestReady:${request.id}`, onReady);
+      this.emitter.off(`requestFailed:${request.id}`, onFailed);
       // Same reasoning as the abort branch for the trailing catch: the logger
       // inside `publishAbandoned`'s own catch is consumer code, and a throw there
       // would leave this floating promise rejected with nothing attached.
@@ -378,8 +395,10 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
     const onReady = (ready: RequestMetadata) => {
       clearTimeout(timeout);
       signal?.removeEventListener?.("abort", onAbort);
+      this.emitter.off(`requestFailed:${request.id}`, onFailed);
       this.unregisterWaitingRequest(request.id);
       request.isThawRequest = ready.isThawRequest;
+      request.claimedKeys = ready.claimedKeys;
       request.setStatus("inProgress");
       resolve(true);
     };
@@ -389,6 +408,7 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
     // depend on that check for a signal to get abort handling at all.
     signal?.addEventListener?.("abort", onAbort, { once: true });
     this.emitter.once(`requestReady:${request.id}`, onReady);
+    this.emitter.once(`requestFailed:${request.id}`, onFailed);
     this.registerWaitingRequest(request.id, cancel);
   });
 
@@ -556,8 +576,8 @@ async function handleRetry(
   };
   // Classify the failure before deciding whether to retry. The freeze is a
   // fleet-wide statement about the upstream, and a 429 says the same thing on
-  // the last permitted attempt as on the first — checking the retry budget
-  // first meant `maxRetries: 0` never armed the back-off for anyone.
+  // the last permitted attempt as on the first, so `maxRetries: 0` still arms
+  // the back-off.
   const outOfRetries = request.retries >= this.retryOptions.maxRetries;
 
   if (status && status === 429 && retry429s) {
@@ -600,8 +620,7 @@ async function handleRetry(
   if (!data.retry) {
     // A freeze still needs a duration even though this request is finished
     // retrying: the freeze is about the upstream, not about this attempt, and
-    // `handleRequestDone` ignores a freeze with no wait time — so the last
-    // attempt's 429 armed nothing at all.
+    // `handleRequestDone` ignores a freeze with no duration.
     if (data.freezeClient) handleBackoff.bind(this)(request, data);
     return data;
   }
@@ -621,7 +640,7 @@ function handleBackoff(
   const attempt = Math.max(1, request.retries);
   const multiplier = Math.pow(attempt, power);
   data.waitTime = multiplier * this.getRetryBackoffBaseTime(data.isRateLimited);
-  data.freezeTime = multiplier * this.getFreezeBaseTime();
+  data.freezeTime = multiplier * this.getFreezeBaseTime(data.isRateLimited);
   data.message += ` | Will retry...`;
   return data;
 }

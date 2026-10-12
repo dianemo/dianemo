@@ -1,9 +1,22 @@
 import { normalizeTtlSeconds } from "@dianemo/core";
+import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 import type {
   AcquireConcurrencyResult,
   ConcurrencyConfig,
 } from "@dianemo/core";
+
+/** A reply whose occupancy the script sent as an `exact` string. */
+function readConcurrency<T extends { currentConcurrency?: number }>(
+  result: unknown
+): T {
+  const parsed = JSON.parse(result as string) as T;
+  if (parsed.currentConcurrency === undefined) return parsed;
+  return {
+    ...parsed,
+    currentConcurrency: parseLuaNumber(parsed.currentConcurrency),
+  };
+}
 
 /** Concurrency operations. Twin of the memory backend's concurrency section. */
 export function concurrencyOps(ctx: Ctx) {
@@ -51,7 +64,7 @@ export function concurrencyOps(ctx: Ctx) {
         86400 // TTL for the key
       );
 
-      return JSON.parse(result as string) as AcquireConcurrencyResult;
+      return readConcurrency<AcquireConcurrencyResult>(result);
     },
 
     async acquireQueuedConcurrency(
@@ -71,7 +84,7 @@ export function concurrencyOps(ctx: Ctx) {
         config.requestTtl,
         86400
       );
-      return JSON.parse(result as string) as AcquireConcurrencyResult;
+      return readConcurrency<AcquireConcurrencyResult>(result);
     },
 
     /**
@@ -100,10 +113,10 @@ export function concurrencyOps(ctx: Ctx) {
         requestTtl
       );
 
-      return JSON.parse(result as string) as {
+      return readConcurrency<{
         currentConcurrency: number;
         activeRequests: string[];
-      };
+      }>(result);
     },
 
     /**
@@ -111,8 +124,9 @@ export function concurrencyOps(ctx: Ctx) {
      * their slots too, and the cap stops holding until they finish.
      */
     async clearConcurrency(key: string): Promise<void> {
-      const costKey = `${key}:costs`;
-      await Promise.all([ctx.redis.del(key), ctx.redis.del(costKey)]);
+      // One `DEL` naming both, so no acquire can land between the two and leave
+      // a slot whose cost entry is gone.
+      await ctx.redis.del(key, `${key}:costs`);
     },
   };
 }

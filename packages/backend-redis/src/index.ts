@@ -1,6 +1,7 @@
 import { createContext, type Ctx } from "./context.js";
 import { concurrencyOps } from "./ops/concurrency.js";
 import { tokenBucketOps } from "./ops/tokenBucket.js";
+import { multiLimitOps } from "./ops/multiLimit.js";
 import { normalizeTtlSeconds } from "@dianemo/core";
 import { instanceOps } from "./ops/instances.js";
 import { freezeOps } from "./ops/freeze.js";
@@ -58,6 +59,7 @@ class RedisBackend implements DianemoBackend {
   private subscribed = new Map<string, Set<MessageHandler>>();
   private ops: {
     tokenBucket: ReturnType<typeof tokenBucketOps>;
+    multiLimit: ReturnType<typeof multiLimitOps>;
     concurrency: ReturnType<typeof concurrencyOps>;
     queue: ReturnType<typeof queueOps>;
     freeze: ReturnType<typeof freezeOps>;
@@ -69,6 +71,7 @@ class RedisBackend implements DianemoBackend {
     this.ctx = createContext(redis);
     this.ops = {
       tokenBucket: tokenBucketOps(this.ctx),
+      multiLimit: multiLimitOps(this.ctx),
       concurrency: concurrencyOps(this.ctx),
       queue: queueOps(this.ctx),
       freeze: freezeOps(this.ctx),
@@ -295,6 +298,24 @@ class RedisBackend implements DianemoBackend {
     return this.ops.tokenBucket.refundTokens(...a);
   }
 
+  // -------------------------------------------------------- several budgets
+
+  acquireMultiLimit(
+    ...a: Parameters<NonNullable<DianemoBackend["acquireMultiLimit"]>>
+  ) {
+    return this.ops.multiLimit.acquireMultiLimit(...a);
+  }
+  releaseMultiLimit(
+    ...a: Parameters<NonNullable<DianemoBackend["releaseMultiLimit"]>>
+  ) {
+    return this.ops.multiLimit.releaseMultiLimit(...a);
+  }
+  tryAdmitMultiLimit(
+    ...a: Parameters<NonNullable<DianemoBackend["tryAdmitMultiLimit"]>>
+  ) {
+    return this.ops.multiLimit.tryAdmitMultiLimit(...a);
+  }
+
   // ---------------------------------------------------------- concurrency
 
   tryAdmitConcurrency(...a: Parameters<DianemoBackend["tryAdmitConcurrency"]>) {
@@ -408,9 +429,9 @@ class RedisBackend implements DianemoBackend {
     // Cleared first, so a second close cannot quit the same connection twice.
     const listener = this.listener;
     this.listener = null;
-    // `quit()` sends QUIT and waits for the reply, which never arrives on a
-    // connection that never reached the server — closing after a failed start hung
-    // instead of releasing it. `disconnect()` tears down without a round trip.
+    // `quit()` sends QUIT and waits for a reply that never arrives on a
+    // connection that never reached the server. `disconnect()` tears down
+    // without a round trip.
     if (listener.status === "ready") {
       await listener.quit().catch(() => listener.disconnect());
       return;
@@ -421,7 +442,23 @@ class RedisBackend implements DianemoBackend {
 
 /**
  * Coordinates through Redis — the right choice for anything running more than
- * one process, and a safe choice for one.
+ * one process, and a safe choice for one. Valkey connections work unchanged;
+ * DragonflyDB does not by default. Run the server with
+ * `maxmemory-policy noeviction`: an evicted bucket reads as full. See
+ * docs/backends/redis.md.
+ *
+ * Registers dianemo's Lua scripts on `redis` as custom commands, and opens one
+ * duplicate connection of its own for pub/sub on the first `subscribe`;
+ * `close()` closes only that duplicate.
+ *
+ * ```ts
+ * import { Redis } from "ioredis";
+ * import RequestHandler from "@dianemo/core";
+ * import { redisBackend } from "@dianemo/backend-redis";
+ *
+ * const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
+ * const handler = new RequestHandler({ key, backend: redisBackend(redis) });
+ * ```
  *
  * @param redis an ioredis connection you own and will close yourself
  */

@@ -8,7 +8,7 @@ npm install @dianemo/core   # nothing else
 import RequestHandler, { memoryBackend } from "@dianemo/core";
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY,
+  key: process.env.REQUEST_HANDLER_KEY!,
   backend: memoryBackend(),
 });
 ```
@@ -51,8 +51,11 @@ nothing can interleave with a synchronous loop.
 
 ## What you give up besides distribution
 
-- **Durability.** State lives in memory. A restart loses the queue, the token
-  buckets and any cached OAuth tokens. Redis would have kept them.
+- **Durability.** State lives in memory, so a process restart loses the queue,
+  the token buckets, any cached OAuth tokens and every template client stored
+  with `addTemplateClient`. Redis would have kept them. A `stop()` and `start()`
+  within one process loses nothing: the store outlives `close()`, and the
+  handler rebuilds its stored template clients from it.
 - **Shared credentials.** OAuth tokens are per-process, so a refresh benefits
   only the process that performed it. Under a distributed backend one replica's
   refresh serves the whole fleet.
@@ -62,9 +65,14 @@ nothing can interleave with a synchronous loop.
 
 ## Expiry
 
-Keys expire lazily: a TTL is checked on read, and an unreferenced sweep runs on
-an unref'd timer so keys nobody reads again cannot pin memory forever. The
-sweep's timer is unref'd, so it never keeps a process alive on its own.
+Keys expire lazily: a TTL is checked on read, and a sweep once a minute removes
+expired keys nobody reads again, so they cannot pin memory forever. The sweep's
+timer is unref'd, so it never keeps a process alive on its own.
+
+A set, sorted set or hash whose last member is removed is deleted with it, as
+Redis deletes one, and an `hset` with no fields creates nothing. So an emptied
+key never answers an existence check, and whatever is added to it next does not
+inherit the old key's expiry.
 
 ## Plugins
 

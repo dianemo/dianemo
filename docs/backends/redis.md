@@ -9,10 +9,10 @@ import { Redis } from "ioredis";
 import RequestHandler from "@dianemo/core";
 import { redisBackend } from "@dianemo/backend-redis";
 
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL!);
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY,
+  key: process.env.REQUEST_HANDLER_KEY!,
   backend: redisBackend(redis),
 });
 ```
@@ -27,11 +27,25 @@ you run one replica or twenty.
 It is also a perfectly good choice for a single process. If you are unsure which
 backend you need, use this one.
 
-## Valkey, DragonflyDB and friends
+## Versions
 
-Both are wire-compatible with Redis, so no separate adapter exists or is needed.
-Construct their connection with `ioredis` and pass it to `redisBackend()`
+- **Redis 5.0 or later.** Several scripts write after reading `TIME`, which
+  Redis allows without `redis.replicate_commands()` only from 5.0, when effects
+  replication became the default. Redis 4 refuses them with "Write commands not
+  allowed after non deterministic commands". CI runs against Redis 7.
+- **`ioredis` `^5.4.0`**, the package's peer range.
+
+## Valkey and DragonflyDB
+
+Valkey is wire-compatible with Redis, so no separate adapter exists or is
+needed. Construct its connection with `ioredis` and pass it to `redisBackend()`
 unchanged.
+
+DragonflyDB is not a drop-in replacement. Some scripts touch keys they do not
+declare in `KEYS`, and Dragonfly refuses that by default with "script tried
+accessing undeclared key". Starting it with
+`--default_lua_flags=allow-undeclared-keys` should lift the refusal, but that
+configuration is untested.
 
 ## You own the connection
 
@@ -85,11 +99,14 @@ atomic script, taking a request from nine round-trips down to two, or one for a
   error, no log line, only the vendor's counters disagreeing with yours.
 
   **A TTL is not protection.** Nearly every key dianemo writes carries one — a
-  token bucket expires a day after its last use, an instance registration in
-  seconds — which makes them _candidates_ under `volatile-lru` and the other
-  `volatile-*` policies rather than exempt from them. Only the instance and
-  template registries are TTL-less. `noeviction` is the setting; there is no
-  safe middle ground.
+  token bucket expires a day after its last use, or once it could have refilled
+  from empty if that takes longer; an instance registration in seconds — which
+  makes them _candidates_ under `volatile-lru` and the other `volatile-*`
+  policies rather than exempt from them. Only the instance and template
+  registries, the template credentials and settings filed beside them, and each
+  instance's client-name set
+  (`requestHandler:templateClients:<template>::<instance>`, behind any
+  `keyPrefix`) are TTL-less. `noeviction` is the setting; there is no safe middle ground.
 
 - **A shared Redis is fine for collisions, not for memory.** Keys are prefixed,
   so dianemo can live alongside a cache or a queue in the same instance and
@@ -98,6 +115,10 @@ atomic script, taking a request from nine round-trips down to two, or one for a
   make it `noeviction` and size it for the whole working set — a cache can still
   bound itself with TTLs, which expire under `noeviction` exactly as they do
   under any other policy.
+- **One logical keyspace only.** Several scripts touch keys they do not declare
+  in `KEYS`, so anything that routes by key — Redis Cluster, a key-routing
+  proxy, an active-active deployment — is unsupported. See
+  [design notes](../design-notes.md#the-redis-backend-requires-one-logical-keyspace).
 - **Failover.** ioredis handles reconnection. Coordination state is rebuilt from
   what remains; a lost queue means in-flight requests are re-driven by their
   callers rather than silently dropped.

@@ -20,7 +20,7 @@ describe.each(harnesses(5))("requestLimit — $name", (harness) => {
   });
 
   const CLIENT = "rl:_:a";
-  const BUCKET = "ct:requestHandler:rl:_:a:rateLimit";
+  const BUCKET = "ct:requestHandler:rl:_:a:rateLimit:default";
   const QUEUE = "ct:requestHandler:rl:_:a:queue";
   const META = "ct:requestHandler:rl:_:a:request";
 
@@ -31,7 +31,7 @@ describe.each(harnesses(5))("requestLimit — $name", (harness) => {
     withHandler(
       harness,
       upstream.baseURL,
-      [{ name: "rl", rateLimit: { type: "requestLimit", ...rateLimit } }],
+      [{ name: "rl", rateLimit: [{ type: "requestLimit", ...rateLimit }] }],
       fn
     );
 
@@ -131,8 +131,13 @@ describe.each(harnesses(5))("requestLimit — $name", (harness) => {
       async (handler) => {
         await fireMany(handler, CLIENT, 10);
         const stats = await handler.getClientStats(CLIENT);
-        expect(stats.rateLimit).toMatchObject({ type: "requestLimit" });
-        expect((stats.rateLimit as { tokens: number }).tokens).toBe(90);
+        // One limit, reported the same way several are: a named entry apiece.
+        expect(stats.rateLimit).toHaveLength(1);
+        expect(stats.rateLimit[0]).toMatchObject({
+          type: "requestLimit",
+          name: "default",
+          tokens: 90,
+        });
       }
     );
   }, 30_000);
@@ -148,5 +153,20 @@ describe.each(harnesses(5))("requestLimit — $name", (harness) => {
         expect(stats.pending + stats.inProgress).toBe(0);
       }
     );
+  }, 30_000);
+
+  it("serves a budget whose refill outlasts any key ttl, spending one token each", async () => {
+    const glacial = {
+      interval: Number.MAX_SAFE_INTEGER,
+      tokensToAdd: 1,
+      maxTokens: 10_000,
+    };
+    await run(glacial, async (handler, backend) => {
+      const results = await fireMany(handler, CLIENT, 3);
+      expect(results.every((r) => r.status === 200)).toBe(true);
+      expect((await backend.getTokenBucketState(BUCKET, glacial)).tokens).toBe(
+        9_997
+      );
+    });
   }, 30_000);
 });

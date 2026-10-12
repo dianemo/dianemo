@@ -17,6 +17,11 @@ configured. Dianemo coordinates through a shared backend, so N replicas draw fro
 
 - **Shared token buckets.** One budget per credential, refilled lazily and drawn down by every
   replica through the backend. Adding replicas doesn't multiply your request rate.
+- **Several limits per client.** A vendor publishing "20 a second and 50,000 a day" is one client
+  with two limits, and a request goes out only when every one admits it — claimed in one atomic
+  backend operation, so a decline never leaves the first budget spent.
+- **Rate-limit plans in templates.** A template can offer a closed menu of limits — one per
+  subscription tier — and each tenant picks one by key when its credentials are added.
 - **Priority queue with cost-weighted spending.** A request declares a `priority`, so a bulk backfill
   at priority 1 is admitted behind interactive traffic at priority 5 instead of starving it, and a
   `cost` for how many tokens it consumes. Ordering is by priority, then retry count, then arrival —
@@ -53,8 +58,8 @@ import { redisBackend } from "@dianemo/backend-redis";
 import fedex from "@dianemo/plugin-fedex";
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY, // encrypts stored credentials
-  backend: redisBackend(new Redis(process.env.REDIS_URL)),
+  key: process.env.REQUEST_HANDLER_KEY!, // encrypts stored credentials
+  backend: redisBackend(new Redis(process.env.REDIS_URL!)),
   logger: console, // optional; silent by default
 });
 
@@ -63,8 +68,8 @@ export const requests = handler.use(fedex);
 // Credentials arrive separately — from a vault, a database, or env.
 await handler.addTemplateClient("fedex", {
   instanceId: "production",
-  clientId: process.env.FEDEX_CLIENT_ID,
-  clientSecret: process.env.FEDEX_CLIENT_SECRET,
+  clientId: process.env.FEDEX_CLIENT_ID!,
+  clientSecret: process.env.FEDEX_CLIENT_SECRET!,
   baseUrl: "https://apis.fedex.com",
 });
 
@@ -75,9 +80,11 @@ await requests.fedex.cancelShipment("fedex:_:production", {
 ```
 
 `handler.start()` is called on the first request and is idempotent. It registers SIGTERM/SIGINT/SIGHUP
-handlers so the queue drains on shutdown: `stop()` waits for queued and in-flight work to finish, up
-to a 10-second grace period (`setDrainTimeout` changes it), then fails anything still waiting with a
-`ClientUnavailableError` rather than leaving it to time out after the process meant to exit.
+handlers so the queue drains on shutdown: `stop()` waits up to a 10-second budget for queued work
+to drain, fails anything still waiting with a `ClientUnavailableError` rather than leaving it to
+time out after the process meant to exit, then waits up to the same budget again for requests
+already upstream. Shutdown can therefore take about 20 seconds; `setDrainTimeout` changes the
+budget.
 
 [Getting started](docs/getting-started.md) explains what each piece above is for.
 
@@ -111,6 +118,7 @@ The manual lives in [`docs/`](docs/README.md).
 - [Getting started](docs/getting-started.md) — a working setup, explained in the order the pieces matter
 - [Concepts](docs/concepts.md) — sub-clients, grants, overrides, leader election, freeze/thaw
 - [Choosing a rate limit](docs/rate-limits/README.md) — the four strategies, side by side
+- [Several limits at once](docs/rate-limits/multiple-limits.md) — per-second *and* per-day, or a rate *and* a concurrency ceiling
 - [Choosing a backend](docs/backends/README.md) — where shared state lives
 - [Writing a plugin](docs/writing-plugins.md) — packaging an integration
 - [Benchmarks](docs/benchmarks.md) — what each scenario measures, and the numbers
@@ -121,7 +129,7 @@ The manual lives in [`docs/`](docs/README.md).
 | Package                                            | What it is                                                                                     |
 | -------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | [`@dianemo/core`](packages/core)                   | The handler, the plugin system, and the in-memory backend. Depends only on `axios` and `@opentelemetry/api`. |
-| [`@dianemo/backend-redis`](packages/backend-redis) | Redis backend. Also covers Valkey and DragonflyDB, which are wire-compatible.                  |
+| [`@dianemo/backend-redis`](packages/backend-redis) | Redis backend. Also covers Valkey, which is wire-compatible.                                   |
 
 Integrations are published separately, one package per vendor, from
 [dianemo-plugins](https://github.com/vivo-us/dianemo-plugins) — FedEx, UPS, Shopify, Stripe, Amazon
@@ -150,7 +158,7 @@ fix to the Redis backend does not bump core.
 
 ```
 packages/core            @dianemo/core            interface + memory backend
-packages/backend-redis   @dianemo/backend-redis   Redis/Valkey/DragonflyDB backend
+packages/backend-redis   @dianemo/backend-redis   Redis/Valkey backend
 ```
 
 ```bash
@@ -177,7 +185,8 @@ npm run release:publish       # publishes to npm
 backends that disagree about ordering, fairness or refill timing are two different products wearing
 one name, so the token bucket, fast-path admission, concurrency slots, queue ordering, freeze/thaw
 probing, locks and pub/sub are asserted identically against both. Adding a backend means making this
-suite pass — nothing else is required, and nothing less is sufficient.
+suite pass — nothing less is sufficient — plus `test/clientTypes/multiLimit.test.ts` if it implements
+the optional multi-limit methods that clients declaring several limits need.
 
 `test/handler.integration.test.ts` runs a whole handler end to end on each backend, asserting through
 the backend interface rather than poking at storage. `test/lifecycle.integration.test.ts` covers the

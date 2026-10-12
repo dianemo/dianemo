@@ -19,6 +19,11 @@ configured. Dianemo coordinates through a shared backend, so N replicas draw fro
 
 - **Shared token buckets.** One budget per credential, refilled lazily and drawn down by every
   replica through the backend. Adding replicas doesn't multiply your request rate.
+- **Several limits per client.** A vendor publishing "20 a second and 50,000 a day" is one client
+  with two limits, and a request goes out only when every one admits it — claimed in one atomic
+  backend operation, so a decline never leaves the first budget spent.
+- **Rate-limit plans in templates.** A template can offer a closed menu of limits — one per
+  subscription tier — and each tenant picks one by key when its credentials are added.
 - **Cost-weighted priority queue.** A request declares a `cost` (how many tokens it consumes) and a
   `priority`, so a bulk backfill is admitted behind interactive traffic instead of starving it.
 - **Freeze and thaw with single-flight probing.** When a vendor returns a hard limit, the client
@@ -75,8 +80,9 @@ second pod, a `pm2 -i 2` — switch to a distributed backend.** That is not an o
 only thing that makes the limit real. If you are unsure, use Redis: being wrong in that direction
 costs one connection, and being wrong in the other direction costs your API access.
 
-Anything wire-compatible with Redis works unchanged — **Valkey** and **DragonflyDB** both speak the
-same protocol, so `redisBackend()` takes their connections as-is.
+**Valkey** works unchanged, since it speaks the same protocol: `redisBackend()` takes its connection
+as-is. **DragonflyDB** refuses some of the backend's scripts by default; see
+[the Redis backend page](https://github.com/vivo-us/dianemo/blob/master/docs/backends/redis.md#valkey-and-dragonflydb).
 
 [Full comparison](https://github.com/vivo-us/dianemo/blob/master/docs/backends/README.md)
 
@@ -89,10 +95,10 @@ import { redisBackend } from "@dianemo/backend-redis";
 import fedex from "@dianemo/plugin-fedex";
 import ups from "@dianemo/plugin-ups";
 
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL!);
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY, // encrypts credentials at rest
+  key: process.env.REQUEST_HANDLER_KEY!, // encrypts credentials at rest
   backend: redisBackend(redis),
   logger: console, // optional; silent by default
 });
@@ -102,8 +108,8 @@ export const requests = handler.use(fedex, ups);
 // Credentials arrive separately — from a vault, a database, or env.
 await handler.addTemplateClient("fedex", {
   instanceId: "production",
-  clientId: process.env.FEDEX_CLIENT_ID,
-  clientSecret: process.env.FEDEX_CLIENT_SECRET,
+  clientId: process.env.FEDEX_CLIENT_ID!,
+  clientSecret: process.env.FEDEX_CLIENT_SECRET!,
   baseUrl: "https://apis.fedex.com",
 });
 
@@ -123,7 +129,7 @@ For a single-process program, swap two lines and drop the dependency entirely:
 import RequestHandler, { memoryBackend } from "@dianemo/core";
 
 const handler = new RequestHandler({
-  key: process.env.REQUEST_HANDLER_KEY,
+  key: process.env.REQUEST_HANDLER_KEY!,
   backend: memoryBackend(), // single process only — see "Choosing a backend"
 });
 ```
@@ -139,7 +145,7 @@ npm for the vendor you need rather than assuming it is there. Nothing waits on t
 
 | Term         | Meaning                                                                                    |
 | ------------ | ------------------------------------------------------------------------------------------ |
-| **Template** | The _shape_ of an integration: rate limit, auth flow, sub-clients. Carries no credentials. |
+| **Template** | The _shape_ of an integration: rate limits, auth flow, sub-clients. Carries no credentials. |
 | **Client**   | A template plus one set of credentials, named `<template>:<orgId \| _>:<alias>`.           |
 | **Plugin**   | A template plus the request functions that use it, packaged together.                      |
 | **Grant**    | An independently rate-limited credential within a client.                                  |
@@ -153,14 +159,20 @@ or an environment variable.
 
 ## Errors
 
-Every error carries `statusCode` and `code` alongside `message`, so an HTTP layer can map them
-without importing this package:
+Every error dianemo raises itself carries `statusCode` and `code` alongside `message`, so an HTTP
+layer can map them without importing this package. A failed upstream call is the exception: it
+reaches a `handleRequest` caller as axios's own error, from the last attempt, which has the vendor's
+answer on `status` rather than `statusCode`:
 
 ```ts
 if (typeof err.statusCode === "number" && typeof err.code === "string") {
   res
     .status(err.statusCode)
     .json({ error: err.code, error_description: err.message });
+} else if (typeof err.status === "number") {
+  res
+    .status(502)
+    .json({ error: "upstream_error", upstream_status: err.status });
 }
 ```
 

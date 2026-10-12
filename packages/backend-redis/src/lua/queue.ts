@@ -1,4 +1,4 @@
-import { finiteNumberFn } from "./fragments.js";
+import { exactFn, finiteNumberFn } from "./fragments.js";
 import {
   MAX_QUEUE_PRIORITY as MAX_PRIORITY,
   MAX_QUEUE_RETRIES as MAX_RETRIES,
@@ -146,8 +146,7 @@ export const updateRequest = `
   end
   -- 'type(x) == number', not 'x ~= nil': cjson decodes a JSON null to a
   -- lightuserdata that is not nil, and JSON.stringify writes null for both NaN and
-  -- Infinity — so a non-finite update stored the literal string 'userdata: 0',
-  -- which the re-score below then read as the default.
+  -- Infinity, so a non-finite update is skipped rather than stored.
   local needsScoreUpdate =
     type(updates.retries) == 'number' or type(updates.priority) == 'number'
 
@@ -179,13 +178,8 @@ export const updateRequest = `
     redis.call('HSET', metadataKey, 'isThawRequest', value)
   end
 
-  -- Recalculate and update score if priority or retries changed.
-  --
-  -- This must pack the score exactly as calculateQueueScore does. It used
-  -- to use its own constants — a 1e15 priority band, a 10-retry band and a
-  -- raw timestamp — which put a re-scored request on a scale roughly ten
-  -- times larger than every freshly-added one. A retry therefore sorted
-  -- behind the whole queue, the precise opposite of retrying sooner.
+  -- Packs the score exactly as calculateQueueScore does, from the same
+  -- constants, so a re-scored entry sorts on the same scale as a fresh one.
   if needsScoreUpdate then
     local priority = tonumber(redis.call('HGET', metadataKey, 'priority')) or 1
     local retries = tonumber(redis.call('HGET', metadataKey, 'retries')) or 0
@@ -202,9 +196,8 @@ export const updateRequest = `
 
     -- The arrival term is clamped into its own band, which calculateQueueScore
     -- instead enforces with a RangeError. A stored timestamp is not a constant a
-    -- maintainer chose, so a corrupt one is clamped rather than raised: unclamped it
-    -- bled into the retry band and sorted the entry against a different band
-    -- entirely, and a raise here would fail the retry it is re-scoring.
+    -- maintainer chose, so a corrupt one is clamped rather than raised: a raise
+    -- here would fail the retry it is re-scoring.
     local arrival = timestamp - ${SCORE_EPOCH_MS}
     if arrival < 0 then arrival = 0 end
     if arrival > ${RETRY_BAND} - 1 then arrival = ${RETRY_BAND} - 1 end
@@ -224,6 +217,7 @@ export const getQueueStats = `
 
   local requestIds = redis.call('ZRANGE', queueKey, 0, -1)
 ${finiteNumberFn()}
+${exactFn()}
   local pending = 0
   local inProgress = 0
   local totalCost = 0
@@ -250,7 +244,7 @@ ${finiteNumberFn()}
     end
   end
 
-  return cjson.encode({ pending = pending, inProgress = inProgress, totalCost = totalCost })
+  return cjson.encode({ pending = pending, inProgress = inProgress, totalCost = exact(totalCost) })
 `;
 
 export const getAllRequests = `

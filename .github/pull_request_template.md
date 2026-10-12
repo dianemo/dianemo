@@ -20,7 +20,7 @@ A renamed error `code`, a moved key layout or a changed public signature all bel
 
 **REQUIRED** | What you ran, and what you could not.
 
-- Test totals, and **whether the Redis-gated suites actually ran**. Without `REDIS_URL` a green run is 112 tests short and silent about it, and `test/conformance.test.ts` — the suite proving the two backends agree — loses its Redis half rather than skipping visibly.
+- Test totals, and **whether the Redis-gated suites actually ran**. Without `REDIS_URL` a green run leaves out about half the suite and says nothing, and `test/conformance.test.ts` — the suite proving the two backends agree — loses its Redis half rather than skipping visibly.
 - Whether you ran the `--typecheck` form. `npm test` omits it, so the type-level suite CI runs does not execute locally.
 - `check`, `lint`, `format`, `sort-imports:check` and `build`.
 - **Any test assertion you changed, and why the behaviour under it is still right.**

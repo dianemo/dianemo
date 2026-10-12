@@ -58,7 +58,7 @@ against a real one. Import order is enforced by `scripts/sort-imports.mjs`, so r
 `npm run sort-imports` rather than hand-ordering imports.
 
 Two things that line does not do: `npm test` omits `--typecheck`, so the type-level suite CI
-runs never executes, and without `REDIS_URL` a green run is 112 tests short. Before pushing,
+runs never executes, and without `REDIS_URL` about half the suite never runs. Before pushing,
 load `pre-commit-checks` — it owns the full sequence and the reasons for its order.
 
 Prettier owns formatting — do not hand-wrap code to a column. Comment prose is not prettier's

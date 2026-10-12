@@ -97,18 +97,18 @@ Two things are missing from a bare `npm test`, and both are the kind that pass l
 fail in CI.
 
 **`npm test` does not run the type-level suite.** The `test` script is `vitest run` with no
-`--typecheck`, so `test/typeInference.test-d.ts` never executes. Measured on master:
-`npm test` collects 32 files / 613 tests, `npx vitest run --typecheck` collects 33 / 618.
-Those five tests guard plugin namespace inference — if `use()` ever returns `any`, every
-runtime test still passes while consumers silently lose type safety. **Run the `--typecheck`
-form before pushing.**
+`--typecheck`, so `test/typeInference.test-d.ts` never executes: `--typecheck` adds one
+file and five tests. Those five tests guard plugin namespace inference — if `use()` ever
+returns `any`, every runtime test still passes while consumers silently lose type safety.
+**Run the `--typecheck` form before pushing.**
 
 **Redis-backed suites skip silently without `REDIS_URL`.** Eight files skip entirely —
 `lifecycle.integration`, `luaGuards`, `redisClock`, `redisKeyTtl`, `redisOps`,
-`clientTypes/backendFailure`, `replicas.failover`, `replicas.smoke` — and that is only 103
-of it. The rest comes from suites that run against **every** backend and quietly lose their
-Redis half, `test/conformance.test.ts` first among them. Measured on master with no Redis:
-501 passed, **112 skipped**, reported as a green run.
+`clientTypes/backendFailure`, `replicas.failover`, `replicas.smoke` — and the skip count
+understates it. Suites that run against **every** backend, `test/conformance.test.ts` first
+among them, do not skip their Redis half: they never generate it, so it is not counted at
+all. Measured at `081e86c` with `--typecheck`: 710 passed and 122 skipped without Redis,
+against 1307 passed with it — **about half the suite absent from a green run**.
 
 The conformance suite is the one that proves the two backends agree. **A backend change
 verified without Redis is not verified**, and the run will not tell you.
@@ -120,7 +120,7 @@ docker run --rm -p 6379:6379 redis:7-alpine    # CI uses the same image
 Set `REDIS_URL` with no trailing path — the harnesses append a database index
 (`${REDIS_URL}/${TEST_DB}`), so a trailing slash produces an unusable URL.
 
-Expect **around 105 seconds**. `fileParallelism` is off deliberately: several suites assert
+Expect **around six minutes**. `fileParallelism` is off deliberately: several suites assert
 on timing and on occupancy at a shared upstream, and running four at once made them measure
 the machine rather than the code. A slow run is not a hung one.
 
@@ -182,8 +182,8 @@ than working from memory — nothing from either is restated here on purpose, be
 copy of the rules drifts from the first the moment either moves.
 
 If you changed backend semantics, the specific question to ask is whether the **other**
-backend needs the same change. `test/clientTypes/backendParity.test.ts` and
-`test/conformance.test.ts` are the guard, and the second only runs with Redis.
+backend needs the same change. `test/conformance.test.ts` is the guard, and only with
+Redis; `test/clientTypes/backendParity.test.ts` covers queue selection alone.
 
 ## What CI re-runs
 

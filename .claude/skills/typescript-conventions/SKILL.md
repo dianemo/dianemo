@@ -27,23 +27,22 @@ and **must stay semantically identical**.
 ## The twin rule comes before every other rule here
 
 A change to what a backend operation *means* is a change to both backends. Not "should
-usually be" — `test/clientTypes/backendParity.test.ts` and `test/conformance.test.ts`
-exist to fail when it isn't, and `docs/design-notes.md#two-backends-one-contract` is the
+usually be" — `test/conformance.test.ts` exists to fail when it isn't, run with Redis, and `docs/design-notes.md#two-backends-one-contract` is the
 argument for why.
 
 That extends into layout, which is why the large files are laid out the way they are.
 `DianemoBackend` is section-separated in a fixed order:
 
 ```
-store · locks · pub/sub · admission (fast path) · token bucket · concurrency ·
-queue · freeze / thaw · instances · lifecycle
+store · locks · pub/sub · admission (fast path) · token bucket · several budgets ·
+concurrency · queue · freeze / thaw · instances · lifecycle
 ```
 
 `backend/memory.ts` and `backend-redis/src/index.ts` both repeat that order in their own
 separators, each with one local addition — `primitives` at the top of the memory backend,
 `clock` in the Redis one. The Redis backend then splits the heavier operations out by the
 same names again, one file per section, under `src/ops/` and `src/lua/`
-(`tokenBucket`, `concurrency`, `queue`, `freeze`, `instances`).
+(`tokenBucket`, `multiLimit`, `concurrency`, `queue`, `freeze`, `instances`).
 
 **Put a new operation in the matching section of each.** The correspondence is what lets a
 reader diff one backend against the other by eye, and it is worth more than any local
@@ -62,13 +61,14 @@ statement rather than an inline `type` specifier in a value import.
 
 ## File size
 
-The measured shape of this repo is a lot of small files and four large ones:
-`client/index.ts` (~1,500 lines), `backend/memory.ts` (~1,300), `core/src/index.ts`
-(~970) and `client/methods/handleRequest.ts` (~660). Everything else is under ~500.
+The measured shape of this repo is a lot of small files and a few large ones:
+`backend/memory.ts` and `client/index.ts` (~1,700 lines each) and `core/src/index.ts`
+(~1,300), then `utils/templateClients.ts`, `backend/types.ts`, `handleRequest.ts` and
+`meteredClient.ts` (600–850). Everything else is under ~500.
 
 - **A new file targets under 300 lines.** If it is heading past that, it is usually a
   transport concern, a mapping concern and the orchestration over both.
-- **The four large files are not an invitation to add a fifth.** They are large because
+- **The large files are not an invitation to add another.** They are large because
   each is one class implementing one interface, and `memory.ts` in particular is long
   precisely so that it reads section-for-section against its Redis twin. Splitting it
   would buy nothing and cost the correspondence above.
@@ -88,7 +88,9 @@ implementations as the deliberate exception.
 
 ## Errors
 
-Everything thrown extends `RequestHandlerError`, which carries `statusCode` and `code`.
+Every error the handler raises about its own state or configuration extends
+`RequestHandlerError`, which carries `statusCode` and `code`. `RequestError` (which plugins
+throw), upstream axios errors and the backends' `RangeError` do not.
 
 **The `code` string is public API.** Its JSDoc tells hosts to duck-type on `statusCode`
 and `code` rather than import the classes, because the handler and the catch site may
@@ -103,7 +105,8 @@ and needs a `major` version plan — see `pull-requests`.
   failures a caller would handle differently. A caller matching on the code cannot tell
   what failed otherwise, which is the entire reason the codes exist.
 - `ConfigurationError` is for **programming errors** — bad config, a `:` in a template
-  name, a duplicate plugin. Never a runtime condition.
+  name, a duplicate plugin. A few of its codes arise at runtime (`invalid_token_response`,
+  `unusable_rate_limit`, `invalid_request_cost`); do not add to them.
 
 Message prose is part of the error's value here: several messages name the offending
 value and state the fix. Follow that.
@@ -115,7 +118,7 @@ buries the fact that the line does IO, throws away the name of what was fetched,
 leaves nothing to log or break on.
 
 `packages/*/src` is at **zero** occurrences of this — the line is currently held, so any
-you introduce is yours. The tests are not: about fifteen live in `test/`. Write new test
+you introduce is yours. The tests are not: about twenty live in `test/`. Write new test
 code the same way as source, but do not sweep the existing ones as a side errand.
 
 A bare boolean predicate in a condition — `if (await client.hasOutstandingWork())` — is
@@ -142,10 +145,9 @@ Each thing lives at the **lowest level that contains all of its users**:
 | the handler and the clients                 | `core/src/utils/`                 |
 | both backends                               | `core/src/backend/`, exported     |
 
-The last row is load-bearing and easy to get wrong. The Redis backend's `ops/` layer
-imports `normalizeTtlSeconds`, `parseStoredNumber`, `calculateQueueScore` and
-`REQUEST_TOMBSTONE_TTL_SECONDS` **from `@dianemo/core` by name** — shared arithmetic lives
-in core and is imported, rather than being reimplemented in the backend where it would
+The last row is load-bearing and easy to get wrong. The Redis backend imports its TTL
+normalisers, stored-number parsers and queue-score constants **from `@dianemo/core` by
+name** — shared arithmetic lives in core and is imported, rather than being reimplemented in the backend where it would
 drift. If you find yourself writing a second copy of a calculation the memory backend
 already does, export the first one instead.
 

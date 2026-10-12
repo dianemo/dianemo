@@ -176,7 +176,7 @@ What you ran, and what you could not:
 
 - The test totals, and **whether the Redis-gated suites actually ran**. "1302 tests, 37
   files, both backends against a real Redis" is the sentence that matters, because a green
-  run without `REDIS_URL` is 112 tests short and silent about it.
+  run without `REDIS_URL` leaves out about half the suite and says nothing.
 - `check`, `lint`, `format`, `sort-imports:check` and `build` clean.
 - **Any test assertion you changed, and why the behaviour under it is still right.**
   Changing a test to match new behaviour is normal; changing one to make it pass is not, and

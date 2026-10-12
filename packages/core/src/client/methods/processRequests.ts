@@ -98,9 +98,34 @@ async function processRequests(this: BaseClient) {
         settles: request.settles,
       };
 
+      // Every write-back of this claim confirms first, so a stale claimer
+      // writes nothing over the entry's new holder. After a confirmation whose
+      // reply was lost the write goes ahead, since it may have landed.
+      // docs/design-notes.md#a-queue-claim-is-a-lease
+      let confirmation: "unsent" | "sent" | "refused" = "unsent";
+      const confirm = async () => {
+        confirmation = "sent";
+        const confirmed = await this.confirmRequestInQueue(request);
+        if (!confirmed) confirmation = "refused";
+        return confirmed;
+      };
+      // A probe that does not go out must give the mark back: left set, it
+      // reads as a competing probe, and its eventual completion would be
+      // counted against whichever freeze is standing by then.
+      const returnToQueue = async () => {
+        if (confirmation === "refused") return;
+        if (confirmation === "unsent" && !(await confirm())) return;
+        const updates: Partial<QueuedRequest> = { status: "pending" };
+        if (requestMetadata.isThawRequest) {
+          updates.isThawRequest = false;
+          requestMetadata.isThawRequest = false;
+        }
+        await this.updateRequestInQueue(requestId, updates);
+      };
+
       const res = await this.canProcessNextRequest(requestMetadata);
       if (!res.canProcess) {
-        await this.updateRequestInQueue(requestId, { status: "pending" });
+        await returnToQueue();
         // Checked before the grant short-circuit below, because an impossible cost
         // is a property of the request rather than of its grant's momentary
         // capacity — otherwise a grant-scoped request goes to `blockedGrantIds` and
@@ -143,7 +168,7 @@ async function processRequests(this: BaseClient) {
         const thawResult = await this.tryStartThawRequest(grantId, requestId);
 
         if (thawResult === "exists") {
-          await this.updateRequestInQueue(requestId, { status: "pending" });
+          await returnToQueue();
           // No `scheduleDrainForFreeze` here, unlike the three decline exits above:
           // this request is not waiting for the freeze to lapse but for a probe that
           // is already running, and that probe's `requestDone` re-enters this loop.
@@ -152,29 +177,6 @@ async function processRequests(this: BaseClient) {
 
         requestMetadata.isThawRequest = true;
       }
-
-      // A probe that does not go out must give the mark back: left set, it reads
-      // as a competing probe, and its eventual completion would be counted
-      // against whichever freeze is standing by then.
-      //
-      // A claim whose lease lapsed belongs to whoever was handed the entry next,
-      // so a stale claimer writes nothing back over it. Confirming first also
-      // ends the lease, so the entry cannot be handed out mid-write. Once a
-      // confirmation has been sent the write is unconditional: one whose reply
-      // was lost may have landed, and only this write moves that entry on.
-      let confirmSent = false;
-      const returnToQueue = async () => {
-        if (!confirmSent) {
-          confirmSent = true;
-          if (!(await this.confirmRequestInQueue(request))) return;
-        }
-        const updates: Partial<QueuedRequest> = { status: "pending" };
-        if (requestMetadata.isThawRequest) {
-          updates.isThawRequest = false;
-          requestMetadata.isThawRequest = false;
-        }
-        await this.updateRequestInQueue(requestId, updates);
-      };
 
       // Between the claim above and the notification below the request exists
       // only in this loop — `getNextRequest` already marked it `inProgress`, so
@@ -231,10 +233,20 @@ async function processRequests(this: BaseClient) {
         }
 
         // Not released on a lapsed claim: a concurrency slot is keyed by
-        // request id, so it is the slot the entry's new holder is using.
+        // request id, so it is the slot the entry's new holder is using. An
+        // entry that is gone has no holder, and its slot is this pass's alone.
         // docs/design-notes.md#a-queue-claim-is-a-lease
-        confirmSent = true;
-        if (!(await this.confirmRequestInQueue(request))) continue;
+        if (!(await confirm())) {
+          if (this.claimsReleasableCapacity()) {
+            const entry = await this.getRequestFromQueue(requestId).catch(
+              () => "unreadable" as const
+            );
+            if (entry === null) {
+              await this.releaseUnusedAdmission(requestMetadata);
+            }
+          }
+          continue;
+        }
 
         // Addressed to the replica waiting on this request rather than broadcast,
         // since only the owner has a listener for it. When that owner is this

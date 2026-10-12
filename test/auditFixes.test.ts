@@ -155,6 +155,52 @@ describe("redaction", () => {
     expect(redactUrl("https://tok@en@host.example/x")).not.toContain("en@");
   });
 
+  it("redacts a password containing '#'", () => {
+    expect(redactUrl("https://user:pa#ss@host/x")).not.toContain("pa");
+  });
+
+  it("redacts a password containing '?'", () => {
+    expect(redactUrl("https://user:pa?ss@host/x")).not.toContain("pa?");
+  });
+
+  it("redacts a password that starts with '#' or '?'", () => {
+    expect(redactUrl("https://user:#secret@host/x")).not.toContain("secret");
+    expect(redactUrl("https://user:?secret@host/x")).not.toContain("secret");
+  });
+
+  it.each([
+    ["https://user:pw@host/p", "https://user:[REDACTED]@host/p"],
+    ["https://user:p@ss@host/p", "https://user:[REDACTED]@host/p"],
+    ["https://user:pw@host#a@b", "https://user:[REDACTED]@host#a@b"],
+    ["https://host:8080/a@b", "https://host:8080/a@b"],
+    ["https://host:8080?email=a@b.com", "https://host:8080?email=a@b.com"],
+    ["https://host/?email=a@b.com", "https://host/?email=a@b.com"],
+    ["http://[::1]:8080/a@b", "http://[::1]:8080/a@b"],
+    ["http://user:pw@[::1]:80/", "http://user:[REDACTED]@[::1]:80/"],
+    ["https://ghp_tok@host/", "https://[REDACTED]@host/"],
+    ["https://u%40x:p%3Aw@host/", "https://u%40x:[REDACTED]@host/"],
+    ["//user:pw@host/", "//user:[REDACTED]@host/"],
+    ["https://host#frag@x", "https://host#frag@x"],
+  ])("redacts %s as %s", (input, expected) => {
+    expect(redactUrl(input)).toBe(expected);
+  });
+
+  it("stays linear on a long adversarial URL", () => {
+    const inputs = [
+      "https://" + "a:".repeat(25_000),
+      "https://a:" + "@".repeat(50_000) + "/",
+      "https://a:" + "#@".repeat(25_000),
+      "https://" + "a".repeat(50_000),
+      "//" + ":".repeat(50_000),
+      "https://a:" + "b".repeat(50_000),
+    ];
+    for (const input of inputs) {
+      const start = performance.now();
+      redactUrl(input);
+      expect(performance.now() - start).toBeLessThan(100);
+    }
+  });
+
   it("redacts a consumer's own credential header when told about it", () => {
     const headers = redactHeaders(
       { "X-Subscription-Key": "VENDOR_KEY", Accept: "application/json" },

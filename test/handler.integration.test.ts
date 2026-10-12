@@ -17,7 +17,8 @@ import { Redis } from "ioredis";
  * Assertions go through the backend interface rather than poking at storage, so
  * the same test is meaningful for a backend that has no Redis keys to inspect.
  *
- * The memory backend always runs. Redis runs when REDIS_URL is set.
+ * The memory backend always runs. Redis runs when REDIS_URL is set, once on a
+ * plain connection and once on one with an ioredis `keyPrefix`.
  */
 
 const REDIS_URL = process.env.REDIS_URL;
@@ -47,6 +48,23 @@ if (REDIS_URL) {
     name: "redis",
     create: async () => {
       const redis = new Redis(`${REDIS_URL}/${TEST_DB}`);
+      await redis.flushdb();
+      const backend = redisBackend(redis);
+      return {
+        backend,
+        cleanup: async () => {
+          await backend.close();
+          await redis.quit();
+        },
+      };
+    },
+  });
+  harnesses.push({
+    name: "redis with an ioredis keyPrefix",
+    create: async () => {
+      const redis = new Redis(`${REDIS_URL}/${TEST_DB}`, {
+        keyPrefix: "e2e:",
+      });
       await redis.flushdb();
       const backend = redisBackend(redis);
       return {

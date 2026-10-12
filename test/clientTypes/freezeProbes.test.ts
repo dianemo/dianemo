@@ -17,6 +17,8 @@ async function startUpstream() {
     if (path.startsWith("/hold/")) {
       await new Promise<void>((resolve) => holds.set(path, resolve));
       res.writeHead(200).end("{}");
+    } else if (path.startsWith("/status/")) {
+      res.writeHead(Number(path.slice("/status/".length))).end("{}");
     } else if (path === "/429") {
       res.writeHead(429).end("{}");
     } else {
@@ -233,3 +235,105 @@ describe.each(harnesses(0))(
     });
   }
 );
+
+describe.each(harnesses(0))("what a thaw probe learns — $name", (harness) => {
+  const FREEZE = `${NS}:freezeState`;
+
+  /** Freezes on a 429, then resolves once the window has lapsed. */
+  async function freezeAndLapse(
+    handler: RequestHandler,
+    backend: DianemoBackend
+  ) {
+    await send(handler, "/429").catch(() => undefined);
+    const lapsed = await waitUntil(async () => {
+      const state = await backend.getFreezeState(FREEZE);
+      return state !== null && (await backend.now()) >= state.frozenUntil;
+    });
+    expect(lapsed).toBe(true);
+  }
+
+  const send = (handler: RequestHandler, url: string) =>
+    handler.handleRequest({
+      clientName: NAME,
+      requestName: "t",
+      method: "GET",
+      url,
+    } as never);
+
+  const probing = (upstream: { baseURL: string }, extra = {}) => ({
+    rateLimit: [{ type: "noLimit" }],
+    requestOptions: { defaults: { baseURL: upstream.baseURL } },
+    retryOptions: {
+      maxRetries: 0,
+      retryBackoffBaseTime: 50,
+      thawRequestCount: 1,
+      ...extra,
+    },
+  });
+
+  it("does not hold a client in single-file probing for a week when every probe gets a 404", async () => {
+    const upstream = await startUpstream();
+    try {
+      await withClient(harness, probing(upstream), async (handler, backend) => {
+        await freezeAndLapse(handler, backend);
+        for (let i = 0; i < 3; i++) {
+          await expect(send(handler, "/status/404")).rejects.toThrow();
+        }
+        expect(
+          await waitUntil(
+            async () => (await backend.getFreezeState(FREEZE)) === null
+          )
+        ).toBe(true);
+      });
+    } finally {
+      await upstream.close();
+    }
+  }, 20_000);
+
+  it("keeps the client frozen when its probe gets a 5xx", async () => {
+    const upstream = await startUpstream();
+    try {
+      await withClient(harness, probing(upstream), async (handler, backend) => {
+        await freezeAndLapse(handler, backend);
+        await expect(send(handler, "/status/503")).rejects.toThrow();
+        await sleep(200);
+        expect(await backend.getFreezeState(FREEZE)).toMatchObject({
+          thawRequestCount: 1,
+        });
+
+        await send(handler, "/ok");
+        expect(
+          await waitUntil(
+            async () => (await backend.getFreezeState(FREEZE)) === null
+          )
+        ).toBe(true);
+      });
+    } finally {
+      await upstream.close();
+    }
+  }, 20_000);
+
+  it("keeps the client frozen when its probe gets a 4xx that classifyError freezes on", async () => {
+    const upstream = await startUpstream();
+    const classifyError = (error: { response?: { status?: number } }) =>
+      error.response?.status === 403
+        ? { action: "retry" as const, freeze: true as const }
+        : undefined;
+    try {
+      await withClient(
+        harness,
+        probing(upstream, { classifyError }),
+        async (handler, backend) => {
+          await freezeAndLapse(handler, backend);
+          await expect(send(handler, "/status/403")).rejects.toThrow();
+          await sleep(200);
+          expect(await backend.getFreezeState(FREEZE)).toMatchObject({
+            thawRequestCount: 1,
+          });
+        }
+      );
+    } finally {
+      await upstream.close();
+    }
+  }, 20_000);
+});

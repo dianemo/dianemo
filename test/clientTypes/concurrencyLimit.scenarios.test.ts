@@ -1,5 +1,6 @@
 import { fireMany, harnesses, startUpstream, withHandler } from "./harness.js";
 import type { DianemoBackend } from "../../packages/core/src/backend/types.js";
+import { QUEUE_CLAIM_LEASE_MS } from "../../packages/core/src/index.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import RequestHandler from "../../packages/core/src/index.js";
 import { createServer, type ServerResponse } from "node:http";
@@ -1544,11 +1545,10 @@ describe.each(harnesses(11))(
         async (handler, backend, clientName) => {
           const holder = settle(send(handler, clientName, "/hold"));
           await sleep(100);
-          const queued = settle(send(handler, clientName, "/ok"));
-          await sleep(100);
 
           // The claim runs and its reply is lost: a dropped connection, or a
-          // command timeout after the server had executed it.
+          // command timeout after the server had executed it. Installed before
+          // the request is queued, so no pass can hold a claim made without it.
           const original = backend.getNextRequest.bind(backend);
           let dropped = false;
           backend.getNextRequest = async (...args) => {
@@ -1559,6 +1559,8 @@ describe.each(harnesses(11))(
             }
             return result;
           };
+          const queued = settle(send(handler, clientName, "/ok"));
+          await sleep(100);
           up.releaseHeld();
 
           const held = await holder;
@@ -1610,6 +1612,180 @@ describe.each(harnesses(11))(
         }
       );
     }, 30_000);
+
+    /**
+     * Each test plays a second controller from inside this one's pass, at the
+     * point where this pass's lease has lapsed: it takes the entry over and
+     * confirms it, the point after which it dispatches. This pass is then the
+     * stale claimer. docs/design-notes.md#a-queue-claim-is-a-lease
+     */
+    describe("a stale claimer", () => {
+      interface Controller {
+        getQueueKey(): string;
+        getMetadataKeyPrefix(): string;
+        instanceId: string;
+        processRequests(): Promise<void>;
+      }
+      const controllerOf = (handler: RequestHandler, clientName: string) =>
+        (
+          handler as unknown as { clients: Map<string, Controller> }
+        ).clients.get(clientName)!;
+
+      const enqueue = async (
+        backend: DianemoBackend,
+        client: Controller,
+        clientName: string,
+        requestId = "x",
+        priority = 1
+      ) => {
+        await backend.addRequest(
+          client.getQueueKey(),
+          client.getMetadataKeyPrefix(),
+          {
+            requestId,
+            clientName,
+            requestName: "t.stale",
+            status: "pending",
+            priority,
+            cost: 1,
+            retries: 0,
+            timestamp: Date.now(),
+            isThawRequest: false,
+            ownerId: client.instanceId,
+          },
+          3600
+        );
+      };
+
+      const takeOver = async (backend: DianemoBackend, client: Controller) => {
+        const prefix = client.getMetadataKeyPrefix();
+        const held = await backend.getRequest(prefix, "x");
+        await backend.hset(`${prefix}:x`, {
+          claimedAt: String(held!.claimedAt! - QUEUE_CLAIM_LEASE_MS),
+        });
+        const next = await backend.getNextRequest(client.getQueueKey(), prefix);
+        expect(next?.requestId).toBe("x");
+        const confirmed = await backend.confirmRequest(
+          prefix,
+          "x",
+          next!.claimedAt!
+        );
+        expect(confirmed).toBe(true);
+      };
+
+      /** The new holder's entry stays confirmed and is not handed out again. */
+      const expectStillHeld = async (
+        handler: RequestHandler,
+        backend: DianemoBackend,
+        client: Controller
+      ) => {
+        const prefix = client.getMetadataKeyPrefix();
+        const entry = await backend.getRequest(prefix, "x");
+        expect(entry?.status).toBe("inProgress");
+        const next = await backend.getNextRequest(client.getQueueKey(), prefix);
+        expect(next).toBeNull();
+        // Nothing here will ever complete x, so shutdown would wait out the
+        // whole drain for it.
+        handler.setDrainTimeout(100);
+      };
+
+      it("does not reset an entry another controller confirmed when its own stale claim is declined by a freeze", async () => {
+        await withClient(
+          harness,
+          spec(1),
+          async (handler, backend, clientName) => {
+            const client = controllerOf(handler, clientName);
+            await enqueue(backend, client, clientName);
+            const original = backend.canProcessRequest.bind(backend);
+            let tookOver = false;
+            backend.canProcessRequest = async (...args) => {
+              if (tookOver) return original(...args);
+              tookOver = true;
+              await takeOver(backend, client);
+              const now = await backend.now();
+              return {
+                canProcess: false,
+                isThawRequest: false,
+                frozenUntil: now + 60_000,
+              };
+            };
+
+            await client.processRequests();
+            expect(tookOver).toBe(true);
+            await expectStillHeld(handler, backend, client);
+          }
+        );
+      }, 30_000);
+
+      it("does not reset an entry another controller confirmed when its own stale claim finds a probe already running", async () => {
+        await withClient(
+          harness,
+          spec(1),
+          async (handler, backend, clientName) => {
+            const client = controllerOf(handler, clientName);
+            await enqueue(backend, client, clientName);
+            const original = backend.canProcessRequest.bind(backend);
+            let tookOver = false;
+            backend.canProcessRequest = async (...args) => {
+              if (tookOver) return original(...args);
+              tookOver = true;
+              await takeOver(backend, client);
+              return { canProcess: true, isThawRequest: true };
+            };
+            backend.tryStartThawRequest = async () => "exists";
+
+            await client.processRequests();
+            expect(tookOver).toBe(true);
+            await expectStillHeld(handler, backend, client);
+          }
+        );
+      }, 30_000);
+
+      it("leaves a confirmed entry alone when its stale claimer is declined by the budget", async () => {
+        await withClient(
+          harness,
+          spec(1),
+          async (handler, backend, clientName) => {
+            const client = controllerOf(handler, clientName);
+            await enqueue(backend, client, clientName);
+            const original = backend.acquireQueuedConcurrency!.bind(backend);
+            let tookOver = false;
+            backend.acquireQueuedConcurrency = async (...args) => {
+              if (tookOver) return original(...args);
+              tookOver = true;
+              await takeOver(backend, client);
+              return { acquired: false, currentConcurrency: 1 };
+            };
+
+            await client.processRequests();
+            expect(tookOver).toBe(true);
+            await expectStillHeld(handler, backend, client);
+          }
+        );
+      }, 30_000);
+
+      it("releases the slot it took when confirmation finds the entry gone", async () => {
+        await withClient(
+          harness,
+          spec(1),
+          async (handler, backend, clientName) => {
+            const client = controllerOf(handler, clientName);
+            const prefix = client.getMetadataKeyPrefix();
+            await enqueue(backend, client, clientName);
+            const confirm = backend.confirmRequest.bind(backend);
+            backend.confirmRequest = async (...args) => {
+              // The owner abandons x after the still-queued re-read and before
+              // the confirmation.
+              await backend.removeRequest(client.getQueueKey(), prefix, "x");
+              return confirm(...args);
+            };
+
+            await client.processRequests();
+            expect(await occupancy(backend)).toBe(0);
+          }
+        );
+      }, 30_000);
+    });
 
     it("answers a request whose requestName is empty without stalling the queue behind it", async () => {
       await withClient(

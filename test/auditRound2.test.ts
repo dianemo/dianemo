@@ -4,6 +4,7 @@ import Request from "../packages/core/src/request/index.js";
 import RequestHandler from "../packages/core/src/index.js";
 import { describe, expect, it } from "vitest";
 import { createServer } from "node:http";
+import crypto from "node:crypto";
 import {
   redactBody,
   redactUrl,
@@ -113,6 +114,20 @@ describe("derived key caching", () => {
     const secret = "0123456789abcdef0123456789abcdef";
     // The IV is still per-operation even though the salt is now per-secret.
     expect(encrypt("same", secret)).not.toBe(encrypt("same", secret));
+  });
+
+  it("still decrypts a ciphertext written with a per-call salt", () => {
+    const secret = "0123456789abcdef0123456789abcdef";
+    const salt = crypto.randomBytes(16);
+    const iv = crypto.randomBytes(12);
+    const key = crypto.scryptSync(secret, salt, 32);
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    const body = Buffer.concat([
+      cipher.update("hello", "utf8"),
+      cipher.final(),
+    ]);
+    const blob = Buffer.concat([salt, iv, cipher.getAuthTag(), body]);
+    expect(decrypt(blob.toString("base64"), secret)).toBe("hello");
   });
 });
 

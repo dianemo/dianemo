@@ -297,6 +297,18 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       }
       expect([fast, multi]).toEqual([100, 100]);
     });
+
+    it("admits nothing more once a large bucket is spent", async () => {
+      const large = { maxTokens: 1e10, tokensToAdd: 1e10, interval: 3_600_000 };
+      const spent = await backend.acquireTokens(KEY, 1e10, large);
+      expect(spent.acquired).toBe(true);
+      let admitted = 0;
+      for (let i = 0; i < 20; i++) {
+        const result = await backend.acquireTokens(KEY, 1, large);
+        if (result.acquired) admitted++;
+      }
+      expect(admitted).toBe(0);
+    });
   });
 
   // ------------------------------------------------------------- settlement
@@ -553,6 +565,14 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         maxDebt: 0,
       });
 
+      /** Moves the bucket's refill clock back by whole `slow` intervals. */
+      const ageSlow = async (intervals: number) => {
+        const state = await backend.getTokenBucketState(KEY, slow);
+        await backend.hset(KEY, {
+          lastUpdate: state.lastUpdate - intervals * slow.interval,
+        });
+      };
+
       /**
        * Two claims of 1 leave 8; six intervals of refill then discard 4 at the
        * cap. Each claim under-reserved by 4. Charged at claim, the balance would
@@ -561,10 +581,7 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       const claimTwiceAndRefill = async () => {
         await backend.acquireTokens(KEY, 1, slow, mark("a"));
         await backend.acquireTokens(KEY, 1, slow, mark("b"));
-        const state = await backend.getTokenBucketState(KEY, slow);
-        await backend.hset(KEY, {
-          lastUpdate: state.lastUpdate - 6 * slow.interval,
-        });
+        await ageSlow(6);
       };
 
       it("forgives discarded refill once, not once per outstanding claim", async () => {
@@ -582,6 +599,23 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
           settleSlow("b"),
         ]);
         expect(results.reduce((sum, r) => sum + r.applied, 0)).toBe(4);
+      });
+
+      it("forgives an older claim the refill discarded before a newer claim was made", async () => {
+        // a, then 10 discarded at the cap; b, then 1 more discarded. b settles
+        // first and is forgiven that 1; the 10 before b existed still cover a.
+        await backend.acquireTokens(KEY, 1, slow, mark("a"));
+        await ageSlow(11);
+        await backend.acquireTokens(KEY, 1, slow, mark("b"));
+        await ageSlow(2);
+        const [b] = await backend.settleTokens!([
+          { key: KEY, markId: "b", actual: 2, config: slow, maxDebt: 0 },
+        ]);
+        expect(b.applied).toBe(0);
+        const [a] = await backend.settleTokens!([
+          { key: KEY, markId: "a", actual: 6, config: slow, maxDebt: 0 },
+        ]);
+        expect(a.applied).toBe(0);
       });
     });
 
@@ -628,6 +662,19 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       const [result] = await settle(51, 0, "a");
       expect(result.applied).toBe(0);
       expect(await balance()).toBe(99);
+    });
+
+    it("applies nothing when neither the bucket nor the mark carries an epoch", async () => {
+      await backend.acquireTokens(KEY, 10, config);
+      await backend.hset(`${KEY}:claim:a`, {
+        claimed: 10,
+        overflow: 0,
+        fills: 0,
+        generation: 0,
+      });
+      const [result] = await settle(30, 0, "a");
+      expect(result.applied).toBe(0);
+      expect(await balance()).toBe(90);
     });
   });
 
@@ -1501,6 +1548,27 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
 
       const again = await backend.getNextRequest(QUEUE, PREFIX);
       expect(again?.isThawRequest).toBe(false);
+    });
+
+    it("lets a later head start a probe when an earlier probe's claim lapsed behind it", async () => {
+      await add("x", { priority: 1 });
+      await backend.getNextRequest(QUEUE, PREFIX);
+      await backend.updateRequest(QUEUE, PREFIX, "x", { isThawRequest: true });
+      // y sorts ahead of x, so x is never handed out again to clear its mark.
+      await add("y", { priority: 9 });
+      const y = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(y?.requestId).toBe("y");
+      const probing = () =>
+        backend.hasThawRequestInProgress(QUEUE, PREFIX, "", { anyGrant: true });
+      const start = () =>
+        backend.tryStartThawRequest("q:frozen", QUEUE, PREFIX, "y", "");
+
+      expect(await probing()).toBe(true);
+      expect(await start()).toBe("exists");
+
+      await lapse("x");
+      expect(await probing()).toBe(false);
+      expect(await start()).toBe("started");
     });
 
     it("ends a claim when a status is written back", async () => {

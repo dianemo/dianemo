@@ -307,7 +307,15 @@ deleting on the count alone would let the probe's success end that new window
 early, which is the shortening that
 [`armFreeze`'s monotonicity](#freeze-duration-and-retry-wait-are-separate-numbers)
 rules out. Each completion id is recorded before the state is read, so a
-redelivered completion is not counted twice.
+redelivered completion is not counted twice, and the set of them lives
+`FREEZE_PROBE_TTL_SECONDS`, as long as the freeze it guards outlives its window.
+
+What counts as success is decided in `handleRequestDone`: a probe fails only
+if its own completion arms a freeze (`freezesClient`, the same test that arms
+one), so `classifyError` decides probes as it decides freezes. A failure leaves
+the freeze key alone, TTL included. Re-arming there would be redundant, since
+the failure has just armed a freeze through `armFreeze`, whose merge keeps the
+probes owed and sizes the key for them.
 
 ## Claiming and then verifying leaves a residue
 
@@ -355,16 +363,35 @@ was handed; an entry without a stamp is admitted and is never reclaimed. Any
 plainly pending. A stamp that does not parse never lapses, on both sides.
 
 The lease bounds only the gap between claim and confirmation, a few round
-trips, so it can be short. Too short costs little: within one controller the
-passes are serialised by `processingLock`, so a lease only lapses under a live
-claimer when two controllers drain at once. Then the stale claimer's
-confirmation fails and it does not dispatch. It does not release what it
-claimed either, because a concurrency slot is keyed by request id and is the
-slot the new holder is using; a token-bucket claim is spent twice instead,
-which under-admits rather than over-admits.
+trips, so it can be short. Too short costs little. Within one client object the
+passes are serialised by `processingLock`, but the lock is that object's own:
+`resetClient` demotes and destroys the old client without waiting out a pass it
+is already running, so after a rebuild that pass can drain alongside the
+replacement's. That, or two controllers draining at once, is when a lease
+lapses under a live claimer.
 
-A stale claimer that is *declined* confirms before `returnToQueue` writes
-`pending`, so it cannot reset an entry the new holder has already confirmed.
+Then the stale claimer's confirmation fails and it does not dispatch. It does
+not release what it claimed either, because a concurrency slot is keyed by
+request id and is the slot the new holder is using. The exception is an entry
+that a re-read finds gone: it has no holder, so the slot is this pass's alone
+and is released. A token-bucket claim is spent twice instead, and the stale
+claimer's claim mark, `<bucket>:claim:<slotId>`, is keyed by the same request
+and overwrites the new holder's. Settling the new holder's response against
+that mark can credit back at most `cost − actual`, against a full extra spend
+already taken, so both under-admit rather than over-admit.
+
+Every write-back of a claim in the loop — declined by a freeze, by a probe
+already running, by the budget, or failed in admission — goes through
+`returnToQueue`, which confirms before it writes `pending`. A stale claimer
+that is declined anywhere therefore cannot reset an entry the new holder has
+already confirmed.
+
+A thaw-probe mark made under a claim whose lease has lapsed does not count as a
+competing probe in `tryStartThawRequest` or `hasThawRequestInProgress`, on the
+backend's clock as `getNextRequest` reads it. `getNextRequest` clears such a
+mark when it hands the entry out again, but an entry sorted behind a head that
+keeps being handed out is never reached, and its mark would otherwise hold off
+every probe.
 
 A confirmation whose reply is lost throws into the loop's catch, which returns
 the entry to the queue undispatched, as for any other admission failure. That

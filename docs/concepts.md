@@ -276,9 +276,13 @@ on a client with exactly one `requestLimit` does.
 
 Recovery from a 429 is not "everyone retries at once". Once the deadline
 passes, one request at a time across the whole fleet is nominated as the **thaw
-probe**. Each probe that succeeds counts toward `thawRequestCount` (default 3),
-and the freeze clears when that many have. A failed probe does not consume thaw
-progress, and the next request becomes the next probe.
+probe**. A probe asks one question — has the upstream stopped limiting or
+failing? — so it succeeds on any response that would not itself freeze the
+client, a 404 or 400 included, and fails only on a 429, a 5xx, a dropped
+connection, or a failure `classifyError` freezes on. Each probe that succeeds
+counts toward `thawRequestCount` (default 3), and the freeze clears when that
+many have. A failed probe does not consume thaw progress; it arms a freeze of
+its own, and the next request after that becomes the next probe.
 
 With isolated grants, probing is per grant: one probe per grant rather than one
 per client, so recovering tenants do not wait behind each other. Without
@@ -298,9 +302,9 @@ computed from a skewed clock or from an extreme `retryBackoffBaseTime`. Such a
 deadline is bounded — both backends clamp it to 2^53-1 — but bounded far past
 any horizon you care about. Waiting the key out is not an escape either: the
 freeze key's TTL is sized from the deadline plus a minute, or plus a week while
-thaw probes are still owed, and each probe that completes re-arms it. It
-outlives the freeze rather than expiring under it; only a freeze nobody has
-probed for a week is dropped by its TTL.
+thaw probes are still owed, re-armed by each probe that succeeds and by the
+freeze each failed probe arms. It outlives the freeze rather than expiring
+under it; only a freeze nobody has probed for a week is dropped by its TTL.
 
 The escape hatch is the backend, not the client. Three methods on
 `DianemoBackend` exist for this, and nothing in the library calls them:

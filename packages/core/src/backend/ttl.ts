@@ -89,8 +89,9 @@ export function normalizeStateTtlSeconds(ttlSeconds: number): number {
 
 /**
  * How long a freeze key lives past its window while it still owes thaw
- * probes. A probe completion re-arms it, so only a freeze nobody has probed
- * for this long is dropped by its TTL.
+ * probes. A successful probe re-arms it and a failed one arms a freeze of its
+ * own, so only a freeze nobody has probed for this long is dropped by its TTL.
+ * The probe-completion ids kept to deduplicate redeliveries live as long.
  */
 export const FREEZE_PROBE_TTL_SECONDS = 7 * 86400;
 

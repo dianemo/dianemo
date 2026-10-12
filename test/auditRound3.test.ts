@@ -218,6 +218,104 @@ describe("audit round 3 regressions", () => {
     expect(response.status).toBe(200);
   });
 
+  it("refuses a request after stop() even when stop() ran before the first auto-start", async () => {
+    const target = await upstream();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend: memoryBackend(),
+      defaultClientOptions: {
+        name: "default",
+        requestOptions: { defaults: { baseURL: target.baseURL } },
+      },
+    });
+    handlers.push(handler);
+    await handler.stop();
+    await expect(
+      handler.handleRequest({
+        clientName: "default",
+        requestName: "shutdown.before-start",
+        method: "GET",
+        url: "/",
+      })
+    ).rejects.toMatchObject({ code: "handler_stopped" });
+    expect(handler.getMetadata().status).toBe("stopped");
+    expect(target.hits()).toBe(0);
+  });
+
+  it("refuses a request after a stop() that landed during a start() that failed", async () => {
+    const target = await upstream();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend: memoryBackend(),
+      defaultClientOptions: {
+        name: "default",
+        requestOptions: { defaults: { baseURL: target.baseURL } },
+      },
+    });
+    handlers.push(handler);
+    let enterHook!: () => void;
+    let failHook!: () => void;
+    const entered = new Promise<void>((resolve) => (enterHook = resolve));
+    const failed = new Promise<void>((_resolve, reject) => {
+      failHook = () => reject(new Error("first start fails"));
+    });
+    handler.registerStartupHook(async () => {
+      enterHook();
+      await failed;
+    });
+
+    const starting = handler.start();
+    await entered;
+    const stopping = handler.stop();
+    failHook();
+    await expect(starting).rejects.toThrow("first start fails");
+    await stopping;
+    await expect(
+      handler.handleRequest({
+        clientName: "default",
+        requestName: "shutdown.failed-start",
+        method: "GET",
+        url: "/",
+      })
+    ).rejects.toMatchObject({ code: "handler_stopped" });
+    expect(target.hits()).toBe(0);
+  });
+
+  it("serves again after stop(), start(), stop(), start()", async () => {
+    const target = await upstream();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend: memoryBackend(),
+      defaultClientOptions: {
+        name: "default",
+        requestOptions: { defaults: { baseURL: target.baseURL } },
+      },
+    });
+    handlers.push(handler);
+    handler.setDrainTimeout(100);
+    const request = {
+      clientName: "default",
+      requestName: "shutdown.cycle",
+      method: "GET" as const,
+      url: "/",
+    };
+    await handler.start();
+    await handler.stop();
+    await expect(handler.handleRequest(request)).rejects.toMatchObject({
+      code: "handler_stopped",
+    });
+    await handler.start();
+    const first = await handler.handleRequest(request);
+    expect(first.status).toBe(200);
+    await Promise.all([handler.stop(), handler.stop()]);
+    await expect(handler.handleRequest(request)).rejects.toMatchObject({
+      code: "handler_stopped",
+    });
+    await handler.start();
+    const second = await handler.handleRequest(request);
+    expect(second.status).toBe(200);
+  });
+
   it("elects past a peer registration it cannot read", async () => {
     const target = await upstream();
     const backend = memoryBackend();
@@ -250,6 +348,35 @@ describe("audit round 3 regressions", () => {
       url: "/",
     });
     expect(response.status).toBe(200);
+  });
+
+  it("elects without failing when a peer's registration parses to something other than an object", async () => {
+    const backend = memoryBackend();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend,
+      keyPrefix: "misshapen",
+    });
+    handlers.push(handler);
+    const namespace = handler.getNamespace();
+    const registrations = ["null", "42", '"text"', "[]", '{"id":"partial"}'];
+    await backend.batch(
+      registrations.flatMap((value, index) => [
+        {
+          op: "sadd" as const,
+          key: `${namespace}:instances`,
+          member: `peer${index}`,
+        },
+        {
+          op: "set" as const,
+          key: `${namespace}:instance:peer${index}`,
+          value,
+          ttlSeconds: 60,
+        },
+      ])
+    );
+    await expect(handler.start()).resolves.toBeUndefined();
+    expect(handler.getMetadata().ownedClients).toContain("default");
   });
 
   it("waits for an in-progress start before tearing the handler down", async () => {

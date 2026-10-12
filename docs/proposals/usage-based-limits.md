@@ -122,15 +122,16 @@ claim. Two counters on each bucket hash, maintained by every script that refills
 - **`overflow`** — total refill discarded at the `maxTokens` cap.
 - **`fills`** — how many times refill reached the cap at all, exactly or over.
 
-A third, **`forgiven`**, is the point on the `overflow` count up to which
-discarded refill has already paid down a debit. Only settlement moves it.
+A third, **`forgiven`**, totals the discarded refill that has paid down a
+debit. Only settlement moves it.
 
 At claim, a **claim mark** records
-`{ claimed, overflow, fills, generation, epoch }` under
+`{ claimed, overflow, fills, generation, epoch, forgiven }` under
 `<bucketKey>:claim:<requestId>:<retries>`, atomically with the claim. It is
 written only for a request that can be settled: one that declares `settle` or
 `settleStream`, or is streamed. At settlement, with `delta = actual − claimed`
-and `slack = overflow now − max(overflow at claim, forgiven)`:
+and `slack = max(0, (overflow now − overflow at claim) − (forgiven now −
+forgiven at claim))`:
 
 | Case | Applied now |
 |---|---|
@@ -138,7 +139,7 @@ and `slack = overflow now − max(overflow at claim, forgiven)`:
 | Credit (`delta < 0`), `fills` unchanged since the claim, not frozen | the full credit, capped at `maxTokens` |
 | Credit, the bucket has filled since the claim | nothing |
 | Credit while frozen | nothing — as `refundTokens` already does |
-| `generation` or `epoch` changed since the claim | nothing |
+| `generation` or `epoch` changed since the claim, or no `epoch` | nothing |
 | No mark: expired, already settled, or claimed before this shipped | nothing, reported `settled: false` |
 
 **Debits are exact for one claim.** Had the debit been charged at claim time,
@@ -146,12 +147,14 @@ every refill the bucket discarded since would have gone to paying it down
 instead. Only what that discarded refill has not covered still counts.
 
 **Discarded refill is spent when it forgives.** A debit that uses `slack`
-advances `forgiven` past what it used, so two claims outstanding across the
-same refill cannot each be forgiven the same tokens. It is consumed from
-`max(overflow at claim, forgiven)` upward, so an older claim settled after a
-newer one also loses the stretch below the newer claim's mark. That errs
-toward charging, never toward forgiving twice; tracking which stretch each
-claim used would need per-claim history.
+adds what it used to `forgiven`, and a claim's slack is the refill discarded
+since it was made less what has been forgiven since, so two claims outstanding
+across the same refill cannot each be forgiven the same tokens. Forgiveness
+from before a claim was made is not charged to it: a newer claim settling
+first leaves an older one the refill discarded before the newer existed. The
+reverse order is not exact. An older claim settling first may have used
+refill from before the newer claim, and the newer is still charged for it,
+because telling which stretch a claim used would need per-claim history.
 
 **Credits are close, not exact.** A credit charged at claim time would have
 reached the cap sooner and been discarded. If the bucket has filled since, that
@@ -170,7 +173,7 @@ in its first cycle matches a recreated bucket on every counter. The first mark
 written against a bucket stamps it with an `epoch` the mark copies, and it goes
 with the bucket's hash: Redis's clock to the microsecond, which no two scripts
 share, and a per-process counter in the memory backend. A mismatch, or no
-`epoch` on the bucket at all, applies nothing.
+`epoch` on the bucket or the mark, applies nothing.
 
 Settlement reads and deletes the mark in the same operation, so it applies
 exactly once however many times it is retried. That matters because the

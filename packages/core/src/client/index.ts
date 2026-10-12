@@ -944,16 +944,18 @@ abstract class BaseClient {
    * Keeps a streaming attempt's claims alive: its slots from the reaper, its
    * claim marks from expiry. Called every `streamKeepAliveMs` while the stream
    * is open; a crashed process stops calling, so crash recovery is unchanged.
+   *
+   * @returns The slot ledgers the attempt no longer holds a slot in.
    */
-  public async keepAttemptAlive(request: RequestMetadata): Promise<void> {
+  public async keepAttemptAlive(request: RequestMetadata): Promise<string[]> {
     const owner = this.getBudgetOwnerClient?.();
-    if (owner && owner !== this) await owner.keepAttemptAlive(request);
+    return owner && owner !== this ? owner.keepAttemptAlive(request) : [];
   }
 
   /** How often a streaming attempt's claims are kept alive. */
-  public streamKeepAliveMs(): number {
+  public streamKeepAliveMs(request: RequestMetadata): number {
     const owner = this.getBudgetOwnerClient?.();
-    return owner && owner !== this ? owner.streamKeepAliveMs() : 60_000;
+    return owner && owner !== this ? owner.streamKeepAliveMs(request) : 60_000;
   }
 
   /**
@@ -1309,7 +1311,7 @@ abstract class BaseClient {
       // to the entry by `tryStartThawRequest` on this side, and the owning
       // replica's `Request` keeps the `false` it was constructed with. Ordered
       // after the freeze test so it only costs a round trip when it can matter.
-      if (!data.freezeClient || !freezeDuration(data)) {
+      if (!freezesClient(data)) {
         const entry = await this.getRequestFromQueue(data.requestId);
         if (entry?.isThawRequest) await this.removeFrozenGrantId(data.grantId);
       }
@@ -1326,7 +1328,7 @@ abstract class BaseClient {
     // separate numbers and can disagree — a legal `retryBackoffBaseTime: 0` has a
     // zero wait while its freeze may run a whole refill interval.
     const freezeFor = freezeDuration(data);
-    if (!pending.freezeHandled && data.freezeClient && freezeFor) {
+    if (!pending.freezeHandled && freezesClient(data)) {
       // Wake against the freeze in force, not the one this completion asked for:
       // `armFreeze` keeps the longer of the two, and waking early declines without
       // re-booking. `extraMs` rides back on the write, costing no round trip.
@@ -1355,7 +1357,7 @@ abstract class BaseClient {
         this.freezeTimers.add(timer);
       }
       pending.freezeHandled = true;
-    } else if (!(data.freezeClient && freezeFor)) {
+    } else if (!freezesClient(data)) {
       pending.freezeHandled = true;
     }
 
@@ -1381,9 +1383,8 @@ abstract class BaseClient {
 
     // Nothing else wakes the drain loop for a retry that did not freeze the
     // client — a freeze schedules its own wake-up. Coalesces through
-    // `processingLock`. Uses the same freeze condition as the arming above, so
-    // the two cannot disagree about whether a freeze happened.
-    if (isRetry && !(data.freezeClient && freezeDuration(data))) {
+    // `processingLock`.
+    if (isRetry && !freezesClient(data)) {
       this.processRequests().catch((error) => {
         this.logger.error(
           { error },
@@ -1393,9 +1394,12 @@ abstract class BaseClient {
     }
 
     if (isThawRequest && !pending.thawHandled) {
+      // A probe asks whether the upstream still limits or fails us, so any
+      // answer that would not itself freeze the client is a success — a 404
+      // included. See docs/concepts.md#freeze-and-thaw.
       await this.backend.updateThawProgress(
         this.getFreezeStateKey(data.grantId),
-        data.responseStatus === "success",
+        !freezesClient(data),
         completionIdOf(data)
       );
 
@@ -1797,6 +1801,14 @@ function completionIdOf(data: RequestDoneData): string {
  */
 function freezeDuration(data: RequestDoneData): number {
   return data.freezeTime ?? data.waitTime;
+}
+
+/**
+ * Whether this completion arms a freeze. The one test for arming one and for
+ * failing a thaw probe, so the two cannot disagree.
+ */
+function freezesClient(data: RequestDoneData): boolean {
+  return Boolean(data.freezeClient && freezeDuration(data));
 }
 
 /**

@@ -107,12 +107,14 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
               await waitOutBackoff.bind(this)(request, backoffMs);
             }
             await handlePreRequest.bind(this)(request);
-            // The interceptor and a token refresh run after admission, and an
-            // abort landing there would otherwise reach axios as its own
-            // `CanceledError`, with the claim still spent.
+            // The interceptor and a token refresh run after admission and can
+            // outlive the shutdown drain. Without these, an abort landing there
+            // reaches axios as its own `CanceledError` with the claim still
+            // spent, and a stop lets the request go out after `stop()` returned.
             if (request.config.signal?.aborted) {
               throw new RequestAbortedError(request.id);
             }
+            if (this.admissionHalted) throw admissionHaltedError(this);
           } catch (error) {
             await releaseAbandonedRequest.bind(this)(request, error);
             throw error;
@@ -647,6 +649,14 @@ const DEFAULT_STREAM_TIMEOUT_MS = 3_600_000;
  */
 const SETTLE_GRACE_MS = 5_000;
 
+/**
+ * Roughly the largest body that completes unread, since the stream completes
+ * once every chunk has passed into the relay's readable side. 128 KiB is both
+ * sides of a default `PassThrough` on Node 22, whose byte `highWaterMark` is
+ * 64 KiB. See docs/rate-limits/streaming.md#the-two-moments.
+ */
+const RELAY_BUFFERS = { readableHighWaterMark: 128 * 1024 };
+
 function isStreamed(request: Request, res: AxiosResponse): boolean {
   return request.config.responseType === "stream" && isReadableStream(res.data);
 }
@@ -714,14 +724,25 @@ async function handleStreamedResponse(
     resolveFinished = resolve;
   });
 
+  const lostSlots = new Set<string>();
   const keepAlive = setInterval(() => {
-    void this.keepAttemptAlive(metadata).catch((error) => {
-      this.logger.error(
-        { error },
-        `Request ID: ${request.id} | could not keep the streaming request's claims alive`
-      );
-    });
-  }, this.streamKeepAliveMs());
+    void this.keepAttemptAlive(metadata)
+      .then((lost) => {
+        for (const key of lost) {
+          if (lostSlots.has(key)) continue;
+          lostSlots.add(key);
+          this.logger.warn(
+            `Client ${this.name} | request ${request.id} no longer holds its slot in ${key}; the stream carries on outside maxConcurrency`
+          );
+        }
+      })
+      .catch((error) => {
+        this.logger.error(
+          { error },
+          `Request ID: ${request.id} | could not keep the streaming request's claims alive`
+        );
+      });
+  }, this.streamKeepAliveMs(metadata));
   keepAlive.unref?.();
 
   const timeoutMs = streamTimeoutOf(this.requestOptions.streamTimeout);
@@ -801,8 +822,9 @@ function observingRelay(
   observer: StreamObserver | undefined
 ): Transform {
   const onChunk = observer?.onChunk?.bind(observer);
-  if (!onChunk) return new PassThrough();
+  if (!onChunk) return new PassThrough(RELAY_BUFFERS);
   return new Transform({
+    ...RELAY_BUFFERS,
     transform: (chunk: Buffer | string, _encoding, callback) => {
       try {
         onChunk(chunk);
@@ -938,42 +960,46 @@ async function handleError(
   // `handleRetry` below — long before the throw at the end of this function.
   sanitizeError(res, this.getSensitiveHeaderNames());
 
-  // Before `handleRetry`, which moves the retry count on to the next attempt.
-  await runSettle.bind(this)(request, {
-    response: res.response,
-    error: res,
-  });
-
-  const retryData = await handleRetry.bind(this)(request, res);
-  handleLogError.bind(this)(request, res, retryData);
-
-  if (retryData.retry) {
-    // Only the retry count, which is what re-scores the entry. Deliberately not
-    // `status: "pending"` — that would make the entry claimable before the owner
-    // has re-installed its `requestReady` listener, and an admission landing in
-    // that window emits into an EventEmitter nobody is listening to.
-    // `waitForRequestReady` flips it to pending once the listener exists.
-    await this.updateRequestInQueue(request.id, {
-      retries: request.retries,
+  let thrownToCaller = false;
+  try {
+    // Before `handleRetry`, which moves the retry count on to the next attempt.
+    await runSettle.bind(this)(request, {
+      response: res.response,
+      error: res,
     });
-  }
 
-  // The controller handles freeze and concurrency release from this event, and
-  // leaves a retry in the queue — it distinguishes them by `responseStatus`.
-  await publishRequestDone.bind(this)(
-    request,
-    JSON.stringify(request.getRequestDoneData(retryData, res.response?.status))
-  );
+    const retryData = await handleRetry.bind(this)(request, res);
+    handleLogError.bind(this)(request, res, retryData);
 
-  if (retryData.retry) {
-    // Nobody will read a streamed error body that is being retried, and an
+    if (retryData.retry) {
+      // Only the retry count, which is what re-scores the entry. Deliberately not
+      // `status: "pending"` — that would make the entry claimable before the owner
+      // has re-installed its `requestReady` listener, and an admission landing in
+      // that window emits into an EventEmitter nobody is listening to.
+      // `waitForRequestReady` flips it to pending once the listener exists.
+      await this.updateRequestInQueue(request.id, {
+        retries: request.retries,
+      });
+    }
+
+    // The controller handles freeze and concurrency release from this event, and
+    // leaves a retry in the queue — it distinguishes them by `responseStatus`.
+    await publishRequestDone.bind(this)(
+      request,
+      JSON.stringify(
+        request.getRequestDoneData(retryData, res.response?.status)
+      )
+    );
+
+    if (retryData.retry) return retryData;
+    thrownToCaller = true;
+    throw res;
+  } finally {
+    // Nobody will read a streamed error body the caller is not handed, and an
     // unread one holds its socket open.
     const body = res.response?.data;
-    if (isReadableStream(body)) body.destroy();
-    return retryData;
+    if (!thrownToCaller && isReadableStream(body)) body.destroy();
   }
-
-  throw res;
 }
 
 async function handleRetry(

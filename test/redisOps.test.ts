@@ -501,6 +501,39 @@ describeIfRedis("redis backend — ops layer", () => {
         "appA:requestHandler:requestDone",
       ]);
     });
+
+    it("stamps no epoch on a bucket claimed without a mark on a prefixed connection", async () => {
+      await open().acquireTokens("plain:tb", 1, BUCKET);
+      expect(await redis.hget("plain:tb", "epoch")).toBeNull();
+
+      await openPrefixed("app:").acquireTokens("tb", 1, BUCKET);
+      expect(await redis.hget("app:tb", "epoch")).toBeNull();
+    });
+
+    it("does not write to the key named by the bare ioredis prefix when a claim asks for no mark", async () => {
+      await redis.hset("app:", "owner", "someone-else");
+      const backend = openPrefixed("app:");
+
+      await backend.acquireTokens("tb", 1, BUCKET);
+      await backend.tryAdmitImmediately("q", "tb", "fz", 1, BUCKET);
+
+      expect(await redis.hgetall("app:")).toEqual({ owner: "someone-else" });
+      expect(await redis.ttl("app:")).toBe(-1);
+    });
+
+    it("reads no freeze from the key named by the bare ioredis prefix when a refund names none", async () => {
+      const backend = openPrefixed("app:");
+      const now = await backend.now();
+      await redis.hset("app:", {
+        frozenUntil: now + 60_000,
+        emptiesBucket: "1",
+      });
+      await backend.acquireTokens("tb", 5, BUCKET);
+
+      await backend.refundTokens!("tb", 5, BUCKET.maxTokens);
+
+      expect(await redis.hget("app:tb", "tokens")).toBe("100");
+    });
   });
 
   // ---------------------------------------------------------- token bucket read

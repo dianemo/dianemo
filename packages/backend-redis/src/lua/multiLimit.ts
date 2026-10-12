@@ -91,7 +91,7 @@ ${lazyRefill("      ")}
         mt = tonumber(spec.mt),
       })
       -- Twin of coversCost in the core package's backend/balance.ts.
-      if not (tokens >= cost - maxTokens * ${BALANCE_TOLERANCE}) then
+      if not (tokens >= cost - math.min(maxTokens, cost) * ${BALANCE_TOLERANCE}) then
         local intervalsNeeded = math.ceil((cost - tokens) / tokensToAdd)
         local wait = intervalsNeeded * interval - (now - lastUpdate)
         if wait < 0 then wait = 0 end

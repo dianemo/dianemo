@@ -1,6 +1,10 @@
-import { exactFn, finiteNumberFn, redisNow } from "./fragments.js";
 import {
-  QUEUE_CLAIM_LEASE_MS as CLAIM_LEASE_MS,
+  exactFn,
+  redisNow,
+  claimLapsedFn,
+  finiteNumberFn,
+} from "./fragments.js";
+import {
   MAX_QUEUE_PRIORITY as MAX_PRIORITY,
   MAX_QUEUE_RETRIES as MAX_RETRIES,
   QUEUE_PRIORITY_BAND as PRIORITY_BAND,
@@ -109,25 +113,26 @@ export const getNextRequest = `
   end
 
 ${redisNow()}
+${claimLapsedFn()}
   local allRequests = redis.call('ZRANGE', queueKey, 0, -1)
 
   for i, requestId in ipairs(allRequests) do
     local entryKey = metadataKey .. ':' .. requestId
-    local fields = redis.call('HMGET', entryKey, 'status', 'claimedAt', 'grantId',
-      'requestId', 'clientName', 'requestName')
-    local status = fields[1]
-    -- nil for an absent or empty field and nan for 'nan', neither of which ever
-    -- lapses: the memory twin's claimable().
-    local claimedAt = tonumber(fields[2])
+    -- The rest of the entry is read only once it proves claimable: most of a
+    -- deep queue is confirmed and in flight, and is passed over on these two.
+    local state = redis.call('HMGET', entryKey, 'status', 'claimedAt')
+    local status = state[1]
     local claimable = status == 'pending'
-      or (status == 'inProgress' and claimedAt ~= nil and now - claimedAt >= ${CLAIM_LEASE_MS})
+      or (status == 'inProgress' and claimLapsed(state[2]))
     if claimable and not skipRequestIds[requestId] then
-      local grantId = fields[3] or ''
+      local fields = redis.call('HMGET', entryKey, 'grantId', 'requestId',
+        'clientName', 'requestName')
+      local grantId = fields[1] or ''
       -- What decodeRequest requires. Claiming an entry it then reads as null
       -- leaves the entry inProgress while the caller sees an empty queue. An
       -- empty requestName is a label like any other; HMGET's false is absence.
-      local decodable = fields[4] and fields[4] ~= '' and fields[5]
-        and fields[5] ~= '' and fields[6] ~= false
+      local decodable = fields[2] and fields[2] ~= '' and fields[3]
+        and fields[3] ~= '' and fields[4] ~= false
       if decodable and (grantId == '' or not skipGrantIds[grantId]) then
         -- A lapsed claim's probe nomination lapses with it: left set, it holds
         -- off every other probe for a request nobody is admitting.

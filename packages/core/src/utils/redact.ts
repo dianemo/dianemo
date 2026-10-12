@@ -1,4 +1,4 @@
-import type { Readable } from "node:stream";
+import { PassThrough, pipeline, type Readable } from "node:stream";
 import type { AxiosError } from "axios";
 
 /**
@@ -97,6 +97,30 @@ export function redactHeaders(
   return out;
 }
 
+const USERINFO_WITH_PASSWORD =
+  /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#@:]*:)([^/?#]*)@/i;
+
+/**
+ * A password holding a raw `?` or `#`, which an unescaped one from a config
+ * file can. Tried only when the strict form above found no userinfo, so a
+ * query's own `@` is not mistaken for the end of one. Anchored, and only its
+ * last run backtracks, so a match stays linear in the URL's length.
+ */
+const USERINFO_WITH_RAW_PASSWORD =
+  /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#@:]*:)([^/]*)@/i;
+
+/** `host:8080?email=a@b.com`: a port, then a query or fragment holding `@`. */
+const PORT_BEFORE_QUERY = /^\d{1,5}[?#]/;
+
+function redactPassword(url: string): string {
+  const strict = USERINFO_WITH_PASSWORD.exec(url);
+  const match = strict ?? USERINFO_WITH_RAW_PASSWORD.exec(url);
+  if (!match) return url;
+  const [whole, scheme, user, password] = match;
+  if (!strict && PORT_BEFORE_QUERY.test(password)) return url;
+  return `${scheme}${user}${REDACTED}@${url.slice(whole.length)}`;
+}
+
 /**
  * Strips credentials from a URL's query string and userinfo.
  *
@@ -110,18 +134,10 @@ export function redactUrl(url: string | undefined): string | undefined {
   // as the username (`https://ghp_xxx@host/…`) is the whole credential and has no
   // password component to strip, so userinfo without a colon is replaced wholesale.
   // Scheme-relative `//user@host` is covered as well.
-  const out = url
-    .replace(
-      /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#@:]*:)([^/?#]*)@/i,
-      (_m, scheme: string, user: string) => `${scheme}${user}${REDACTED}@`
-    )
-    // No colon means the userinfo IS the credential — a PAT or bearer used as
-    // the username — so there is no password half to strip and the whole
-    // component goes.
-    .replace(
-      /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#:]+)@/i,
-      (_m, scheme: string) => `${scheme}${REDACTED}@`
-    );
+  const out = redactPassword(url).replace(
+    /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#:]+)@/i,
+    (_m, scheme: string) => `${scheme}${REDACTED}@`
+  );
 
   const queryStart = out.indexOf("?");
   if (queryStart === -1) return out;
@@ -278,6 +294,17 @@ export function redactConfig(
 }
 
 /**
+ * A relay of a streamed error body. The body itself is an `IncomingMessage`,
+ * which reaches the socket and through it the `ClientRequest` whose `_header`
+ * holds what was sent. `pipeline` destroys the body when the relay is.
+ */
+function detachedBody(body: Readable): Readable {
+  const relay = new PassThrough();
+  pipeline(body, relay, () => undefined);
+  return relay;
+}
+
+/**
  * Strips credentials from an error before it is thrown to the caller.
  *
  * `JSON.stringify(err)` reaches `AxiosError.prototype.toJSON`, which returns
@@ -324,10 +351,9 @@ export function sanitizeError(
         extraHeaderNames
       );
     }
-    if (
-      err.response.data !== undefined &&
-      !isReadableStream(err.response.data)
-    ) {
+    if (isReadableStream(err.response.data)) {
+      err.response.data = detachedBody(err.response.data);
+    } else if (err.response.data !== undefined) {
       err.response.data = redactBody(err.response.data);
     }
     // Some upstreams echo the offending value into the reason phrase.

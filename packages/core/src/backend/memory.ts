@@ -35,6 +35,7 @@ import type {
   TokenBucketConfig,
 } from "./types.js";
 import {
+  FREEZE_PROBE_TTL_SECONDS,
   freezeTtlSeconds,
   normalizeStateTtlSeconds,
   normalizeTombstoneTtl,
@@ -161,6 +162,11 @@ function claimable(
 ): boolean {
   if (status === "pending") return true;
   if (status !== "inProgress") return false;
+  return claimLapsed(claimedAt, now);
+}
+
+/** Whether a `claimedAt` stamp names a lease that has lapsed. See `claimable`. */
+function claimLapsed(claimedAt: string | undefined, now: number): boolean {
   return now - parseStoredNumber(claimedAt, NaN) >= QUEUE_CLAIM_LEASE_MS;
 }
 
@@ -727,6 +733,7 @@ class MemoryBackend implements DianemoBackend {
       String(parseFiniteStored(bucket.get("generation"), 0))
     );
     hash.set("epoch", bucket.get("epoch") ?? "");
+    hash.set("forgiven", String(parseFiniteStored(bucket.get("forgiven"), 0)));
     this.expire(markKey, mark.ttlSeconds);
   }
 
@@ -865,7 +872,8 @@ class MemoryBackend implements DianemoBackend {
         claimed: parseFiniteStored(mark.get("claimed"), 0),
         overflowNow: state.overflow,
         overflowAtClaim: parseFiniteStored(mark.get("overflow"), 0),
-        forgiven: parseFiniteStored(this.hget(spec.key, "forgiven"), 0),
+        forgivenNow: parseFiniteStored(this.hget(spec.key, "forgiven"), 0),
+        forgivenAtClaim: parseFiniteStored(mark.get("forgiven"), 0),
         fillsNow: state.fills,
         fillsAtClaim: parseFiniteStored(mark.get("fills"), 0),
         generationNow: parseFiniteStored(this.hget(spec.key, "generation"), 0),
@@ -1802,7 +1810,7 @@ class MemoryBackend implements DianemoBackend {
       this.live(completionKey)?.set?.has(completionId) === true;
     if (completionId && !alreadySeen) {
       this.setOf(completionKey).add(completionId);
-      this.expire(completionKey, 86400);
+      this.expire(completionKey, FREEZE_PROBE_TTL_SECONDS);
     }
 
     const raw = this.hget(key, "frozenUntil");
@@ -1821,10 +1829,8 @@ class MemoryBackend implements DianemoBackend {
       this.store.delete(key);
       return null;
     }
-    if (!success) {
-      this.expire(key, freezeTtlSeconds(frozenUntil, thawRequestCount, now));
-      return { frozenUntil, thawRequestCount };
-    }
+    // No re-arm: a failed probe arms a freeze of its own, which sizes the key.
+    if (!success) return { frozenUntil, thawRequestCount };
 
     const newCount = Math.max(0, thawRequestCount - 1);
     // A window re-armed while this probe was in flight still stands.
@@ -1878,12 +1884,14 @@ class MemoryBackend implements DianemoBackend {
 
   /**
    * Whether the entry at `metadataKey` is an in-progress probe that a claim for
-   * `grantId` must yield to — any grant's, under `anyGrant`.
+   * `grantId` must yield to — any grant's, under `anyGrant`. A nomination made
+   * under a claim whose lease has lapsed is not one: nobody is admitting it.
    */
   private isCompetingProbe(
     metadataKey: string,
     grantId: string,
-    anyGrant: boolean
+    anyGrant: boolean,
+    now: number
   ): boolean {
     // Normalised as the Lua twin's `fields[2] or ''` does: a client-level probe
     // carries no `grantId` field, so an absent one has to match its own kind.
@@ -1891,7 +1899,8 @@ class MemoryBackend implements DianemoBackend {
     return (
       this.hget(metadataKey, "status") === "inProgress" &&
       (anyGrant || otherGrantId === grantId) &&
-      this.hget(metadataKey, "isThawRequest") === "true"
+      this.hget(metadataKey, "isThawRequest") === "true" &&
+      !claimLapsed(this.hget(metadataKey, "claimedAt"), now)
     );
   }
 
@@ -1901,9 +1910,12 @@ class MemoryBackend implements DianemoBackend {
     grantId: string,
     options: { anyGrant?: boolean } = {}
   ): Promise<boolean> {
+    const now = Date.now();
     for (const requestId of this.sorted(queueKey)) {
       const metadataKey = `${metadataKeyPrefix}:${requestId}`;
-      if (this.isCompetingProbe(metadataKey, grantId, !!options.anyGrant)) {
+      if (
+        this.isCompetingProbe(metadataKey, grantId, !!options.anyGrant, now)
+      ) {
         return true;
       }
     }
@@ -1927,10 +1939,13 @@ class MemoryBackend implements DianemoBackend {
       this.expire(frozenGrantsKey, 86400);
     }
 
+    const now = Date.now();
     for (const otherId of this.sorted(queueKey)) {
       if (otherId === requestId) continue;
       const metadataKey = `${metadataKeyPrefix}:${otherId}`;
-      if (this.isCompetingProbe(metadataKey, grantId, !!options.anyGrant)) {
+      if (
+        this.isCompetingProbe(metadataKey, grantId, !!options.anyGrant, now)
+      ) {
         return "exists";
       }
     }

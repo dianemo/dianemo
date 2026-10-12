@@ -1,4 +1,4 @@
-import { REDIS_MAX_TTL_SECONDS } from "@dianemo/core";
+import { QUEUE_CLAIM_LEASE_MS, REDIS_MAX_TTL_SECONDS } from "@dianemo/core";
 
 /**
  * Lua blocks that more than one script needs to agree on, character for
@@ -37,6 +37,22 @@ export const redisNow = (prefix = "  "): string =>
   indent(
     `local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)`,
+    prefix
+  );
+
+/**
+ * Declares `claimLapsed(claimedAt)`, whether a queue entry's claim stamp names a
+ * lease that has lapsed — the memory backend's `claimLapsed`. An absent or empty
+ * stamp is `nil` and `'nan'` is NaN, so neither ever lapses.
+ *
+ * Requires `now`. Declares `claimLapsed`.
+ */
+export const claimLapsedFn = (prefix = "  "): string =>
+  indent(
+    `local function claimLapsed(claimedAt)
+  local stamp = tonumber(claimedAt)
+  return stamp ~= nil and now - stamp >= ${QUEUE_CLAIM_LEASE_MS}
+end`,
     prefix
   );
 
@@ -277,10 +293,10 @@ export const writeMarkFn = (prefix = "  "): string =>
     `local function writeMark(markKey, ttl, claimed, overflow, fills, bucketKey)
   local clock = redis.call('TIME')
   redis.call('HSETNX', bucketKey, 'epoch', clock[1] .. '.' .. clock[2])
-  local bucket = redis.call('HMGET', bucketKey, 'generation', 'epoch')
+  local bucket = redis.call('HMGET', bucketKey, 'generation', 'epoch', 'forgiven')
   local generation = finiteNumber(bucket[1], 0)
   redis.call('HSET', markKey, 'claimed', claimed, 'overflow', overflow, 'fills', fills,
-    'generation', generation, 'epoch', bucket[2] or '')
+    'generation', generation, 'epoch', bucket[2] or '', 'forgiven', finiteNumber(bucket[3], 0))
   redis.call('EXPIRE', markKey, ttl)
 end`,
     prefix

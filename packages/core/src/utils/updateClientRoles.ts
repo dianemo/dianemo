@@ -76,16 +76,36 @@ async function getInstances(this: RequestHandler) {
   for (const instance of otherInstances) {
     // Skipped rather than thrown: one unreadable registration would otherwise
     // fail every election on every replica until it expires.
+    let parsed: unknown;
+    let error: unknown;
     try {
-      instances.push(JSON.parse(instance.data));
-    } catch (error) {
-      this.logger.warn(
-        { error },
-        `Ignoring an unreadable registration for instance ${instance.id} in role election`
-      );
+      parsed = JSON.parse(instance.data);
+    } catch (parseError) {
+      error = parseError;
     }
+    if (isElectableRegistration(parsed)) {
+      instances.push(parsed);
+      continue;
+    }
+    this.logger.warn(
+      { error },
+      `Ignoring an unreadable registration for instance ${instance.id} in role election`
+    );
   }
   return instances;
+}
+
+/** The fields `getClientsBefore` reads, which a peer's JSON may lack. */
+function isElectableRegistration(
+  value: unknown
+): value is RequestHandlerMetadata {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<RequestHandlerMetadata>;
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.priority === "number" &&
+    Array.isArray(candidate.registeredClients)
+  );
 }
 
 /** Publishes this instance's client list so peers can elect against it. */

@@ -265,7 +265,7 @@ export default class RequestHandler {
   protected startupHooks: StartupHook[] = [];
   /** Whether the current start has passed its loop over `startupHooks`. */
   private startupHooksRan = false;
-  /** Set when `stop()` finishes; only an explicit `start()` clears it. */
+  /** Set whenever `stop()` resolves, in any state; only `start()` clears it. */
   private stoppedByCaller = false;
   protected startPromise: Promise<void> | null = null;
   protected stopPromise: Promise<void> | null = null;
@@ -519,17 +519,17 @@ export default class RequestHandler {
    * ends `stopped`, even when deregistration fails, though that error still
    * rejects this. Requests and template mutations are then refused with
    * `ClientUnavailableError` `handler_stopped` rather than restarting the
-   * handler; call `start()` to bring it back.
+   * handler — also after a stop before the first start, or during a start
+   * that fails; call `start()` to bring it back.
    */
   public async stop(): Promise<void> {
-    if (
-      this.status !== "started" &&
-      this.status !== "starting" &&
-      !this.stopPromise
-    )
-      return;
     if (this.stopPromise) return this.stopPromise;
+    if (this.status !== "started" && this.status !== "starting") {
+      this.stoppedByCaller = true;
+      return;
+    }
     this.stopPromise = this.finishStartupThenStop().finally(() => {
+      this.stoppedByCaller = true;
       this.stopPromise = null;
     });
     return this.stopPromise;
@@ -722,7 +722,6 @@ export default class RequestHandler {
       this.heartbeatInterval = undefined;
       this.startPromise = null;
       this.status = "stopped";
-      this.stoppedByCaller = true;
     }
     this.logger.warn(`Stopped request handler instance with ID ${this.id}`);
   }

@@ -385,9 +385,9 @@ async function handleRefreshMethod(
   // construction, and the call sits outside the request path's error handling.
   let res;
   try {
-    // Bounded by the lock's TTL even with no client-wide timeout: past it a
-    // peer refreshes anyway, and a token endpoint that never answers would
-    // otherwise hold every request coalesced onto this refresh for ever.
+    // Capped at the lock's TTL even when the client-wide timeout is longer or
+    // unset: past it a peer refreshes anyway, and a token endpoint that never
+    // answers would otherwise hold every request coalesced onto this refresh.
     res = await this.http({
       ...config,
       timeout: refreshTimeout(this.http.defaults.timeout),

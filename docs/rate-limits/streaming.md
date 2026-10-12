@@ -38,10 +38,11 @@ backpressure, so the vendor's stream is read only as fast as the caller reads.
 
 The end is the first of:
 
-- the upstream finishing and every chunk having passed through to the
-  caller's stream, reported as `"completed"`. With backpressure that is when
-  the caller has read all but the last buffer's worth, not when the vendor
-  closed the connection;
+- the upstream finishing and every chunk having passed into the caller's
+  stream, reported as `"completed"`. That stream buffers up to about 128 KiB,
+  so with backpressure this is when the caller has read all but the last
+  128 KiB, not when the vendor closed the connection, and a body that fits
+  completes even if the caller never reads it;
 - the caller destroying the stream, or the request's `signal` aborting,
   reported as `"closed"`. An abort destroys the caller's stream with
   `RequestAbortedError`;
@@ -134,24 +135,30 @@ that happens inside the stream retries it. An error reported inside the stream
 freezes the client for the rest of the fleet; without an observer, dianemo
 cannot see one and records a success.
 
-A request that fails at its headers is not handed a relay: the axios error
-carries the vendor's error body as the unread stream in
-`error.response.data`. Read it or destroy it, since until then it holds its
-connection open. A retried attempt's body is destroyed for you.
+A request that fails at its headers is handed no response: the axios error
+carries the vendor's error body, unread, as a stream in `error.response.data`.
+That stream relays the body without reaching the connection or the request
+behind it, whose headers carried the credentials. Read it or destroy it, since
+until then it holds its connection open. A body the caller is not handed, such
+as a retried attempt's, is destroyed for you.
 
 ## Keeping a long stream alive
 
 A large generation streams for half an hour or more, far past
 `concurrencySlotTtl`. While a stream is open its replica refreshes the
-request's slots every third of `concurrencySlotTtl`, or of `settleWindow` if
-that is shorter, and its claim marks with them, so the reaper never takes a
-slot that is still in use and a mark never lapses before the stream settles. A
-crashed replica stops refreshing, so crash recovery is as quick as it has always
-been, and `concurrencySlotTtl` no longer has to exceed the longest generation.
+request's slots and claim marks every third of the shortest-lived of them, so
+the reaper never takes a slot that is still in use and a mark never lapses
+before the stream settles. A slot lives `concurrencySlotTtl`. A request that
+settles leaves a claim mark on each token bucket, living `settleWindow` or the
+bucket's refill from empty, whichever is longer, rounded up to whole seconds.
+The refresh never runs more often than every 250 ms, so a `concurrencySlotTtl`
+under 750 ms can lose its slot between refreshes. A crashed replica stops
+refreshing, so crash recovery is as quick as it has always been, and
+`concurrencySlotTtl` no longer has to exceed the longest generation.
 
 A slot can still be lost — reaped after a long pause in the process, say. The
-stream then carries on outside `maxConcurrency`, and a warning names the
-request.
+stream then carries on outside `maxConcurrency`, and a warning, once per
+stream, names the request.
 
 `requestOptions.streamTimeout`, default 60 minutes, closes a stream still open
 after that long and releases its slot, so a stream the caller forgot cannot hold

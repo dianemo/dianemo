@@ -5,6 +5,7 @@ import type { Logger } from "../../packages/core/src/logger.js";
 import { createServer, type Server } from "node:http";
 import { type AxiosError, isAxiosError } from "axios";
 import type { Readable } from "node:stream";
+import { inspect } from "node:util";
 import type {
   DianemoResponse,
   StreamObserver,
@@ -134,7 +135,6 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** The parts of a client these tests reach into. */
 interface ClientInternals {
   logger: Logger;
-  streamKeepAliveMs(): number;
 }
 
 function clientOf(handler: RequestHandler, name: string): ClientInternals {
@@ -234,11 +234,24 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
       });
     }, 30_000);
 
+    it("completes an unread body that fits the relay's buffers", async () => {
+      await run({ rateLimit: [slot] }, async (handler) => {
+        // ~96 KB: past one default 64 KiB buffer, within the relay's 128 KiB.
+        const res = await stream(handler, "id=a&chunks=96&gap=1&pad=1000");
+        const reason = await Promise.race([
+          res.dianemo!.finished,
+          sleep(2_000).then(() => "still open"),
+        ]);
+        res.data.destroy();
+        expect(reason).toBe("completed");
+      });
+    }, 30_000);
+
     it("is kept alive past concurrencySlotTtl while the stream runs", async () => {
       await run(
-        { rateLimit: [slot], requestOptions: { concurrencySlotTtl: 300 } },
+        { rateLimit: [slot], requestOptions: { concurrencySlotTtl: 750 } },
         async (handler) => {
-          const res = await stream(handler, "id=a&chunks=10&gap=100");
+          const res = await stream(handler, "id=a&chunks=25&gap=100");
           const next = plain(handler, "b");
           await readAll(res.data);
           await next;
@@ -250,10 +263,52 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
     }, 30_000);
 
     it("refreshes its claim marks more often than a short settleWindow lets them live", async () => {
+      // Refills from empty in 500 ms, so with a 600 ms settleWindow its marks
+      // live the whole-second minimum.
+      const bucket = { ...otpm, interval: 500 };
       await run(
-        { rateLimit: [slot, otpm], requestOptions: { settleWindow: 600 } },
-        async (handler) => {
-          expect(clientOf(handler, CLIENT).streamKeepAliveMs()).toBe(200);
+        { rateLimit: [slot, bucket], requestOptions: { settleWindow: 600 } },
+        async (handler, backend) => {
+          const touches: { at: number; ttlSeconds: number }[] = [];
+          const touch = backend.touchClaimMark!.bind(backend);
+          backend.touchClaimMark = async (key, markId, ttlSeconds) => {
+            touches.push({ at: Date.now(), ttlSeconds });
+            return touch(key, markId, ttlSeconds);
+          };
+          const sent = Date.now();
+          const res = await stream(handler, "id=a&chunks=12&gap=100", {
+            cost: { slots: 1, otpm: 10 },
+            settle: () => ({ slots: 1, otpm: 10 }),
+          });
+          await readAll(res.data);
+          await res.dianemo!.finished;
+          expect(touches.length).toBeGreaterThanOrEqual(2);
+          const times = [sent, ...touches.map((touch) => touch.at)];
+          const gaps = times.slice(1).map((at, i) => at - times[i]);
+          expect(Math.max(...gaps)).toBeLessThan(1_000);
+          expect(touches.every((touch) => touch.ttlSeconds === 1)).toBe(true);
+        }
+      );
+    }, 30_000);
+
+    it("does not refresh the backend more often than a claim mark's whole-second TTL needs", async () => {
+      await run(
+        { rateLimit: [slot, otpm], requestOptions: { settleWindow: 1 } },
+        async (handler, backend) => {
+          let touches = 0;
+          const touch = backend.touchConcurrency!.bind(backend);
+          backend.touchConcurrency = async (...args) => {
+            touches++;
+            return touch(...args);
+          };
+          const res = await stream(handler, "id=a&chunks=5&gap=100", {
+            cost: { slots: 1, otpm: 10 },
+            settle: () => ({ slots: 1, otpm: 10 }),
+          });
+          await readAll(res.data);
+          await res.dianemo!.finished;
+          // An hour's mark and the default two-minute slot need nothing in 0.5 s.
+          expect(touches).toBeLessThan(10);
         }
       );
     }, 30_000);
@@ -269,6 +324,23 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
           expect(
             warnings.some((line) => /no longer holds its slot/.test(line))
           ).toBe(true);
+        }
+      );
+    }, 30_000);
+
+    it("warns once, not on every keep-alive tick, when the slot is gone", async () => {
+      await run(
+        { rateLimit: [slot], requestOptions: { concurrencySlotTtl: 150 } },
+        async (handler, backend) => {
+          const warnings = captureWarnings(clientOf(handler, CLIENT));
+          backend.touchConcurrency = async () => false;
+          const res = await stream(handler, "id=a&chunks=10&gap=100");
+          await readAll(res.data);
+          await res.dianemo!.finished;
+          const lost = warnings.filter((line) =>
+            /no longer holds its slot/.test(line)
+          );
+          expect(lost.length).toBe(1);
         }
       );
     }, 30_000);
@@ -333,7 +405,7 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
       await run({ rateLimit: [otpm] }, async (handler, backend) => {
         const res = await stream(
           handler,
-          "id=a&chunks=120&gap=1&pad=1000&out=400",
+          "id=a&chunks=200&gap=1&pad=1000&out=400",
           { cost: 100, settleStream: usageObserver }
         );
         await sleep(1_000);
@@ -420,6 +492,18 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
         const body = (error as AxiosError<Readable>).response?.data;
         expect(typeof body?.pipe).toBe("function");
         body?.destroy();
+      });
+    }, 30_000);
+
+    it("keeps the request's credentials out of a thrown streamed error body", async () => {
+      await run({ rateLimit: [slot] }, async (handler) => {
+        upstream.respond(400);
+        const error = await stream(handler, "id=a&holdError", {
+          headers: { Authorization: "Bearer s3cr3t-value-that-must-not-leak" },
+        }).catch((caught: unknown) => caught);
+        const dump = inspect(error, { depth: null });
+        (error as AxiosError<Readable>).response?.data?.destroy();
+        expect(dump).not.toContain("s3cr3t-value");
       });
     }, 30_000);
   });

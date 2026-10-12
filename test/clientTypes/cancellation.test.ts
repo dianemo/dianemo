@@ -2,14 +2,16 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import RequestHandler from "../../packages/core/src/index.js";
 import { type Harness, harnesses } from "./harness.js";
 import { createServer, type Server } from "node:http";
+import { getEventListeners } from "node:events";
 import {
   ClientUnavailableError,
   RequestAbortedError,
 } from "../../packages/core/src/errors.js";
 
 /**
- * A request that is waiting — out a retry's back-off, or on a token refresh —
- * still answers to its signal and to shutdown, and gives back what it held.
+ * A request that is waiting — out a retry's back-off, on a token refresh, or
+ * on a requestInterceptor — still answers to its signal and to shutdown, and
+ * gives back what it held.
  */
 
 /**
@@ -174,6 +176,32 @@ describe.each(harnesses(9))("cancellation — $name", (harness) => {
         expect(upstream.arrivals("backoff-stop")).toBe(1);
       });
     }, 30_000);
+
+    it("leaves no abort listener on the signal after retries that sleep out their back-off", async () => {
+      await withClient(
+        {
+          retryOptions: {
+            maxRetries: 3,
+            retryBackoffBaseTime: 50,
+            retryBackoffMethod: "linear",
+          },
+        },
+        async (handler) => {
+          upstream.respond(503, 503, 503);
+          const controller = new AbortController();
+          const started = Date.now();
+          const res = await send(
+            handler,
+            "backoff-listeners",
+            controller.signal
+          );
+          expect(res).toMatchObject({ status: 200 });
+          expect(upstream.arrivals("backoff-listeners")).toBe(4);
+          expect(Date.now() - started).toBeGreaterThanOrEqual(250);
+          expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+        }
+      );
+    }, 30_000);
   });
 
   describe("an OAuth2 token refresh", () => {
@@ -234,6 +262,56 @@ describe.each(harnesses(9))("cancellation — $name", (harness) => {
         expect(upstream.arrivals("refresh-timeout")).toBe(0);
         upstream.setTokenDelay(0);
       });
+    }, 30_000);
+
+    it("sends nothing upstream after stop() returns when a token refresh outlives the drain", async () => {
+      upstream.setTokenDelay(1_000);
+      try {
+        await withClient(oauth(), async (handler) => {
+          const pending = send(handler, "refresh-outlives-stop");
+          await sleep(100);
+          handler.setDrainTimeout(100);
+          await handler.stop();
+          expect(upstream.arrivals("refresh-outlives-stop")).toBe(0);
+          const error = await pending;
+          expect((error as ClientUnavailableError).code).toBe(
+            "handler_stopped"
+          );
+          await sleep(200);
+          expect(upstream.arrivals("refresh-outlives-stop")).toBe(0);
+        });
+      } finally {
+        upstream.setTokenDelay(0);
+      }
+    }, 30_000);
+  });
+
+  describe("a requestInterceptor", () => {
+    it("sends nothing upstream after stop() returns when the requestInterceptor outlives the drain", async () => {
+      await withClient(
+        {
+          requestOptions: {
+            defaults: { baseURL: upstream.baseURL },
+            requestInterceptor: async (config: unknown) => {
+              await sleep(1_000);
+              return config;
+            },
+          },
+        },
+        async (handler) => {
+          const pending = send(handler, "interceptor-outlives-stop");
+          await sleep(100);
+          handler.setDrainTimeout(100);
+          await handler.stop();
+          expect(upstream.arrivals("interceptor-outlives-stop")).toBe(0);
+          const error = await pending;
+          expect((error as ClientUnavailableError).code).toBe(
+            "handler_stopped"
+          );
+          await sleep(200);
+          expect(upstream.arrivals("interceptor-outlives-stop")).toBe(0);
+        }
+      );
     }, 30_000);
   });
 });

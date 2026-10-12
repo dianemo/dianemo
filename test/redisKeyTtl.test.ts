@@ -175,7 +175,7 @@ describeIfRedis("redis key expiry", () => {
     );
   });
 
-  it("re-arms a freeze key's expiry each time a thaw probe completes", async () => {
+  it("re-arms a freeze key's expiry each time a thaw probe succeeds", async () => {
     const now = await backend.now();
     await backend.armFreeze("kt:freeze", now + 1_000, 3);
 
@@ -184,10 +184,23 @@ describeIfRedis("redis key expiry", () => {
     expect(await redis.ttl("kt:freeze")).toBeGreaterThanOrEqual(
       FREEZE_PROBE_TTL_SECONDS - 5
     );
+  });
+
+  it("leaves a freeze key's expiry to the freeze a failed probe arms", async () => {
+    const now = await backend.now();
+    await backend.armFreeze("kt:freeze", now + 1_000, 3);
 
     await redis.expire("kt:freeze", 30);
     await backend.updateThawProgress("kt:freeze", false);
-    expect(await redis.ttl("kt:freeze")).toBeGreaterThanOrEqual(
+    expect(await redis.ttl("kt:freeze")).toBeLessThanOrEqual(30);
+  });
+
+  it("remembers a probe completion for as long as the freeze it counts against", async () => {
+    const now = await backend.now();
+    await backend.armFreeze("kt:freeze", now + 1_000, 3);
+
+    await backend.updateThawProgress("kt:freeze", true, "c1");
+    expect(await redis.ttl("kt:freeze:thawCompletions")).toBeGreaterThanOrEqual(
       FREEZE_PROBE_TTL_SECONDS - 5
     );
   });

@@ -658,7 +658,7 @@ describe("memory backend: a freeze still owed probes", () => {
     await backend.close();
   });
 
-  it("re-arms a lapsed freeze's lifetime each time a thaw probe completes", async () => {
+  it("re-arms a lapsed freeze's lifetime each time a thaw probe succeeds", async () => {
     const backend = memoryBackend();
     const frozenUntil = Date.now() + 1_000;
     await backend.armFreeze("fp:freeze", frozenUntil, 3);
@@ -666,8 +666,36 @@ describe("memory backend: a freeze still owed probes", () => {
     vi.setSystemTime(Date.now() + 6 * DAY_MS);
     await backend.updateThawProgress("fp:freeze", true);
     vi.setSystemTime(Date.now() + 6 * DAY_MS);
-    await backend.updateThawProgress("fp:freeze", false);
+    await backend.updateThawProgress("fp:freeze", true);
     vi.setSystemTime(Date.now() + 6 * DAY_MS);
+
+    expect(await backend.getFreezeState("fp:freeze")).toEqual({
+      frozenUntil,
+      thawRequestCount: 1,
+    });
+    await backend.close();
+  });
+
+  it("leaves a lapsed freeze's lifetime to the freeze a failed probe arms", async () => {
+    const backend = memoryBackend();
+    await backend.armFreeze("fp:freeze", Date.now() + 1_000, 3);
+
+    vi.setSystemTime(Date.now() + 6 * DAY_MS);
+    await backend.updateThawProgress("fp:freeze", false);
+    vi.setSystemTime(Date.now() + DAY_MS + 2_000);
+
+    expect(await backend.getFreezeState("fp:freeze")).toBeNull();
+    await backend.close();
+  });
+
+  it("remembers a probe completion for as long as the freeze it counts against", async () => {
+    const backend = memoryBackend();
+    const frozenUntil = Date.now() - 1;
+    await backend.armFreeze("fp:freeze", frozenUntil, 3);
+    await backend.updateThawProgress("fp:freeze", true, "c1");
+
+    vi.setSystemTime(Date.now() + 6 * DAY_MS);
+    await backend.updateThawProgress("fp:freeze", true, "c1");
 
     expect(await backend.getFreezeState("fp:freeze")).toEqual({
       frozenUntil,

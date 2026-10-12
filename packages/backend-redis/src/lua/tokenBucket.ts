@@ -1,3 +1,4 @@
+import { BALANCE_TOLERANCE } from "@dianemo/core";
 import {
   bucketTtlFn,
   exactFn,
@@ -73,7 +74,8 @@ ${bucketTtlFn()}
 
 ${lazyRefill()}
 
-  if tokens >= cost then
+  -- Twin of coversCost in the core package's backend/balance.ts.
+  if tokens >= cost - maxTokens * ${BALANCE_TOLERANCE} then
     tokens = tokens - cost
     redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
     redis.call('EXPIRE', key, ttl)
@@ -200,7 +202,7 @@ ${freezeGate()}
 
 ${lazyRefill()}
 
-  if tokens < cost then
+  if not (tokens >= cost - maxTokens * ${BALANCE_TOLERANCE}) then
     redis.call('HSET', bucketKey, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
     redis.call('EXPIRE', bucketKey, ttl)
     return 0
@@ -262,6 +264,8 @@ ${finiteNumberFn()}
 
 ${bucketTtlFn()}
 
+${exactFn()}
+
   local results = {}
   for i, entry in ipairs(entries) do
     local key = KEYS[entry.k]
@@ -271,9 +275,9 @@ ${bucketTtlFn()}
     local tokensToAdd = tonumber(entry.tokensToAdd)
     local interval = tonumber(entry.interval)
     local maxDebt = tonumber(entry.maxDebt)
-    local result = { settled = false, applied = 0, unapplied = 0 }
+    local result = { settled = false, applied = exact(0), unapplied = exact(0) }
 
-    local mark = redis.call('HMGET', markKey, 'claimed', 'overflow', 'fills', 'generation')
+    local mark = redis.call('HMGET', markKey, 'claimed', 'overflow', 'fills', 'generation', 'epoch')
     -- Checked before the mark is consumed, so a settlement this script cannot
     -- act on leaves it for one that can.
     local usable = mark[1] ~= false
@@ -294,19 +298,28 @@ ${bucketTtlFn()}
 
 ${lazyRefill("        ")}
 
-        local generation = finiteNumber(redis.call('HGET', key, 'generation'), 0)
+        local bucket = redis.call('HMGET', key, 'generation', 'epoch', 'forgiven')
+        local generation = finiteNumber(bucket[1], 0)
+        local epoch = bucket[2] or ''
+        local forgiven = finiteNumber(bucket[3], 0)
         local claimed = finiteNumber(mark[1], 0)
         local overflowAtClaim = finiteNumber(mark[2], 0)
         local fillsAtClaim = finiteNumber(mark[3], 0)
         local generationAtClaim = finiteNumber(mark[4], 0)
+        local epochAtClaim = mark[5] or ''
 
         local applied = 0
         local unapplied = 0
-        if generation == generationAtClaim and overflow >= overflowAtClaim and fills >= fillsAtClaim then
+        if epoch == epochAtClaim and generation == generationAtClaim
+          and overflow >= overflowAtClaim and fills >= fillsAtClaim then
           local delta = actual - claimed
           if delta > 0 then
-            local owed = delta - (overflow - overflowAtClaim)
-            if owed < 0 then owed = 0 end
+            local from = math.max(overflowAtClaim, forgiven)
+            local slack = overflow - from
+            if slack < 0 then slack = 0 end
+            local used = math.min(delta, slack)
+            local owed = delta - used
+            if used > 0 then forgiven = from + used end
             local debt = 0
             if maxDebt ~= nil and maxDebt == maxDebt and maxDebt ~= math.huge and maxDebt > 0 then
               debt = maxDebt
@@ -323,10 +336,11 @@ ${lazyRefill("        ")}
         end
 
         tokens = tokens - applied
-        redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
+        redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills,
+          'forgiven', forgiven)
         redis.call('EXPIRE', key, bucketTtl(baseTtl, maxTokens, tokensToAdd, interval))
-        result.applied = applied
-        result.unapplied = unapplied
+        result.applied = exact(applied)
+        result.unapplied = exact(unapplied)
       end
     end
     results[i] = result

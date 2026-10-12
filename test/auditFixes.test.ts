@@ -146,6 +146,15 @@ describe("redaction", () => {
     );
   });
 
+  it("hides the whole password when it contains an unencoded @", () => {
+    // WHATWG URL parsing takes the last "@" before the path as the userinfo
+    // delimiter, so the password sent here is "p@ssw0rd".
+    const redacted = redactUrl("https://user:p@ssw0rd@host.example/x") ?? "";
+    expect(redacted).not.toContain("ssw0rd");
+    expect(redacted).toContain("@host.example/x");
+    expect(redactUrl("https://tok@en@host.example/x")).not.toContain("en@");
+  });
+
   it("redacts a consumer's own credential header when told about it", () => {
     const headers = redactHeaders(
       { "X-Subscription-Key": "VENDOR_KEY", Accept: "application/json" },

@@ -109,6 +109,7 @@ export {
   QUEUE_RETRY_BAND,
   QUEUE_SCORE_EPOCH_MS,
 } from "./backend/queueScore.js";
+export { QUEUE_CLAIM_LEASE_MS } from "./backend/queueClaim.js";
 export {
   formatStoredCost,
   parseFiniteStored,
@@ -117,12 +118,15 @@ export {
   parseStoredNumber,
 } from "./backend/parseStored.js";
 export {
+  FREEZE_PROBE_TTL_SECONDS,
+  normalizeStateTtlSeconds,
   normalizeTombstoneTtl,
   normalizeTtlSeconds,
   REDIS_MAX_TTL_SECONDS,
   REQUEST_TOMBSTONE_TTL_SECONDS,
 } from "./backend/ttl.js";
 export { claimMarkKey } from "./backend/settlement.js";
+export { BALANCE_TOLERANCE } from "./backend/balance.js";
 export type {
   AcquireConcurrencyResult,
   AcquireMultiLimitResult,
@@ -212,7 +216,8 @@ const STREAM_CLOSE_TIMEOUT_MS = 5_000;
  * in the fleet that shares their budgets through `backend`.
  *
  * Construct one per process. It starts itself on the first request or
- * template mutation, and stops on SIGTERM, SIGINT or SIGHUP.
+ * template mutation, and stops on SIGTERM, SIGINT or SIGHUP. Once stopped it
+ * stays stopped: work is refused until `start()` is called again.
  *
  * ```ts
  * import RequestHandler, { memoryBackend } from "@dianemo/core";
@@ -260,6 +265,8 @@ export default class RequestHandler {
   protected startupHooks: StartupHook[] = [];
   /** Whether the current start has passed its loop over `startupHooks`. */
   private startupHooksRan = false;
+  /** Set when `stop()` finishes; only an explicit `start()` clears it. */
+  private stoppedByCaller = false;
   protected startPromise: Promise<void> | null = null;
   protected stopPromise: Promise<void> | null = null;
   protected shutdownHooksRegistered = false;
@@ -417,6 +424,7 @@ export default class RequestHandler {
    */
   public async start(): Promise<void> {
     if (this.stopPromise) await this.stopPromise;
+    this.stoppedByCaller = false;
     if (this.status === "started") return;
     if (this.startPromise) return this.startPromise;
     this.startPromise = this.doStart().catch(async (err) => {
@@ -509,7 +517,9 @@ export default class RequestHandler {
    *
    * Idempotent; a stop during `start()` lets the start finish first. Always
    * ends `stopped`, even when deregistration fails, though that error still
-   * rejects this.
+   * rejects this. Requests and template mutations are then refused with
+   * `ClientUnavailableError` `handler_stopped` rather than restarting the
+   * handler; call `start()` to bring it back.
    */
   public async stop(): Promise<void> {
     if (
@@ -712,6 +722,7 @@ export default class RequestHandler {
       this.heartbeatInterval = undefined;
       this.startPromise = null;
       this.status = "stopped";
+      this.stoppedByCaller = true;
     }
     this.logger.warn(`Stopped request handler instance with ID ${this.id}`);
   }
@@ -803,16 +814,18 @@ export default class RequestHandler {
    * Sends one request through `config.clientName`'s budgets, waiting its turn
    * in the fleet-wide queue, and resolves with the axios response.
    *
-   * Starts the handler if it is not started. Retries 429s, 5xxs and network
+   * Starts the handler if it is not started, unless `stop()` stopped it.
+   * Retries 429s, 5xxs and network
    * failures (`ECONNRESET`, `ETIMEDOUT`, `ECONNABORTED`) per the client's
    * `retryOptions`, freezing the client fleet-wide on each. Rejects with:
    *
    * - `ClientUnavailableError` — `handler_stopping` during `stop()`,
-   *   `handler_stopped` if shutdown or the removal of its client failed it
-   *   while queued, and `shared_limit_parent_missing` for a `sharedLimit`
-   *   client whose owner is gone.
+   *   `handler_stopped` after it, or if shutdown or the removal of its client
+   *   failed it while queued or waiting to retry, and
+   *   `shared_limit_parent_missing` for a `sharedLimit` client whose owner is
+   *   gone.
    * - `ClientNotFoundError` when no client of that name appears within 5 s.
-   * - `ConfigurationError` — `invalid_request_cost`,
+   * - `ConfigurationError` — `invalid_request_name`, `invalid_request_cost`,
    *   `invalid_request_priority`, `invalid_grant_id` or
    *   `invalid_request_signal` for an unusable field.
    * - `RequestCostExceedsBudgetError` for a `cost` above the client's tightest
@@ -821,7 +834,8 @@ export default class RequestHandler {
    * - `RequestTimeoutError` when it is not admitted within the client's
    *   `requestOptions.cleanupTimeout` (default 60 s).
    * - `RequestAbortedError` when `config.signal` aborts before dispatch,
-   *   including after admission while the interceptor or a token refresh runs;
+   *   including during a retry's back-off and after admission while the
+   *   interceptor or a token refresh runs;
    *   what the request claimed is handed back. An abort once it is upstream
    *   reaches axios instead.
    * - From pre-request auth on an OAuth2 client:
@@ -843,6 +857,7 @@ export default class RequestHandler {
         "Request handler is stopping and cannot accept new requests."
       );
     }
+    this.assertNotStopped("accept new requests");
     if (this.status !== "started") await this.start();
     const client = await this.waitForClient(config.clientName);
     return (await client.handleRequest(config as never)) as DianemoResponse<
@@ -963,22 +978,29 @@ export default class RequestHandler {
    * Called after `start()`, it immediately builds any credentials already
    * stored, logging and skipping one whose stored settings cannot be built.
    *
-   * @throws {ConfigurationError} `invalid_template_name` for a name containing
-   * `:`, and the codes {@link ClientTemplateOptions} lists for unusable plans.
+   * @throws {ConfigurationError} `invalid_template_name` for an empty name or
+   * one containing `:` or whitespace, and the codes
+   * {@link ClientTemplateOptions} lists for unusable plans.
    */
   public async registerClientTemplate<K extends keyof ClientTemplates>(
     name: K,
     builder: ClientTemplateBuilder<ClientTemplates[K]>,
     options: ClientTemplateOptions = {}
   ): Promise<void> {
-    // Template names occupy parts[0] of clientName, which is `:`-delimited
-    // (`<template>:<orgId>:<alias>[:<sub>]`). A template containing `:`
-    // would shift every subsequent segment and break parseClientName, so
-    // reject loudly at registration time.
-    if ((name as string).includes(":")) {
+    // The same rules `assertNameSegment` applies to the other segments: a `:`
+    // shifts every later segment of the client name, and whitespace is
+    // normalized to `_` in backend keys, so "my tpl" and "my_tpl" would share
+    // one budget and one credential entry.
+    const templateName: unknown = name;
+    if (
+      typeof templateName !== "string" ||
+      templateName.length === 0 ||
+      templateName.includes(":") ||
+      /\s/.test(templateName)
+    ) {
       throw new ConfigurationError(
         "invalid_template_name",
-        `Template name "${String(name)}" must not contain ":"`
+        `Template name ${JSON.stringify(name)} must be a non-empty string with no ":" and no whitespace — it is the first segment of every client name it builds, and backend keys normalize whitespace to "_".`
       );
     }
     assertTemplateOptions(name as string, options);
@@ -1055,7 +1077,8 @@ export default class RequestHandler {
 
   /**
    * Adds a template client, encrypting its credentials into the backend so peers and
-   * restarts can rebuild it. Auto-starts the handler.
+   * restarts can rebuild it. Auto-starts the handler unless `stop()` stopped
+   * it.
    *
    * For credentials one writer distributes to many readers; use
    * {@link addLocalTemplateClient} for per-replica ones.
@@ -1083,7 +1106,8 @@ export default class RequestHandler {
    * codes `CreateClientData.rateLimit` lists, or the builder's own error. A
    * re-add refused this way leaves the instance's existing clients running on
    * what was stored before.
-   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
+   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`, and
+   * `handler_stopped` after it until `start()` is called.
    */
   public async addTemplateClient<K extends keyof ClientTemplates>(
     templateName: K,
@@ -1116,7 +1140,8 @@ export default class RequestHandler {
    * `organizationId` are validated the same way, with the same
    * `ConfigurationError` codes. An unregistered template is logged and skipped.
    *
-   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
+   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`, and
+   * `handler_stopped` after it until `start()` is called.
    */
   public async addLocalTemplateClient<K extends keyof ClientTemplates>(
     templateName: K,
@@ -1269,10 +1294,12 @@ export default class RequestHandler {
    * Removes a template instance everywhere: destroys its clients here, failing
    * their parked requests, deletes its stored credentials, settings and OAuth
    * tokens, and tells every replica to destroy theirs. Starts the handler if it
-   * is `"stopped"`; one already starting is not awaited, so this is safe from a
-   * startup hook. A no-op for an instance that does not exist.
+   * is `"stopped"` and `stop()` did not stop it; one already starting is not
+   * awaited, so this is safe from a startup hook. A no-op for an instance that
+   * does not exist.
    *
-   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
+   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`, and
+   * `handler_stopped` after it until `start()` is called.
    */
   public async removeTemplateClient<K extends keyof ClientTemplates>(
     templateName: K,
@@ -1308,6 +1335,20 @@ export default class RequestHandler {
         "Request handler is stopping and cannot mutate template clients."
       );
     }
+    this.assertNotStopped("mutate template clients");
+  }
+
+  /**
+   * Refuses work after `stop()`, which would otherwise auto-start the handler
+   * again — re-registering it with the fleet and re-arming the heartbeat that
+   * keeps the process alive.
+   */
+  private assertNotStopped(action: string): void {
+    if (!this.stoppedByCaller) return;
+    throw new ClientUnavailableError(
+      "handler_stopped",
+      `Request handler was stopped and cannot ${action} until start() is called again.`
+    );
   }
 
   protected getClient(clientName: string): BaseClient {

@@ -20,6 +20,7 @@ import type {
   StreamResult,
 } from "../../request/types.js";
 import {
+  isReadableStream,
   redactBody,
   redactConfig,
   redactHeaders,
@@ -27,6 +28,7 @@ import {
   sanitizeError,
 } from "../../utils/redact.js";
 import {
+  ClientUnavailableError,
   ConfigurationError,
   NoResponseError,
   RequestAbortedError,
@@ -94,12 +96,16 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
       // A streamed response hands its bookkeeping to the stream's end, which
       // outlives this function.
       let handedToStream = false;
+      let backoffMs = 0;
       try {
         do {
           request.setStatus("inQueue");
           // Everything in here runs after admission has already claimed a slot
           // or spent tokens, so a throw has to hand those back explicitly.
           try {
+            if (backoffMs > 0) {
+              await waitOutBackoff.bind(this)(request, backoffMs);
+            }
             await handlePreRequest.bind(this)(request);
             // The interceptor and a token refresh run after admission, and an
             // abort landing there would otherwise reach axios as its own
@@ -140,11 +146,7 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
             // loop re-enters admission immediately, so deferring to it sends the
             // request the vendor just rejected straight back out. The freeze is the
             // fleet-wide gate; this is the local one.
-            if (retryData.waitTime > 0) {
-              await new Promise((resolve) =>
-                setTimeout(resolve, retryData.waitTime)
-              );
-            }
+            backoffMs = retryData.waitTime;
             continue;
           }
           if (isStreamed(request, res)) {
@@ -254,6 +256,41 @@ async function publishAbandoned(
   }
 }
 
+/**
+ * Sleeps out a retry's back-off. Inside the loop's abandonment handling, so an
+ * abort or a shutdown here releases the queue entry the retry kept.
+ */
+async function waitOutBackoff(
+  this: BaseClient,
+  request: Request,
+  waitMs: number
+): Promise<void> {
+  const signal = request.config.signal;
+  if (signal?.aborted) throw new RequestAbortedError(request.id);
+  if (this.admissionHalted) throw admissionHaltedError(this);
+  await new Promise<void>((resolve, reject) => {
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      signal?.removeEventListener?.("abort", onAbort);
+      this.unregisterWaitingRequest(request.id);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onAbort = () => finish(new RequestAbortedError(request.id));
+    const timer = setTimeout(() => finish(), waitMs);
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+    // Shutdown and client removal cancel waiters through this registration.
+    this.registerWaitingRequest(request.id, finish);
+  });
+}
+
+function admissionHaltedError(client: BaseClient): ClientUnavailableError {
+  return new ClientUnavailableError(
+    "handler_stopped",
+    `Request handler stopped before client ${client.getName()} could admit this request.`
+  );
+}
+
 async function handlePreRequest(this: BaseClient, request: Request) {
   await waitForRequestReady.bind(this)(request);
   if (this.requestOptions.requestInterceptor) {
@@ -325,6 +362,9 @@ async function waitForRequestReady(this: BaseClient, request: Request) {
   if (signal?.aborted) {
     throw new RequestAbortedError(request.id);
   }
+  // A retry re-enters here, and the fast path would otherwise send it upstream
+  // after shutdown has stopped the drain loop admitting anything.
+  if (this.admissionHalted) throw admissionHaltedError(this);
 
   // With nothing contending the queue has no ordering to do, so the enqueue, the
   // admission pass, both broadcasts and the removal are avoidable. Atomic, so it
@@ -607,17 +647,8 @@ const DEFAULT_STREAM_TIMEOUT_MS = 3_600_000;
  */
 const SETTLE_GRACE_MS = 5_000;
 
-function isReadable(value: unknown): value is Readable {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as Readable).pipe === "function" &&
-    typeof (value as Readable).destroy === "function"
-  );
-}
-
 function isStreamed(request: Request, res: AxiosResponse): boolean {
-  return request.config.responseType === "stream" && isReadable(res.data);
+  return request.config.responseType === "stream" && isReadableStream(res.data);
 }
 
 /**
@@ -734,7 +765,10 @@ async function handleStreamedResponse(
       });
   };
 
-  source.once("end", () => end("completed"));
+  // The relay's `finish`, not the source's `end`: a slow reader leaves the
+  // last chunks buffered in the relay, unseen by the observer, after the
+  // source ends.
+  relay.once("finish", () => end("completed"));
   source.once("error", onSourceError);
   relay.once("close", () => end("closed"));
   source.off("error", onEarlyError);
@@ -935,7 +969,7 @@ async function handleError(
     // Nobody will read a streamed error body that is being retried, and an
     // unread one holds its socket open.
     const body = res.response?.data;
-    if (isReadable(body)) body.destroy();
+    if (isReadableStream(body)) body.destroy();
     return retryData;
   }
 
@@ -1084,7 +1118,7 @@ function handleBackoff(
     floorMs,
     multiplier * this.getFreezeBaseTime(data.isRateLimited)
   );
-  data.message += ` | Will retry...`;
+  if (data.retry) data.message += ` | Will retry...`;
   return data;
 }
 

@@ -9,6 +9,12 @@ import type { Redis } from "ioredis";
  */
 export interface Ctx {
   readonly redis: Redis;
+  /**
+   * The connection's ioredis `keyPrefix`, or `""`. ioredis prepends it to
+   * `KEYS` and to the keys of plain commands, but not to `ARGV` or to pub/sub
+   * channel names, so a key prefix travelling in `ARGV` must carry it already.
+   */
+  readonly keyPrefix: string;
   /** Invokes a registered Lua script by its custom-command name. */
   run(name: ScriptName, ...args: unknown[]): Promise<unknown>;
   /**
@@ -49,6 +55,7 @@ export function createContext(redis: Redis): Ctx {
 
   return {
     redis,
+    keyPrefix: redis.options.keyPrefix ?? "",
 
     run(name, ...args) {
       // ioredis attaches the command to the connection, but its generated

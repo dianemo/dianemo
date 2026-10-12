@@ -61,6 +61,26 @@ pub/sub duplicate, and `close()` quits it — so sharing one backend between two
 handlers means either handler's `stop()` leaves the other receiving no
 coordination messages at all. Give each handler its own `redisBackend()`.
 
+## An ioredis `keyPrefix`
+
+A connection built with ioredis's own `keyPrefix` option is supported, and it
+isolates fleets: two fleets on one Redis whose connections differ only in that
+prefix share no keys and receive none of each other's pub/sub messages.
+
+ioredis prepends the prefix to keys it can see as keys, but not to script
+arguments or channel names. The backend reads the connection's
+`options.keyPrefix` and applies it to those itself, on the pub/sub duplicate as
+well. Handlers still receive the channel name without the prefix.
+
+It stacks with the handler's own `keyPrefix` option rather than replacing it.
+The handler's prefix goes inside the key names
+[listed under Clearing a freeze by hand](../concepts.md#clearing-a-freeze-by-hand),
+and the connection's goes in front of those, so with both set a freeze key is
+stored as `<ioredis keyPrefix><keyPrefix>:requestHandler:<clientName>:freezeState`.
+Either one keeps two fleets apart. The backend's methods take keys without the
+connection's prefix, so pass the handler-level form to `clearFreezeState` and
+the other manual calls.
+
 ## How atomicity is achieved
 
 Every operation that spends from a shared budget has to be atomic against every

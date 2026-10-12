@@ -54,6 +54,7 @@ describe("audit round 3 regressions", () => {
       exec: async () => [[failure, null]] as Array<[Error | null, unknown]>,
     };
     const fake = {
+      options: {},
       defineCommand(name: string) {
         (this as Record<string, unknown>)[name] = async () => null;
       },
@@ -181,6 +182,74 @@ describe("audit round 3 regressions", () => {
       })
     ).rejects.toMatchObject({ code: "handler_stopping" });
     await stop;
+  });
+
+  it("refuses a request after stop() rather than restarting the handler", async () => {
+    const target = await upstream();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend: memoryBackend(),
+      defaultClientOptions: {
+        name: "default",
+        requestOptions: { defaults: { baseURL: target.baseURL } },
+      },
+    });
+    handlers.push(handler);
+    await handler.start();
+    handler.setDrainTimeout(0);
+    await handler.stop();
+    const late = {
+      clientName: "default",
+      requestName: "shutdown.late",
+      method: "GET" as const,
+      url: "/",
+    };
+    await expect(handler.handleRequest(late)).rejects.toMatchObject({
+      code: "handler_stopped",
+    });
+    await expect(
+      handler.addTemplateClient("late" as never, { instanceId: "a" } as never)
+    ).rejects.toMatchObject({ code: "handler_stopped" });
+    expect(handler.getMetadata().status).toBe("stopped");
+
+    // An explicit start brings it back.
+    await handler.start();
+    const response = await handler.handleRequest(late);
+    expect(response.status).toBe(200);
+  });
+
+  it("elects past a peer registration it cannot read", async () => {
+    const target = await upstream();
+    const backend = memoryBackend();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend,
+      keyPrefix: "unreadable",
+      defaultClientOptions: {
+        name: "default",
+        requestOptions: { defaults: { baseURL: target.baseURL } },
+      },
+    });
+    handlers.push(handler);
+    const namespace = handler.getNamespace();
+    await backend.batch([
+      { op: "sadd", key: `${namespace}:instances`, member: "garbled" },
+      {
+        op: "set",
+        key: `${namespace}:instance:garbled`,
+        value: "{not json",
+        ttlSeconds: 60,
+      },
+    ]);
+    await handler.start();
+    expect(handler.getMetadata().ownedClients).toContain("default");
+    const response = await handler.handleRequest({
+      clientName: "default",
+      requestName: "election.unreadable",
+      method: "GET",
+      url: "/",
+    });
+    expect(response.status).toBe(200);
   });
 
   it("waits for an in-progress start before tearing the handler down", async () => {

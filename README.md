@@ -84,7 +84,8 @@ handlers so the queue drains on shutdown: `stop()` waits up to a 10-second budge
 to drain, fails anything still waiting with a `ClientUnavailableError` rather than leaving it to
 time out after the process meant to exit, then waits up to the same budget again for requests
 already upstream. Shutdown can therefore take about 20 seconds; `setDrainTimeout` changes the
-budget.
+budget. A stopped handler stays stopped: later requests are refused with `handler_stopped` until
+`start()` is called again.
 
 [Getting started](docs/getting-started.md) explains what each piece above is for.
 

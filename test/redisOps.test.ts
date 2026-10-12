@@ -70,10 +70,20 @@ function queued(requestId: string): QueuedRequest {
 describeIfRedis("redis backend — ops layer", () => {
   let redis: Redis;
   const opened: DianemoBackend[] = [];
+  const connections: Redis[] = [];
 
   /** A backend on the shared connection, closed after the test that made it. */
   function open(): DianemoBackend {
     const backend = redisBackend(redis);
+    opened.push(backend);
+    return backend;
+  }
+
+  /** A backend on its own connection carrying an ioredis `keyPrefix`. */
+  function openPrefixed(keyPrefix: string): DianemoBackend {
+    const connection = new Redis(`${REDIS_URL}/${TEST_DB}`, { keyPrefix });
+    connections.push(connection);
+    const backend = redisBackend(connection);
     opened.push(backend);
     return backend;
   }
@@ -90,6 +100,7 @@ describeIfRedis("redis backend — ops layer", () => {
 
   afterEach(async () => {
     await Promise.all(opened.splice(0).map((backend) => backend.close()));
+    for (const connection of connections.splice(0)) connection.disconnect();
     await redis.flushdb();
   });
 
@@ -380,6 +391,115 @@ describeIfRedis("redis backend — ops layer", () => {
 
       expect(first).toEqual(["ps:a"]);
       expect(second).toEqual([]);
+    });
+
+    it("keeps delivering after its pub/sub connection is killed and reconnects", async () => {
+      const backend = open();
+      const seen: string[] = [];
+      await backend.subscribe(["ps:killed"], (_c, m) => seen.push(m));
+
+      await redis.client("KILL", "TYPE", "pubsub");
+      await new Promise((r) => setTimeout(r, 500));
+      await backend.publish("ps:killed", "after-kill");
+      await new Promise((r) => setTimeout(r, 200));
+
+      expect(seen).toEqual(["after-kill"]);
+    });
+  });
+
+  // ------------------------------------------- a connection's ioredis keyPrefix
+
+  describe("a connection with an ioredis keyPrefix", () => {
+    it("finds a live peer instance on a connection with an ioredis keyPrefix", async () => {
+      const backend = openPrefixed("app:");
+      await backend.batch([
+        {
+          op: "set",
+          key: "ns:instance:peer",
+          value: '{"id":"peer"}',
+          ttlSeconds: 60,
+        },
+        { op: "sadd", key: "ns:instances", member: "peer" },
+      ]);
+      expect(await redis.get("app:ns:instance:peer")).toBe('{"id":"peer"}');
+
+      const peers = await backend.getInstances(
+        "ns:instances",
+        "ns:instance:",
+        "me"
+      );
+
+      expect(peers).toEqual([{ id: "peer", data: '{"id":"peer"}' }]);
+      expect(await redis.smembers("app:ns:instances")).toEqual(["peer"]);
+    });
+
+    it("keeps a grant whose freeze still stands in the frozen-grants set on a connection with an ioredis keyPrefix", async () => {
+      const backend = openPrefixed("app:");
+      const now = await backend.now();
+      await backend.setFreezeState(
+        "ns:c:grant:g1:freezeState",
+        now + 60_000,
+        1
+      );
+      await backend.sadd("ns:c:frozenGrants", "g1");
+
+      const cleaned = await backend.cleanupStaleFrozenGrants(
+        "ns:c:frozenGrants",
+        "ns:c:queue",
+        "ns:c:meta",
+        "ns:c:grant:"
+      );
+
+      expect(cleaned).toBe(0);
+      expect(await backend.smembers("ns:c:frozenGrants")).toEqual(["g1"]);
+    });
+
+    it("does not deliver a message published under another ioredis keyPrefix", async () => {
+      const a = openPrefixed("appA:");
+      const b = openPrefixed("appB:");
+      const seen: string[] = [];
+      await b.subscribe(["requestHandler:requestDone"], (_c, m) =>
+        seen.push(m)
+      );
+
+      await a.publish("requestHandler:requestDone", "from-A");
+      await a.batch([
+        {
+          op: "publish",
+          channel: "requestHandler:requestDone",
+          message: "batched-from-A",
+        },
+      ]);
+      await new Promise((r) => setTimeout(r, 150));
+
+      expect(seen).toEqual([]);
+    });
+
+    it("delivers under its own ioredis keyPrefix with the channel name unprefixed", async () => {
+      const publisher = openPrefixed("appA:");
+      const subscriber = openPrefixed("appA:");
+      const seen: Array<[string, string]> = [];
+      await subscriber.subscribe(["requestHandler:requestDone"], (c, m) =>
+        seen.push([c, m])
+      );
+
+      await publisher.publish("requestHandler:requestDone", "direct");
+      await publisher.batch([
+        {
+          op: "publish",
+          channel: "requestHandler:requestDone",
+          message: "batched",
+        },
+      ]);
+      await new Promise((r) => setTimeout(r, 150));
+
+      expect(seen).toEqual([
+        ["requestHandler:requestDone", "direct"],
+        ["requestHandler:requestDone", "batched"],
+      ]);
+      expect(await redis.pubsub("CHANNELS", "appA:*")).toEqual([
+        "appA:requestHandler:requestDone",
+      ]);
     });
   });
 

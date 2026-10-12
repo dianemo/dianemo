@@ -1,3 +1,4 @@
+import { FREEZE_PROBE_TTL_SECONDS } from "@dianemo/core";
 import {
   exactFn,
   finiteNumberFn,
@@ -13,6 +14,18 @@ import {
  *
  * Twin of the memory backend's freeze/thaw section.
  */
+
+/**
+ * Declares `freezeTtl(frozenUntil, thawRequestCount)`, the freeze key's
+ * lifetime in seconds. Requires `now`. Twin of core's `freezeTtlSeconds`.
+ */
+const freezeTtlFn = `
+  local function freezeTtl(frozenUntil, thawRequestCount)
+    local window = math.ceil((frozenUntil - now) / 1000)
+    if window < 0 then window = 0 end
+    if thawRequestCount > 0 then return window + ${FREEZE_PROBE_TTL_SECONDS} end
+    return window + 60
+  end`;
 
 /**
  * A `noLimit` client has no bucket and no slots, so its whole admission
@@ -85,8 +98,8 @@ ${redisNow()}
 
   -- Derived above the writes because EXPIRE is what rejects an out-of-range
   -- ttl, and it runs second.
-  local ttl = math.ceil((frozenUntil - now) / 1000) + 60
-  if ttl < 60 then ttl = 60 end
+${freezeTtlFn}
+  local ttl = freezeTtl(frozenUntil, thawRequestCount)
 
   -- '%d', not tostring: a millisecond epoch is 13 digits and Lua 5.1's
   -- default number formatting is %.14g — correct today, and silently lossy
@@ -170,7 +183,10 @@ ${redisNow()}
     return nil
   end
 
+${freezeTtlFn}
+
   if not success then
+    redis.call('EXPIRE', key, freezeTtl(frozenUntil, thawRequestCount))
     return reply(frozenUntil, thawRequestCount)
   end
 
@@ -182,6 +198,7 @@ ${redisNow()}
   end
 
   redis.call('HSET', key, 'thawRequestCount', newCount)
+  redis.call('EXPIRE', key, freezeTtl(frozenUntil, newCount))
   return reply(frozenUntil, newCount)
 `;
 

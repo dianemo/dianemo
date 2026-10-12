@@ -156,7 +156,10 @@ Two further rules inside that:
   clamp into the top band. A *read* is serialised into the `requestReady` payload,
   and `JSON.stringify(Infinity)` is `null`, so a corrupt `"Infinity"` would arrive
   at the owning replica as a null priority in a field typed `number`. Reads floor
-  the non-finite to the default; scores keep it.
+  the non-finite to the default; scores keep it. `tonumber` reads every
+  infinity `strtod` does — `inf` and `infinity` in any case, signed or not —
+  where `Number` reads only `Infinity`, so `parseStoredNumber` matches those
+  spellings itself.
 
 The priority default is 1, never 0, because 0 is the documented bottom of the
 range and a request may legitimately ask for it. Mapping corruption onto 0 makes
@@ -332,6 +335,43 @@ the recoverable error — the request either runs, or times out and releases
 through the ordinary abandonment path. Treating it as absent releases capacity
 for a request that may still be live.
 
+## A queue claim is a lease
+
+`getNextRequest` flips an entry to `inProgress` so that no other pass is handed
+it, and the request stays `inProgress` until it completes — which for a stream
+can be half an hour. The flip alone cannot tell those two apart, so a claimer
+that never acted on its claim stranded the entry: a reply lost after the script
+ran, or a controller that died between the claim and `returnToQueue`. Nothing
+selected it again, and orphan cleanup spares it while its owner lives.
+
+So the claim carries a timestamp. Both backends stamp `claimedAt` from their own
+clock (Redis `TIME`, `Date.now()` in memory) when they hand an entry out, and
+`getNextRequest` treats an `inProgress` entry whose stamp is
+`QUEUE_CLAIM_LEASE_MS` old as eligible again, clearing any thaw-probe mark the
+lapsed claim made. Before dispatching, `processRequests` calls
+`confirmRequest`, which deletes the stamp only if it is still the one this pass
+was handed; an entry without a stamp is admitted and is never reclaimed. Any
+`status` written through `updateRequest` also deletes it, so a returned entry is
+plainly pending. A stamp that does not parse never lapses, on both sides.
+
+The lease bounds only the gap between claim and confirmation, a few round
+trips, so it can be short. Too short costs little: within one controller the
+passes are serialised by `processingLock`, so a lease only lapses under a live
+claimer when two controllers drain at once. Then the stale claimer's
+confirmation fails and it does not dispatch. It does not release what it
+claimed either, because a concurrency slot is keyed by request id and is the
+slot the new holder is using; a token-bucket claim is spent twice instead,
+which under-admits rather than over-admits.
+
+A stale claimer that is *declined* confirms before `returnToQueue` writes
+`pending`, so it cannot reset an entry the new holder has already confirmed.
+
+A confirmation whose reply is lost throws into the loop's catch, which returns
+the entry to the queue undispatched, as for any other admission failure. That
+write does not confirm again: the lost confirmation may have landed and removed
+the stamp, and a second one would then refuse and leave the entry `inProgress`
+with nothing to move it on.
+
 ## A removed request cannot be re-added
 
 `removeRequest` marks the id for as long as that request's own add could still be
@@ -382,7 +422,9 @@ directly rather than trying to win the race.
 ## TTL arguments are validated before the write, not after
 
 `normalizeTtlSeconds` in `packages/core/src/backend/ttl.ts` is the one reading of a
-TTL, shared by both backends, and it is called **before** anything is written.
+TTL, shared by both backends — with `normalizeStateTtlSeconds` beside it as
+the stricter reading for rate-limit state — and both are called **before**
+anything is written.
 
 That ordering is the point. A Redis pipeline is not a transaction, so an `HSET`
 followed by an out-of-range `EXPIRE` leaves the hash written with no expiry at all
@@ -398,9 +440,16 @@ Consequences worth knowing:
 - **Non-finite and out-of-range raise** rather than clamping, because both mean the
   caller computed something it did not intend. A caller with no bound passes no
   TTL.
-- **Zero or negative still means "expire now"** on both backends, matching Redis
-  `EXPIRE`. That is a real delete, so it is the one TTL that can lose data
-  silently; `credentialTtlSeconds` floors well above it.
+- **Zero or negative still means "expire now"** for the store — `set`, `hset`,
+  `batch` — on both backends, matching Redis `EXPIRE`, and is passed on as `0`
+  because `EXPIRE` refuses a fraction such as `-0.5`. That is a real delete, so
+  it is the one TTL that can lose data silently; `credentialTtlSeconds` floors
+  well above it.
+- **A key holding rate-limit state refuses zero or negative.** A bucket, a slot
+  ledger, a queue and a claim mark take `normalizeStateTtlSeconds`, which
+  throws a `RangeError` instead. Those keys are shared by every caller of a
+  client, so one caller's "expire now" would delete what its peers hold — a
+  slot ledger with every other holder's slot in it.
 - **`credentialTtlSeconds` clamps its upper end too**, because
   `refresh_token_expires_in` is untrusted provider input checked only for being
   finite and positive, and a "never expires" sentinel exceeds what Redis accepts.

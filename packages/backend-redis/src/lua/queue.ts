@@ -1,5 +1,6 @@
-import { exactFn, finiteNumberFn } from "./fragments.js";
+import { exactFn, finiteNumberFn, redisNow } from "./fragments.js";
 import {
+  QUEUE_CLAIM_LEASE_MS as CLAIM_LEASE_MS,
   MAX_QUEUE_PRIORITY as MAX_PRIORITY,
   MAX_QUEUE_RETRIES as MAX_RETRIES,
   QUEUE_PRIORITY_BAND as PRIORITY_BAND,
@@ -75,7 +76,10 @@ export const removeRequest = `
   return isThawRequest or 'false'
 `;
 
-/** Accepts an optional list of grantIds to skip (for frozen grants). */
+/**
+ * Accepts an optional list of grantIds to skip (for frozen grants). A claim is
+ * a lease: docs/design-notes.md#a-queue-claim-is-a-lease
+ */
 export const getNextRequest = `
   local queueKey = KEYS[1]
   local metadataKey = KEYS[2]
@@ -104,25 +108,55 @@ export const getNextRequest = `
     end
   end
 
-  -- Get all pending requests (status = pending)
+${redisNow()}
   local allRequests = redis.call('ZRANGE', queueKey, 0, -1)
 
   for i, requestId in ipairs(allRequests) do
-    local status = redis.call('HGET', metadataKey .. ':' .. requestId, 'status')
-    if status == 'pending' and not skipRequestIds[requestId] then
-      -- Check if this request's grantId should be skipped
-      local grantId = redis.call('HGET', metadataKey .. ':' .. requestId, 'grantId') or ''
-      if grantId == '' or not skipGrantIds[grantId] then
-        -- Mark as in progress
-        redis.call('HSET', metadataKey .. ':' .. requestId, 'status', 'inProgress')
-        -- Get full metadata
-        local metadata = redis.call('HGETALL', metadataKey .. ':' .. requestId)
-        return cjson.encode(metadata)
+    local entryKey = metadataKey .. ':' .. requestId
+    local fields = redis.call('HMGET', entryKey, 'status', 'claimedAt', 'grantId',
+      'requestId', 'clientName', 'requestName')
+    local status = fields[1]
+    -- nil for an absent or empty field and nan for 'nan', neither of which ever
+    -- lapses: the memory twin's claimable().
+    local claimedAt = tonumber(fields[2])
+    local claimable = status == 'pending'
+      or (status == 'inProgress' and claimedAt ~= nil and now - claimedAt >= ${CLAIM_LEASE_MS})
+    if claimable and not skipRequestIds[requestId] then
+      local grantId = fields[3] or ''
+      -- What decodeRequest requires. Claiming an entry it then reads as null
+      -- leaves the entry inProgress while the caller sees an empty queue. An
+      -- empty requestName is a label like any other; HMGET's false is absence.
+      local decodable = fields[4] and fields[4] ~= '' and fields[5]
+        and fields[5] ~= '' and fields[6] ~= false
+      if decodable and (grantId == '' or not skipGrantIds[grantId]) then
+        -- A lapsed claim's probe nomination lapses with it: left set, it holds
+        -- off every other probe for a request nobody is admitting.
+        if status ~= 'pending' then
+          redis.call('HSET', entryKey, 'isThawRequest', 'false')
+        end
+        redis.call('HSET', entryKey, 'status', 'inProgress',
+          'claimedAt', string.format('%.0f', now))
+        return cjson.encode(redis.call('HGETALL', entryKey))
       end
     end
   end
 
   return nil
+`;
+
+/** Twin of the memory backend's `confirmRequest`. */
+export const confirmRequest = `
+  local metadataKey = KEYS[1]
+  local claimedAt = ARGV[1]
+
+  local fields = redis.call('HMGET', metadataKey, 'status', 'claimedAt')
+  if fields[1] ~= 'inProgress' then return 0 end
+  -- The nil test because nil equals nil, where the memory twin's NaN equals
+  -- nothing: an absent stamp confirms no claim.
+  local stored = tonumber(fields[2])
+  if stored == nil or stored ~= tonumber(claimedAt) then return 0 end
+  redis.call('HDEL', metadataKey, 'claimedAt')
+  return 1
 `;
 
 /**
@@ -162,6 +196,7 @@ export const updateRequest = `
 
   if updates.status ~= nil then
     redis.call('HSET', metadataKey, 'status', updates.status)
+    redis.call('HDEL', metadataKey, 'claimedAt')
   end
   if type(updates.retries) == 'number' then
     redis.call('HSET', metadataKey, 'retries', tostring(updates.retries))

@@ -14,7 +14,7 @@ export function instanceOps(ctx: Ctx) {
       const result = await ctx.run(
         "dianemoGetInstances",
         instanceSetKey,
-        instanceKeyPrefix,
+        ctx.keyPrefix + instanceKeyPrefix,
         currentInstanceId
       );
 

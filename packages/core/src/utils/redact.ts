@@ -1,3 +1,4 @@
+import type { Readable } from "node:stream";
 import type { AxiosError } from "axios";
 
 /**
@@ -111,14 +112,14 @@ export function redactUrl(url: string | undefined): string | undefined {
   // Scheme-relative `//user@host` is covered as well.
   const out = url
     .replace(
-      /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/@]*:)([^/@]*)@/i,
+      /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#@:]*:)([^/?#]*)@/i,
       (_m, scheme: string, user: string) => `${scheme}${user}${REDACTED}@`
     )
     // No colon means the userinfo IS the credential — a PAT or bearer used as
     // the username — so there is no password half to strip and the whole
     // component goes.
     .replace(
-      /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/@:]+)@/i,
+      /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#:]+)@/i,
       (_m, scheme: string) => `${scheme}${REDACTED}@`
     );
 
@@ -210,6 +211,16 @@ function safeDecode(value: string): string {
   }
 }
 
+/** A Node readable, such as the body of a `responseType: "stream"` response. */
+export function isReadableStream(value: unknown): value is Readable {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as Readable).pipe === "function" &&
+    typeof (value as Readable).destroy === "function"
+  );
+}
+
 /**
  * Redacts a body by key name and by value shape. Tracks visited objects, since
  * a cyclic `config.data` would otherwise throw from inside a catch block.
@@ -233,6 +244,9 @@ export function redactBody(
   seen.add(value);
 
   if (Array.isArray(value)) return value.map((v) => redactBody(v, seen));
+  // A copy of a stream's fields is not its body, and replacing the stream with
+  // one leaves its owner nothing to read or destroy.
+  if (isReadableStream(value)) return "[stream]";
 
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
@@ -310,7 +324,10 @@ export function sanitizeError(
         extraHeaderNames
       );
     }
-    if (err.response.data !== undefined) {
+    if (
+      err.response.data !== undefined &&
+      !isReadableStream(err.response.data)
+    ) {
       err.response.data = redactBody(err.response.data);
     }
     // Some upstreams echo the offending value into the reason phrase.

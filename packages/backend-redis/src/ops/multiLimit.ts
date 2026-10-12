@@ -1,5 +1,5 @@
 import type { AcquireMultiLimitResult, MultiLimitSpec } from "@dianemo/core";
-import { claimMarkKey, normalizeTtlSeconds } from "@dianemo/core";
+import { claimMarkKey, normalizeStateTtlSeconds } from "@dianemo/core";
 import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 
@@ -45,7 +45,7 @@ export function multiLimitOps(ctx: Ctx) {
       // Normalised here rather than left to the script, which spends the budgets
       // before its EXPIRE: a TTL Redis rejects would raise with them already
       // claimed and nothing on this path to hand them back.
-      const ttlSeconds = normalizeTtlSeconds(ttl);
+      const ttlSeconds = normalizeStateTtlSeconds(ttl);
       const index = new KeyIndex([queueKey]);
       const freezeIndices = freezeKeys.map((key) => index.of(key));
       const encoded = encodeSpecs(specs, { index, includeMarks: true });
@@ -143,7 +143,7 @@ function encodeSpecs(
         options.includeMarks && spec.mark
           ? {
               mk: index.of(claimMarkKey(spec.key, spec.mark.id)),
-              mt: normalizeTtlSeconds(spec.mark.ttlSeconds),
+              mt: normalizeStateTtlSeconds(spec.mark.ttlSeconds),
             }
           : {};
       return {

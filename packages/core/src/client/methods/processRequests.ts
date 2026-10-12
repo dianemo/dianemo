@@ -3,6 +3,7 @@ import type { QueuedRequest } from "../../backend/types.js";
 import type BaseClient from "../index.js";
 import {
   ClientFrozenError,
+  ConfigurationError,
   RequestCostExceedsBudgetError,
   RequestCostMismatchError,
 } from "../../errors.js";
@@ -155,7 +156,18 @@ async function processRequests(this: BaseClient) {
       // A probe that does not go out must give the mark back: left set, it reads
       // as a competing probe, and its eventual completion would be counted
       // against whichever freeze is standing by then.
+      //
+      // A claim whose lease lapsed belongs to whoever was handed the entry next,
+      // so a stale claimer writes nothing back over it. Confirming first also
+      // ends the lease, so the entry cannot be handed out mid-write. Once a
+      // confirmation has been sent the write is unconditional: one whose reply
+      // was lost may have landed, and only this write moves that entry on.
+      let confirmSent = false;
       const returnToQueue = async () => {
+        if (!confirmSent) {
+          confirmSent = true;
+          if (!(await this.confirmRequestInQueue(request))) return;
+        }
         const updates: Partial<QueuedRequest> = { status: "pending" };
         if (requestMetadata.isThawRequest) {
           updates.isThawRequest = false;
@@ -166,8 +178,9 @@ async function processRequests(this: BaseClient) {
 
       // Between the claim above and the notification below the request exists
       // only in this loop — `getNextRequest` already marked it `inProgress`, so
-      // no other controller reconsiders it and orphan cleanup skips it while its
-      // owner lives. An escaping rejection would strand it until it timed out.
+      // nothing reconsiders it until its claim lapses and orphan cleanup skips
+      // it while its owner lives. An escaping rejection would hold it for the
+      // lease.
       try {
         const turn = await this.tryAcquireTurn(requestMetadata);
         if (!turn.acquired) {
@@ -217,6 +230,12 @@ async function processRequests(this: BaseClient) {
           }
         }
 
+        // Not released on a lapsed claim: a concurrency slot is keyed by
+        // request id, so it is the slot the entry's new holder is using.
+        // docs/design-notes.md#a-queue-claim-is-a-lease
+        confirmSent = true;
+        if (!(await this.confirmRequestInQueue(request))) continue;
+
         // Addressed to the replica waiting on this request rather than broadcast,
         // since only the owner has a listener for it. When that owner is this
         // replica the hand-over stays in process.
@@ -244,6 +263,24 @@ async function processRequests(this: BaseClient) {
           );
           skippedRequestIds.add(requestId);
           await failUnsatisfiable.bind(this)(requestMetadata, error);
+          continue;
+        }
+        // An unspendable cost read back out of the queue never becomes
+        // spendable, so it is stepped over the same way.
+        if (
+          error instanceof ConfigurationError &&
+          error.code === "invalid_request_cost"
+        ) {
+          this.logger.warn(
+            `Client ${this.name} | request ${requestId} has a cost that cannot be spent; failing it and moving on`
+          );
+          skippedRequestIds.add(requestId);
+          if (
+            requestMetadata.ownerId === this.instanceId &&
+            this.failWaitingRequest(requestId, error)
+          ) {
+            await this.removeRequestFromQueue(requestId).catch(() => {});
+          }
           continue;
         }
 

@@ -9,6 +9,12 @@ import type { RequestCost } from "../request/types.js";
  */
 
 /**
+ * The infinities `tonumber` reads through C's `strtod` — `inf` or `infinity` in
+ * any case, optionally signed — of which `Number` accepts only `Infinity`.
+ */
+const STRTOD_INFINITY = /^\s*([+-]?)inf(?:inity)?\s*$/i;
+
+/**
  * Matches Lua's `tonumber` — absent, empty and unparseable all mean the default —
  * because `Number("")` is 0 and the two backends must read one stored field the same
  * way. The rule, and how to find its sites:
@@ -19,6 +25,8 @@ export function parseStoredNumber(
   fallback: number
 ): number {
   if (raw === undefined || raw.trim() === "") return fallback;
+  const infinity = STRTOD_INFINITY.exec(raw);
+  if (infinity) return infinity[1] === "-" ? -Infinity : Infinity;
   const parsed = Number(raw);
   // NaN, not "not finite". `tonumber("Infinity")` is `inf` — a number Lua then
   // clamps into the top band exactly as `Math.min` does here — so rejecting it as

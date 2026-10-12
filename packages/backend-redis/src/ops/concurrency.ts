@@ -1,4 +1,4 @@
-import { normalizeTtlSeconds } from "@dianemo/core";
+import { normalizeStateTtlSeconds } from "@dianemo/core";
 import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
 import type {
@@ -33,7 +33,7 @@ export function concurrencyOps(ctx: Ctx) {
       // Normalised here rather than left to the script, which claims the slot
       // before its EXPIRE: a TTL Redis rejects would raise with the slot held
       // and the caller holding no request to release it by.
-      const ttlSeconds = normalizeTtlSeconds(ttl);
+      const ttlSeconds = normalizeStateTtlSeconds(ttl);
       const result = await ctx.run(
         "dianemoTryAdmitConcurrency",
         queueKey,
@@ -100,7 +100,7 @@ export function concurrencyOps(ctx: Ctx) {
       slotId: string,
       ttlSeconds: number
     ): Promise<boolean> {
-      const ttl = normalizeTtlSeconds(ttlSeconds);
+      const ttl = normalizeStateTtlSeconds(ttlSeconds);
       return (await ctx.run("dianemoTouchConcurrency", key, slotId, ttl)) === 1;
     },
 

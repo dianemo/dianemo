@@ -74,7 +74,16 @@ async function getInstances(this: RequestHandler) {
 
   const instances: RequestHandlerMetadata[] = [this.getMetadata()];
   for (const instance of otherInstances) {
-    instances.push(JSON.parse(instance.data));
+    // Skipped rather than thrown: one unreadable registration would otherwise
+    // fail every election on every replica until it expires.
+    try {
+      instances.push(JSON.parse(instance.data));
+    } catch (error) {
+      this.logger.warn(
+        { error },
+        `Ignoring an unreadable registration for instance ${instance.id} in role election`
+      );
+    }
   }
   return instances;
 }

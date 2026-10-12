@@ -1,3 +1,4 @@
+import { BALANCE_TOLERANCE } from "@dianemo/core";
 import {
   bucketTtlFn,
   exactFn,
@@ -89,7 +90,8 @@ ${lazyRefill("      ")}
         mk = spec.mk,
         mt = tonumber(spec.mt),
       })
-      if tokens < cost then
+      -- Twin of coversCost in the core package's backend/balance.ts.
+      if not (tokens >= cost - maxTokens * ${BALANCE_TOLERANCE}) then
         local intervalsNeeded = math.ceil((cost - tokens) / tokensToAdd)
         local wait = intervalsNeeded * interval - (now - lastUpdate)
         if wait < 0 then wait = 0 end

@@ -10,7 +10,7 @@ import type {
 } from "@dianemo/core";
 import {
   claimMarkKey,
-  normalizeTtlSeconds,
+  normalizeStateTtlSeconds,
   parseFiniteStored,
 } from "@dianemo/core";
 
@@ -24,8 +24,15 @@ function markArgs(bucketKey: string, mark?: ClaimMark): [string, number] {
   if (!mark) return ["", 0];
   return [
     claimMarkKey(bucketKey, mark.id),
-    normalizeTtlSeconds(mark.ttlSeconds),
+    normalizeStateTtlSeconds(mark.ttlSeconds),
   ];
+}
+
+/** One entry of the `settleTokens` reply: amounts as `exact` strings. */
+interface SettledReply {
+  settled: boolean;
+  applied: string;
+  unapplied: string;
 }
 
 /** Token-bucket operations. Twin of the memory backend's token-bucket section. */
@@ -47,7 +54,7 @@ export function tokenBucketOps(ctx: Ctx) {
       // Normalised here rather than left to the script, which spends the tokens
       // before its EXPIRE: a TTL Redis rejects would raise with the budget
       // already gone and nothing on this path to refund it.
-      const ttlSeconds = normalizeTtlSeconds(ttl);
+      const ttlSeconds = normalizeStateTtlSeconds(ttl);
       const [markKey, markTtl] = markArgs(bucketKey, mark);
       const result = await ctx.run(
         "dianemoTryAdmitImmediately",
@@ -192,11 +199,13 @@ export function tokenBucketOps(ctx: Ctx) {
         JSON.stringify(entries),
         86400
       );
-      const parsed = JSON.parse(result as string) as Omit<
-        SettleResult,
-        "key"
-      >[];
-      return specs.map((spec, i) => ({ key: spec.key, ...parsed[i] }));
+      const parsed = JSON.parse(result as string) as SettledReply[];
+      return specs.map((spec, i) => ({
+        key: spec.key,
+        settled: parsed[i].settled,
+        applied: parseLuaNumber(parsed[i].applied),
+        unapplied: parseLuaNumber(parsed[i].unapplied),
+      }));
     },
 
     async touchClaimMark(
@@ -204,7 +213,7 @@ export function tokenBucketOps(ctx: Ctx) {
       markId: string,
       ttlSeconds: number
     ): Promise<boolean> {
-      const ttl = normalizeTtlSeconds(ttlSeconds);
+      const ttl = normalizeStateTtlSeconds(ttlSeconds);
       return (
         (await ctx.redis.expire(claimMarkKey(bucketKey, markId), ttl)) === 1
       );

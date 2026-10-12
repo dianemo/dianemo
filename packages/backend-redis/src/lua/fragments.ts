@@ -266,15 +266,21 @@ end`,
 /**
  * Declares `writeMark(markKey, ttl, claimed, overflow, fills, bucketKey)`, which
  * records what a claim took and how far its bucket had got, for settlement.
- * Twin of the memory backend's `writeMark`.
+ * Twin of the memory backend's `writeMark`, including the bucket's `epoch`:
+ * Redis's clock to the microsecond, distinct for each incarnation of the hash
+ * because scripts run one at a time.
  *
  * Requires: `finiteNumber`. Declares `writeMark`.
  */
 export const writeMarkFn = (prefix = "  "): string =>
   indent(
     `local function writeMark(markKey, ttl, claimed, overflow, fills, bucketKey)
-  local generation = finiteNumber(redis.call('HGET', bucketKey, 'generation'), 0)
-  redis.call('HSET', markKey, 'claimed', claimed, 'overflow', overflow, 'fills', fills, 'generation', generation)
+  local clock = redis.call('TIME')
+  redis.call('HSETNX', bucketKey, 'epoch', clock[1] .. '.' .. clock[2])
+  local bucket = redis.call('HMGET', bucketKey, 'generation', 'epoch')
+  local generation = finiteNumber(bucket[1], 0)
+  redis.call('HSET', markKey, 'claimed', claimed, 'overflow', overflow, 'fills', fills,
+    'generation', generation, 'epoch', bucket[2] or '')
   redis.call('EXPIRE', markKey, ttl)
 end`,
     prefix

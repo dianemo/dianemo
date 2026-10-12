@@ -991,6 +991,23 @@ abstract class BaseClient {
     );
   }
 
+  /**
+   * Records that a claim from {@link getNextRequest} led to admission. False
+   * when the entry is gone, or its claim lapsed and another pass holds it now.
+   * A backend that stamps no `claimedAt` grants no lease, so there is nothing
+   * to confirm.
+   */
+  protected async confirmRequestInQueue(
+    request: QueuedRequest
+  ): Promise<boolean> {
+    if (request.claimedAt === undefined) return true;
+    return this.backend.confirmRequest(
+      this.getMetadataKeyPrefix(),
+      request.requestId,
+      request.claimedAt
+    );
+  }
+
   protected getFrozenGrantsKey(): string {
     return `${this.namespace}:frozenGrants`;
   }

@@ -37,6 +37,13 @@ parseClientName("fedex:acme-co:production:rest");
 `parseClientName` returns `null` for anything with fewer than three segments —
 `default`, the handler's no-template client, is the usual case.
 
+Every segment — the template name, `organizationId`, `instanceId` and each
+sub-client's `name` — must be non-empty and free of `:` and whitespace. A colon
+would shift the segments after it, and backend keys normalize whitespace to
+`_`, so two names differing only by a space would share one budget and one
+credential entry. A template name is refused with `invalid_template_name`, the
+others with `invalid_client_name_segment`.
+
 Use `parseClientName` in anything that receives a client name from elsewhere: a
 metrics listener, a dynamic rate-limit controller, an admin UI. Splitting on `:`
 by hand works right up until a sub-client path appears.
@@ -230,7 +237,10 @@ that client's queue; the rest enqueue and await a `requestReady` broadcast.
 
 This is why recovery is not a thundering herd, and why adding replicas does not
 multiply the work done on the shared queue. When an instance stops or stops
-heartbeating, its requests are reclaimed and roles are recomputed.
+heartbeating, its requests are reclaimed and roles are recomputed. A queued
+request a controller picked up but never admitted — its reply lost, or the
+controller gone mid-pass — is handed out again after `QUEUE_CLAIM_LEASE_MS`
+(2s); one that was admitted never is.
 
 Under the [memory backend](backends/memory.md) there is exactly one instance by
 definition, and it is always the controller.
@@ -287,8 +297,10 @@ arming concurrently cannot cut each other short. The same rule keeps a deadline
 computed from a skewed clock or from an extreme `retryBackoffBaseTime`. Such a
 deadline is bounded — both backends clamp it to 2^53-1 — but bounded far past
 any horizon you care about. Waiting the key out is not an escape either: the
-freeze key's TTL is sized from the deadline plus a minute, so it outlives the
-freeze rather than expiring under it.
+freeze key's TTL is sized from the deadline plus a minute, or plus a week while
+thaw probes are still owed, and each probe that completes re-arms it. It
+outlives the freeze rather than expiring under it; only a freeze nobody has
+probed for a week is dropped by its TTL.
 
 The escape hatch is the backend, not the client. Three methods on
 `DianemoBackend` exist for this, and nothing in the library calls them:

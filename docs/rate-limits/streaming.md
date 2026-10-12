@@ -38,7 +38,10 @@ backpressure, so the vendor's stream is read only as fast as the caller reads.
 
 The end is the first of:
 
-- the upstream finishing, reported as `"completed"`;
+- the upstream finishing and every chunk having passed through to the
+  caller's stream, reported as `"completed"`. With backpressure that is when
+  the caller has read all but the last buffer's worth, not when the vendor
+  closed the connection;
 - the caller destroying the stream, or the request's `signal` aborting,
   reported as `"closed"`. An abort destroys the caller's stream with
   `RequestAbortedError`;
@@ -131,14 +134,24 @@ that happens inside the stream retries it. An error reported inside the stream
 freezes the client for the rest of the fleet; without an observer, dianemo
 cannot see one and records a success.
 
+A request that fails at its headers is not handed a relay: the axios error
+carries the vendor's error body as the unread stream in
+`error.response.data`. Read it or destroy it, since until then it holds its
+connection open. A retried attempt's body is destroyed for you.
+
 ## Keeping a long stream alive
 
 A large generation streams for half an hour or more, far past
 `concurrencySlotTtl`. While a stream is open its replica refreshes the
-request's slots every third of `concurrencySlotTtl`, and its claim marks with
-them, so the reaper never takes a slot that is still in use. A crashed replica
-stops refreshing, so crash recovery is as quick as it has always been, and
-`concurrencySlotTtl` no longer has to exceed the longest generation.
+request's slots every third of `concurrencySlotTtl`, or of `settleWindow` if
+that is shorter, and its claim marks with them, so the reaper never takes a
+slot that is still in use and a mark never lapses before the stream settles. A
+crashed replica stops refreshing, so crash recovery is as quick as it has always
+been, and `concurrencySlotTtl` no longer has to exceed the longest generation.
+
+A slot can still be lost — reaped after a long pause in the process, say. The
+stream then carries on outside `maxConcurrency`, and a warning names the
+request.
 
 `requestOptions.streamTimeout`, default 60 minutes, closes a stream still open
 after that long and releases its slot, so a stream the caller forgot cannot hold

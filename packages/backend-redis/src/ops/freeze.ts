@@ -240,7 +240,7 @@ export function freezeOps(ctx: Ctx) {
         frozenGrantsKey,
         queueKey,
         metadataKeyPrefix,
-        freezeStateKeyPrefix
+        ctx.keyPrefix + freezeStateKeyPrefix
       );
 
       return result as number;

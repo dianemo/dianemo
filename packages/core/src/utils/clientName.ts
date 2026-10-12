@@ -34,7 +34,8 @@ export const GLOBAL_ORGANIZATION_SEGMENT = "_";
  * cache key — so `org "a"` + `instance "b:c"` and `org "a:b"` + `instance "c"`
  * would resolve to one client holding one set of credentials. Whitespace is
  * rejected too, since namespaces normalize it to `_`.
- * `registerClientTemplate` applies the colon rule to the template name.
+ * `registerClientTemplate` applies the same rules to the template name, under
+ * its own code, and every sub-client's `name` is checked with this.
  *
  * @throws {ConfigurationError} `invalid_client_name_segment`.
  */

@@ -405,17 +405,19 @@ class MeteredClient extends BaseClient {
     config: TokenBucketConfig
   ): ClaimMark | undefined {
     if (!request.settles) return undefined;
-    const window = this.requestOptions.settleWindow;
-    const windowMs =
-      window !== undefined && Number.isFinite(window) && window > 0
-        ? window
-        : DEFAULT_SETTLE_WINDOW_MS;
     const refillMs =
       Math.ceil(config.maxTokens / config.tokensToAdd) * config.interval;
     return {
       id: this.getSlotId(request),
-      ttlSeconds: Math.ceil(Math.max(windowMs, refillMs) / 1000),
+      ttlSeconds: Math.ceil(Math.max(this.settleWindowMs, refillMs) / 1000),
     };
+  }
+
+  private get settleWindowMs(): number {
+    const window = this.requestOptions.settleWindow;
+    return window !== undefined && Number.isFinite(window) && window > 0
+      ? window
+      : DEFAULT_SETTLE_WINDOW_MS;
   }
 
   private withMarks(
@@ -497,7 +499,16 @@ class MeteredClient extends BaseClient {
     for (const spec of specs) {
       if (!wasClaimed(request, spec.key)) continue;
       if (spec.kind === "concurrency") {
-        await this.backend.touchConcurrency?.(spec.key, slotId, 86400);
+        const held = await this.backend.touchConcurrency?.(
+          spec.key,
+          slotId,
+          86400
+        );
+        if (held === false) {
+          this.logger.warn(
+            `Client ${this.name} | request ${request.requestId} no longer holds its slot in ${spec.key}; the stream carries on outside maxConcurrency`
+          );
+        }
         continue;
       }
       const mark = this.markFor(request, spec.config);
@@ -508,11 +519,12 @@ class MeteredClient extends BaseClient {
   }
 
   /**
-   * A third of the slot TTL, so two ticks can be lost before the reaper takes
-   * the slot.
+   * A third of the slot TTL, or of `settleWindow` when that is shorter — a
+   * claim mark lives at least that long — so two ticks can be lost before
+   * either the reaper takes the slot or the mark expires.
    */
   public streamKeepAliveMs(): number {
-    return this.requestTtl / 3;
+    return Math.min(this.requestTtl, this.settleWindowMs) / 3;
   }
 
   /**

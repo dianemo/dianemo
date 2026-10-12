@@ -126,7 +126,8 @@ const res = await handler.handleRequest({
 
 `handler.start()` is called automatically on the first request and is
 idempotent. It registers SIGTERM/SIGINT/SIGHUP handlers so the queue drains on
-shutdown.
+shutdown. A stopped handler stays stopped: a request after `stop()` is refused
+with `ClientUnavailableError` `handler_stopped` until `start()` is called again.
 
 `requestName` is not cosmetic — it appears in spans, logs and queue metadata.
 Name the operation, not the URL.

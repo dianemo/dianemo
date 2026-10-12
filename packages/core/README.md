@@ -121,7 +121,8 @@ await requests.fedex.cancelShipment("fedex:_:production", {
 ```
 
 `handler.start()` is called automatically on the first request and is idempotent. It registers
-SIGTERM/SIGINT/SIGHUP handlers so the queue drains on shutdown.
+SIGTERM/SIGINT/SIGHUP handlers so the queue drains on shutdown. After `stop()`, requests are
+refused with `ClientUnavailableError` `handler_stopped` until `start()` is called again.
 
 For a single-process program, swap two lines and drop the dependency entirely:
 

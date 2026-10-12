@@ -1531,6 +1531,119 @@ describe.each(harnesses(11))(
       );
     }, 30_000);
 
+    it("re-admits a queued request whose claim reply was lost", async () => {
+      await withClient(
+        harness,
+        spec(1, {
+          requestOptions: {
+            defaults: { baseURL: up.baseURL },
+            cleanupTimeout: 4_000,
+          },
+          healthCheckIntervalMs: 200,
+        }),
+        async (handler, backend, clientName) => {
+          const holder = settle(send(handler, clientName, "/hold"));
+          await sleep(100);
+          const queued = settle(send(handler, clientName, "/ok"));
+          await sleep(100);
+
+          // The claim runs and its reply is lost: a dropped connection, or a
+          // command timeout after the server had executed it.
+          const original = backend.getNextRequest.bind(backend);
+          let dropped = false;
+          backend.getNextRequest = async (...args) => {
+            const result = await original(...args);
+            if (result && !dropped) {
+              dropped = true;
+              throw new Error("connection reset after execution");
+            }
+            return result;
+          };
+          up.releaseHeld();
+
+          const held = await holder;
+          expect(held.ok).toBe(true);
+          expect(await waitUntil(async () => dropped)).toBe(true);
+          const outcome = await queued;
+          expect(outcome.ok).toBe(true);
+          expect(up.hits("/ok")).toBe(1);
+        }
+      );
+    }, 30_000);
+
+    it("re-admits a queued request whose confirmation reply was lost", async () => {
+      await withClient(
+        harness,
+        spec(1, {
+          requestOptions: {
+            defaults: { baseURL: up.baseURL },
+            cleanupTimeout: 4_000,
+          },
+          healthCheckIntervalMs: 200,
+        }),
+        async (handler, backend, clientName) => {
+          const holder = settle(send(handler, clientName, "/hold"));
+          await sleep(100);
+          const queued = settle(send(handler, clientName, "/ok"));
+          await sleep(100);
+
+          // The confirmation lands and its reply is lost, so the claim it ended
+          // is not this replica's to prove any more.
+          const original = backend.confirmRequest.bind(backend);
+          let dropped = false;
+          backend.confirmRequest = async (...args) => {
+            const result = await original(...args);
+            if (result && !dropped) {
+              dropped = true;
+              throw new Error("connection reset after execution");
+            }
+            return result;
+          };
+          up.releaseHeld();
+
+          const held = await holder;
+          expect(held.ok).toBe(true);
+          expect(await waitUntil(async () => dropped)).toBe(true);
+          const outcome = await queued;
+          expect(outcome.ok).toBe(true);
+          expect(up.hits("/ok")).toBe(1);
+        }
+      );
+    }, 30_000);
+
+    it("answers a request whose requestName is empty without stalling the queue behind it", async () => {
+      await withClient(
+        harness,
+        spec(1, {
+          requestOptions: {
+            defaults: { baseURL: up.baseURL },
+            cleanupTimeout: 3_000,
+          },
+        }),
+        async (handler, _backend, clientName) => {
+          const holder = settle(send(handler, clientName, "/hold"));
+          await sleep(100);
+          const started = Date.now();
+          // Admitted or refused at entry, either is an answer; waiting out the
+          // admission timeout is not.
+          const nameless = settle(
+            send(handler, clientName, "/ok", { requestName: "" })
+          );
+          await sleep(50);
+          const behind = settle(send(handler, clientName, "/ok"));
+          await sleep(100);
+          up.releaseHeld();
+
+          const held = await holder;
+          expect(held.ok).toBe(true);
+          const next = await behind;
+          expect(next.ok).toBe(true);
+          await nameless;
+          expect(Date.now() - started).toBeLessThan(2_000);
+        }
+      );
+    }, 30_000);
+
     /**
      * DELIBERATELY REPETITIVE — DO NOT CUT THE ITERATION COUNT.
      *

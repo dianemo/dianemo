@@ -196,7 +196,7 @@ class RedisBackend implements DianemoBackend {
           if (ttl !== undefined) chain.expire(op.key, ttl);
           break;
         case "publish":
-          chain.publish(op.channel, op.message);
+          chain.publish(this.ctx.keyPrefix + op.channel, op.message);
           break;
       }
     }
@@ -238,11 +238,17 @@ class RedisBackend implements DianemoBackend {
 
   // --------------------------------------------------------------- pub/sub
 
+  // Channels carry the connection's ioredis `keyPrefix`, which ioredis does not
+  // apply to them itself, so fleets kept apart by that prefix stay apart here.
+  // Handlers see the unprefixed name, as on the memory twin.
   async publish(channel: string, message: string): Promise<void> {
-    await this.redis.publish(channel, message);
+    await this.redis.publish(this.ctx.keyPrefix + channel, message);
   }
 
   async subscribe(channels: string[], handler: MessageHandler): Promise<void> {
+    // `SUBSCRIBE` with no channel is an arity error, not a no-op.
+    if (!channels.length) return;
+    const prefix = this.ctx.keyPrefix;
     if (!this.listener) {
       // A subscribed connection cannot run ordinary commands, so pub/sub needs
       // its own. This duplicate is the only connection the backend owns.
@@ -252,7 +258,8 @@ class RedisBackend implements DianemoBackend {
       // listener on it, so a listener per call would both re-deliver another
       // call's channels and grow the emitter without bound. Twin of the memory
       // backend's `subscribed` map.
-      this.listener.on("message", (channel: string, message: string) => {
+      this.listener.on("message", (wireChannel: string, message: string) => {
+        const channel = wireChannel.slice(prefix.length);
         // Copied, so a handler that subscribes while dispatching cannot mutate
         // the set being iterated.
         for (const h of [...(this.subscribed.get(channel) ?? [])]) {
@@ -268,7 +275,7 @@ class RedisBackend implements DianemoBackend {
       }
       handlers.add(handler);
     }
-    await this.listener.subscribe(...channels);
+    await this.listener.subscribe(...channels.map((c) => prefix + c));
   }
 
   // ---------------------------------------------------------------- clock
@@ -367,6 +374,9 @@ class RedisBackend implements DianemoBackend {
   }
   getNextRequest(...a: Parameters<DianemoBackend["getNextRequest"]>) {
     return this.ops.queue.getNextRequest(...a);
+  }
+  confirmRequest(...a: Parameters<DianemoBackend["confirmRequest"]>) {
+    return this.ops.queue.confirmRequest(...a);
   }
   getRequest(...a: Parameters<DianemoBackend["getRequest"]>) {
     return this.ops.queue.getRequest(...a);

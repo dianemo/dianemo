@@ -9,7 +9,7 @@ import {
 import {
   calculateQueueScore,
   normalizeTombstoneTtl,
-  normalizeTtlSeconds,
+  normalizeStateTtlSeconds,
   REQUEST_TOMBSTONE_TTL_SECONDS,
 } from "@dianemo/core";
 
@@ -49,7 +49,7 @@ export function queueOps(ctx: Ctx) {
       // Normalised here rather than left to the script, which ZADDs and HSETs
       // before its EXPIRE: a TTL Redis rejects would leave an entry nobody
       // awaits, with no expiry, pinning the queue non-empty.
-      const ttlSeconds = normalizeTtlSeconds(ttl);
+      const ttlSeconds = normalizeStateTtlSeconds(ttl);
 
       const added = await ctx.run(
         "dianemoAddRequest",
@@ -85,6 +85,19 @@ export function queueOps(ctx: Ctx) {
       if (!result) return null;
 
       return decodeRequest(decodeFlatHash(JSON.parse(result as string)));
+    },
+
+    async confirmRequest(
+      metadataKeyPrefix: string,
+      requestId: string,
+      claimedAt: number
+    ): Promise<boolean> {
+      const confirmed = await ctx.run(
+        "dianemoConfirmRequest",
+        `${metadataKeyPrefix}:${requestId}`,
+        String(claimedAt)
+      );
+      return confirmed === 1;
     },
 
     /**
@@ -167,10 +180,14 @@ export function queueOps(ctx: Ctx) {
       );
 
       const stats = JSON.parse(result as string) as QueueStats;
-      const costByLimit: Record<string, number> = {};
-      for (const [name, total] of Object.entries(stats.costByLimit ?? {})) {
-        costByLimit[name] = parseLuaNumber(total);
-      }
+      // `fromEntries`, not assignment: assigning a limit named `__proto__`
+      // replaces the prototype instead of adding a key. See the memory twin.
+      const costByLimit = Object.fromEntries(
+        Object.entries(stats.costByLimit ?? {}).map(([name, total]) => [
+          name,
+          parseLuaNumber(total),
+        ])
+      );
       return {
         ...stats,
         totalCost: parseLuaNumber(stats.totalCost),

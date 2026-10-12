@@ -3,6 +3,7 @@ import { harnesses as clientTypeHarnesses } from "./clientTypes/harness.js";
 import type { RequestCost } from "../packages/core/src/request/types.js";
 import { memoryBackend } from "../packages/core/src/backend/memory.js";
 import { redisBackend } from "../packages/backend-redis/src/index.js";
+import { QUEUE_CLAIM_LEASE_MS } from "../packages/core/src/index.js";
 import { Redis } from "ioredis";
 import type {
   ConcurrencyConfig,
@@ -268,6 +269,34 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       const res = await backend.acquireTokens(KEY, 1, config);
       expect(res.remainingTokens).toBe(config.maxTokens - 1);
     });
+
+    it("admits a hundred 0.01 claims from a bucket of 1", async () => {
+      const one = { maxTokens: 1, tokensToAdd: 1, interval: 60_000 };
+      let admitted = 0;
+      for (let i = 0; i < 100; i++) {
+        const result = await backend.acquireTokens(KEY, 0.01, one);
+        if (result.acquired) admitted++;
+      }
+      expect(admitted).toBe(100);
+      const refused = await backend.acquireTokens(KEY, 0.01, one);
+      expect(refused.acquired).toBe(false);
+    });
+
+    it("admits a hundred 0.01 claims from a bucket of 1 on the fast path and across several limits", async () => {
+      const one = { maxTokens: 1, tokensToAdd: 1, interval: 60_000 };
+      let fast = 0;
+      let multi = 0;
+      for (let i = 0; i < 100; i++) {
+        if (await backend.tryAdmitImmediately("tb:q", KEY, "tb:f", 0.01, one)) {
+          fast++;
+        }
+        const result = await backend.acquireMultiLimit!([
+          { kind: "tokenBucket", key: "tb:multi", cost: 0.01, config: one },
+        ]);
+        if (result.acquired) multi++;
+      }
+      expect([fast, multi]).toEqual([100, 100]);
+    });
   });
 
   // ------------------------------------------------------------- settlement
@@ -511,6 +540,94 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
 
     it("settles nothing for an empty list", async () => {
       expect(await backend.settleTokens!([])).toEqual([]);
+    });
+
+    describe("discarded refill shared by several claims", () => {
+      // Long interval: nothing refills unless lastUpdate is moved back.
+      const slow = { maxTokens: 10, tokensToAdd: 1, interval: 60_000 };
+      const settleSlow = (markId: string) => ({
+        key: KEY,
+        markId,
+        actual: 5,
+        config: slow,
+        maxDebt: 0,
+      });
+
+      /**
+       * Two claims of 1 leave 8; six intervals of refill then discard 4 at the
+       * cap. Each claim under-reserved by 4. Charged at claim, the balance would
+       * have been 0, refilled by 6 with nothing discarded: 6.
+       */
+      const claimTwiceAndRefill = async () => {
+        await backend.acquireTokens(KEY, 1, slow, mark("a"));
+        await backend.acquireTokens(KEY, 1, slow, mark("b"));
+        const state = await backend.getTokenBucketState(KEY, slow);
+        await backend.hset(KEY, {
+          lastUpdate: state.lastUpdate - 6 * slow.interval,
+        });
+      };
+
+      it("forgives discarded refill once, not once per outstanding claim", async () => {
+        await claimTwiceAndRefill();
+        await backend.settleTokens!([settleSlow("a")]);
+        await backend.settleTokens!([settleSlow("b")]);
+        const state = await backend.getTokenBucketState(KEY, slow);
+        expect(state.tokens).toBe(6);
+      });
+
+      it("forgives discarded refill once across claims settled in one call", async () => {
+        await claimTwiceAndRefill();
+        const results = await backend.settleTokens!([
+          settleSlow("a"),
+          settleSlow("b"),
+        ]);
+        expect(results.reduce((sum, r) => sum + r.applied, 0)).toBe(4);
+      });
+    });
+
+    it("reports a fractional settlement's applied amount exactly", async () => {
+      await backend.acquireTokens(KEY, 1, config, mark());
+      const [result] = await settle(1.1);
+      expect(result.applied).toBe(1.1 - 1);
+    });
+
+    it("reports a large settlement's applied and unapplied amounts exactly", async () => {
+      const huge = { maxTokens: 1e15, tokensToAdd: 1e15, interval: 60_000 };
+      await backend.acquireTokens(KEY, 0, huge, mark("a"));
+      const [applied] = await backend.settleTokens!([
+        {
+          key: KEY,
+          markId: "a",
+          actual: 123_456_789_012_345,
+          config: huge,
+          maxDebt: 0,
+        },
+      ]);
+      expect(applied.applied).toBe(123_456_789_012_345);
+
+      const small = { maxTokens: 10, tokensToAdd: 10, interval: 60_000 };
+      await backend.acquireTokens("st:small", 10, small, mark("b"));
+      const [short] = await backend.settleTokens!([
+        {
+          key: "st:small",
+          markId: "b",
+          actual: 10 + 123_456_789_012_345,
+          config: small,
+          maxDebt: 0,
+        },
+      ]);
+      expect(short.unapplied).toBe(123_456_789_012_345);
+    });
+
+    it("applies nothing to a bucket recreated after the claimed one expired", async () => {
+      await backend.acquireTokens(KEY, 1, config, mark("a"));
+      // The bucket expires (it reads as full again) while the mark lives on,
+      // then another claim recreates it.
+      await backend.del(KEY);
+      await backend.acquireTokens(KEY, 1, config, mark("b"));
+      const [result] = await settle(51, 0, "a");
+      expect(result.applied).toBe(0);
+      expect(await balance()).toBe(99);
     });
   });
 
@@ -1261,6 +1378,140 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       expect(await backend.getRequest(PREFIX, "remnant")).toBeNull();
     });
 
+    it("reports per-limit queued cost for a limit named constructor as a number", async () => {
+      await add("a", { cost: { constructor: 2, other: 1 } });
+      const stats = await backend.getQueueStats(QUEUE, PREFIX);
+      expect(stats.costByLimit.constructor).toBe(2);
+      expect(stats.costByLimit.other).toBe(1);
+    });
+
+    it("keeps a per-limit queued cost for a limit named __proto__ in the stats", async () => {
+      await add("a", { cost: JSON.parse('{"__proto__": 3, "other": 1}') });
+      const stats = await backend.getQueueStats(QUEUE, PREFIX);
+      expect(Object.hasOwn(stats.costByLimit, "__proto__")).toBe(true);
+      expect(Object.getPrototypeOf(stats.costByLimit)).toBe(Object.prototype);
+    });
+
+    it("hands out a queued entry whose requestName is empty rather than stranding it inProgress", async () => {
+      const now = Date.now();
+      await backend.addRequest(
+        QUEUE,
+        PREFIX,
+        queued("a", { requestName: "", timestamp: now })
+      );
+      await backend.addRequest(
+        QUEUE,
+        PREFIX,
+        queued("b", { timestamp: now + 1 })
+      );
+      const first = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(first?.requestId).toBe("a");
+      expect(first?.requestName).toBe("");
+    });
+
+    it("passes over an entry it could not return instead of claiming it", async () => {
+      const now = Date.now();
+      await add("unreadable", { timestamp: now });
+      await add("next", { timestamp: now + 1 });
+      await backend.hset(`${PREFIX}:unreadable`, { clientName: "" });
+
+      const next = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(next?.requestId).toBe("next");
+      const stats = await backend.getQueueStats(QUEUE, PREFIX);
+      expect(stats).toMatchObject({ pending: 1, inProgress: 1 });
+    });
+
+    it("orders same-score entries by byte order, as Redis does", async () => {
+      // U+FF61 is EF BD A1 in UTF-8 and U+1F600 is F0 9F 98 80, but as UTF-16
+      // the second begins with the surrogate D83D, which sorts below FF61.
+      const timestamp = Date.now();
+      await add("\u{1F600}", { timestamp });
+      await add("\uFF61", { timestamp });
+      const first = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(first?.requestId).toBe("\uFF61");
+    });
+
+    // ---- claim lease
+
+    /** Moves a claim's stamp back past the lease, as waiting it out would. */
+    const lapse = async (requestId: string) => {
+      const entry = await backend.getRequest(PREFIX, requestId);
+      await backend.hset(`${PREFIX}:${requestId}`, {
+        claimedAt: String(entry!.claimedAt! - QUEUE_CLAIM_LEASE_MS),
+      });
+    };
+
+    it("stamps a claim and does not hand it out again while its lease runs", async () => {
+      await add("a");
+      const claimed = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(claimed?.claimedAt).toEqual(expect.any(Number));
+      expect(await backend.getNextRequest(QUEUE, PREFIX)).toBeNull();
+    });
+
+    it("hands a claimed entry out again once its lease lapses", async () => {
+      await add("a");
+      const first = await backend.getNextRequest(QUEUE, PREFIX);
+      await lapse("a");
+
+      const again = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(again?.requestId).toBe("a");
+      expect(again?.claimedAt).toBeGreaterThanOrEqual(first!.claimedAt!);
+    });
+
+    it("never hands out a confirmed entry again", async () => {
+      await add("a");
+      const claimed = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(
+        await backend.confirmRequest(PREFIX, "a", claimed!.claimedAt!)
+      ).toBe(true);
+
+      const stored = await backend.getRequest(PREFIX, "a");
+      expect(stored?.status).toBe("inProgress");
+      expect(stored?.claimedAt).toBeUndefined();
+      expect(await backend.getNextRequest(QUEUE, PREFIX)).toBeNull();
+    });
+
+    it("refuses to confirm a claim that lapsed and was taken over", async () => {
+      await add("a");
+      const stale = await backend.getNextRequest(QUEUE, PREFIX);
+      await lapse("a");
+      const fresh = await backend.getNextRequest(QUEUE, PREFIX);
+      const lapsedAt = stale!.claimedAt! - QUEUE_CLAIM_LEASE_MS;
+
+      expect(await backend.confirmRequest(PREFIX, "a", lapsedAt)).toBe(false);
+      expect(await backend.confirmRequest(PREFIX, "a", fresh!.claimedAt!)).toBe(
+        true
+      );
+    });
+
+    it("refuses to confirm an entry that is gone", async () => {
+      await add("a");
+      const claimed = await backend.getNextRequest(QUEUE, PREFIX);
+      await backend.removeRequest(QUEUE, PREFIX, "a");
+      expect(
+        await backend.confirmRequest(PREFIX, "a", claimed!.claimedAt!)
+      ).toBe(false);
+    });
+
+    it("clears a lapsed claim's thaw-probe mark when it hands the entry out again", async () => {
+      await add("a");
+      await backend.getNextRequest(QUEUE, PREFIX);
+      await backend.updateRequest(QUEUE, PREFIX, "a", { isThawRequest: true });
+      await lapse("a");
+
+      const again = await backend.getNextRequest(QUEUE, PREFIX);
+      expect(again?.isThawRequest).toBe(false);
+    });
+
+    it("ends a claim when a status is written back", async () => {
+      await add("a");
+      await backend.getNextRequest(QUEUE, PREFIX);
+      await backend.updateRequest(QUEUE, PREFIX, "a", { status: "pending" });
+      expect(
+        (await backend.getRequest(PREFIX, "a"))?.claimedAt
+      ).toBeUndefined();
+    });
+
     it("defaults a stored numeric field rather than reporting NaN", async () => {
       await add("defaults");
       // Blank out the two fields whose absence used to decode to NaN on Redis.
@@ -1879,6 +2130,10 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       expect(first).toEqual(["ps:first"]);
       expect(second).toEqual([]);
     });
+
+    it("treats subscribing to no channels as a no-op", async () => {
+      await expect(backend.subscribe([], () => {})).resolves.toBeUndefined();
+    });
   });
 
   describe("instances", () => {
@@ -2106,6 +2361,22 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         )
       ).rejects.toThrow(RangeError);
       expect(await backend.get("ttl:b1")).toBeNull();
+    });
+
+    it("deletes the key for a negative fractional ttl instead of failing after the write", async () => {
+      await backend.hset("ttl:negfrac", { a: "1" }, -0.5);
+      expect(await backend.hgetall("ttl:negfrac")).toEqual({});
+
+      await backend.set("ttl:negfrac:b", "v");
+      await backend.batch(
+        [
+          { op: "expire", key: "ttl:negfrac:b", ttlSeconds: -0.5 },
+          { op: "set", key: "ttl:negfrac:sibling", value: "kept" },
+        ],
+        { atomic: true }
+      );
+      expect(await backend.get("ttl:negfrac:b")).toBeNull();
+      expect(await backend.get("ttl:negfrac:sibling")).toBe("kept");
     });
 
     it("gives a reset bucket an expiry, as every other bucket write does", async () => {
@@ -2385,6 +2656,183 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
     });
   });
 
+  // ------------------------------------------------- state key ttl input
+
+  describe("a key ttl that would expire shared rate-limit state", () => {
+    const bucket = { maxTokens: 5, tokensToAdd: 1, interval: 1000 };
+    const slots = { maxConcurrency: 5, requestTtl: 60_000 };
+
+    it("does not drop peers' slots when the fast path is given a zero key ttl", async () => {
+      await backend.acquireConcurrency("sk:slots", 1, "peer", slots);
+      await expect(
+        backend.tryAdmitConcurrency(
+          "sk:q",
+          "sk:slots",
+          "sk:f",
+          1,
+          "me",
+          slots,
+          0
+        )
+      ).rejects.toThrow(RangeError);
+      const state = await backend.getConcurrencyState("sk:slots", 60_000);
+      expect(state.activeRequests).toEqual(["peer"]);
+    });
+
+    it("does not drop peers' slots when a keep-alive is given a zero key ttl", async () => {
+      await backend.acquireConcurrency("sk:slots", 1, "peer", slots);
+      await backend.acquireConcurrency("sk:slots", 1, "me", slots);
+      await expect(
+        backend.touchConcurrency!("sk:slots", "me", 0)
+      ).rejects.toThrow(RangeError);
+      const state = await backend.getConcurrencyState("sk:slots", 60_000);
+      expect(state.activeRequests.sort()).toEqual(["me", "peer"]);
+    });
+
+    it("answers a negative fractional fast-path ttl the same way on every backend", async () => {
+      await expect(
+        backend.tryAdmitConcurrency(
+          "sk:q",
+          "sk:slots",
+          "sk:f",
+          1,
+          "me",
+          slots,
+          -0.5
+        )
+      ).rejects.toThrow(RangeError);
+      const state = await backend.getConcurrencyState("sk:slots", 60_000);
+      expect(state.activeRequests).toEqual([]);
+    });
+
+    it("claims nothing when the multi-limit fast path refuses a negative fractional ttl", async () => {
+      const specs: MultiLimitSpec[] = [
+        { kind: "tokenBucket", key: "sk:b", cost: 1, config: bucket },
+        {
+          kind: "concurrency",
+          key: "sk:slots",
+          cost: 1,
+          slotId: "me",
+          config: slots,
+        },
+      ];
+      await expect(
+        backend.tryAdmitMultiLimit!("sk:q", [], specs, -0.5)
+      ).rejects.toThrow(RangeError);
+      const state = await backend.getConcurrencyState("sk:slots", 60_000);
+      expect(state.activeRequests).toEqual([]);
+      expect((await backend.getTokenBucketState("sk:b", bucket)).tokens).toBe(
+        5
+      );
+    });
+
+    it.each([
+      ["zero", 0],
+      ["negative", -1],
+      ["negative fractional", -0.5],
+    ])(
+      "refuses a %s ttl on the token-bucket and queue entry points before writing",
+      async (_label, ttl) => {
+        await expect(
+          backend.tryAdmitImmediately("sk:q", "sk:b", "sk:f", 1, bucket, ttl)
+        ).rejects.toThrow(RangeError);
+        await expect(
+          backend.acquireTokens("sk:b", 1, bucket, { id: "m", ttlSeconds: ttl })
+        ).rejects.toThrow(RangeError);
+        await expect(
+          backend.acquireMultiLimit!([
+            {
+              kind: "tokenBucket",
+              key: "sk:b",
+              cost: 1,
+              config: bucket,
+              mark: { id: "m", ttlSeconds: ttl },
+            },
+          ])
+        ).rejects.toThrow(RangeError);
+        expect((await backend.getTokenBucketState("sk:b", bucket)).tokens).toBe(
+          5
+        );
+
+        await expect(
+          backend.addRequest("sk:q", "sk:m", queued("a"), ttl)
+        ).rejects.toThrow(RangeError);
+        expect(await backend.getQueueLength("sk:q")).toBe(0);
+        expect(await backend.hgetall("sk:m:a")).toEqual({});
+      }
+    );
+
+    it("refuses an unusable ttl for an already-queued request rather than reporting it queued", async () => {
+      await backend.addRequest("sk:q", "sk:m", queued("a"), 60);
+      await expect(
+        backend.addRequest("sk:q", "sk:m", queued("a"), 0)
+      ).rejects.toThrow(RangeError);
+    });
+
+    it("does not delete a claim mark when its keep-alive is given a zero ttl", async () => {
+      await backend.acquireTokens("sk:b", 1, bucket, {
+        id: "m",
+        ttlSeconds: 60,
+      });
+      await expect(backend.touchClaimMark!("sk:b", "m", 0)).rejects.toThrow(
+        RangeError
+      );
+      expect(await backend.touchClaimMark!("sk:b", "m", 60)).toBe(true);
+    });
+  });
+
+  // ------------------------------------------------------- mark lifetime
+
+  describe("a claim mark lifetime the store cannot hold", () => {
+    const bucket = { maxTokens: 100, tokensToAdd: 1, interval: 60_000 };
+    const balance = async (key: string) => {
+      const state = await backend.getTokenBucketState(key, bucket);
+      return state.tokens;
+    };
+
+    it("spends nothing when a claim's mark lifetime cannot be stored", async () => {
+      await expect(
+        backend.acquireTokens("ml:b", 1, bucket, {
+          id: "a",
+          ttlSeconds: 9.3e15,
+        })
+      ).rejects.toThrow(RangeError);
+      expect(await balance("ml:b")).toBe(100);
+    });
+
+    it("spends nothing on the fast path when a claim's mark lifetime cannot be stored", async () => {
+      await expect(
+        backend.tryAdmitImmediately("ml:q", "ml:b", "ml:f", 1, bucket, 86400, {
+          id: "a",
+          ttlSeconds: Number.NaN,
+        })
+      ).rejects.toThrow(RangeError);
+      expect(await balance("ml:b")).toBe(100);
+    });
+
+    it("spends nothing across several limits when a claim's mark lifetime cannot be stored", async () => {
+      const specs: MultiLimitSpec[] = [
+        { kind: "tokenBucket", key: "ml:other", cost: 1, config: bucket },
+        {
+          kind: "tokenBucket",
+          key: "ml:b",
+          cost: 1,
+          config: bucket,
+          mark: { id: "a", ttlSeconds: Infinity },
+        },
+      ];
+      await expect(backend.acquireMultiLimit!(specs)).rejects.toThrow(
+        RangeError
+      );
+      await expect(
+        backend.tryAdmitMultiLimit!("ml:q", [], specs)
+      ).rejects.toThrow(RangeError);
+      expect([await balance("ml:b"), await balance("ml:other")]).toEqual([
+        100, 100,
+      ]);
+    });
+  });
+
   // ------------------------------------------------------ requestTtl input
 
   describe("a slot lease that cannot be measured", () => {
@@ -2588,6 +3036,25 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         totalCost: 1,
         costByLimit: {},
       });
+    });
+
+    it("re-scores an entry with a stored priority of 'inf' to the same place on both backends", async () => {
+      const ts = Date.now();
+      await backend.addRequest(
+        "inf:q",
+        "inf:m",
+        queued("a", { priority: 5, timestamp: ts })
+      );
+      await backend.addRequest(
+        "inf:q",
+        "inf:m",
+        queued("b", { priority: 1, timestamp: ts + 1 })
+      );
+      await backend.hset("inf:m:b", { priority: "inf" });
+      await backend.updateRequest("inf:q", "inf:m", "b", { retries: 1 });
+      const order = await backend.getAllRequests("inf:q", "inf:m");
+      // `tonumber("inf")` is inf, which the re-score clamps into the top band.
+      expect(order.map((r) => r.requestId)).toEqual(["b", "a"]);
     });
 
     it.each([["inf"], ["Infinity"], ["1e400"]])(

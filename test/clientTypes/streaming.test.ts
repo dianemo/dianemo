@@ -1,6 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { harnesses, withHandler, type ClientSpec } from "./harness.js";
+import type RequestHandler from "../../packages/core/src/index.js";
+import type { Logger } from "../../packages/core/src/logger.js";
 import { createServer, type Server } from "node:http";
+import { type AxiosError, isAxiosError } from "axios";
 import type { Readable } from "node:stream";
 import type {
   DianemoResponse,
@@ -19,9 +22,11 @@ import {
  */
 
 /**
- * Streams `chunks` server-sent events `gap` ms apart, then a usage event of
- * `out` (or an error event with `error`), unless `hang` is set. Records when
- * each request, named by `id`, arrived and when its response ended.
+ * Streams `chunks` server-sent events `gap` ms apart, each padded by `pad`
+ * bytes, then a usage event of `out` (or an error event with `error`), unless
+ * `hang` is set. A scripted error status sends its body and, with `holdError`,
+ * keeps it open. Records when each request, named by `id`, arrived and when its
+ * response ended.
  */
 async function startStreamingUpstream() {
   const arrivals = new Map<string, number>();
@@ -36,6 +41,11 @@ async function startStreamingUpstream() {
     const status = script.shift() ?? 200;
     if (status !== 200) {
       res.writeHead(status, { "Content-Type": "application/json" });
+      if (url.searchParams.has("holdError")) {
+        res.write('{"error":"overloaded"}');
+        res.on("close", () => ends.set(`${id}:error`, Date.now()));
+        return;
+      }
       res.end("{}");
       ends.set(id, Date.now());
       return;
@@ -43,11 +53,12 @@ async function startStreamingUpstream() {
     res.writeHead(200, { "Content-Type": "text/event-stream" });
     const chunks = param("chunks", 3);
     const gap = param("gap", 20);
+    const pad = "x".repeat(param("pad", 0));
     let sent = 0;
     const tick = () => {
       if (res.destroyed) return;
       if (sent < chunks) {
-        res.write(`data: {"n":${sent++}}\n\n`);
+        res.write(`data: {"n":${sent++},"pad":"${pad}"}\n\n`);
         setTimeout(tick, gap);
         return;
       }
@@ -119,6 +130,30 @@ function usageObserver(): StreamObserver {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** The parts of a client these tests reach into. */
+interface ClientInternals {
+  logger: Logger;
+  streamKeepAliveMs(): number;
+}
+
+function clientOf(handler: RequestHandler, name: string): ClientInternals {
+  const clients = (
+    handler as unknown as { clients: Map<string, ClientInternals> }
+  ).clients;
+  return clients.get(name)!;
+}
+
+/** Collects what `client` warns, leaving the rest of its logger in place. */
+function captureWarnings(client: ClientInternals): string[] {
+  const warnings: string[] = [];
+  const logger: Logger = Object.create(client.logger);
+  logger.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(" "));
+  };
+  client.logger = logger;
+  return warnings;
+}
 
 describe.each(harnesses(15))("streaming — $name", (harness) => {
   let upstream: Awaited<ReturnType<typeof startStreamingUpstream>>;
@@ -214,6 +249,30 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
       );
     }, 30_000);
 
+    it("refreshes its claim marks more often than a short settleWindow lets them live", async () => {
+      await run(
+        { rateLimit: [slot, otpm], requestOptions: { settleWindow: 600 } },
+        async (handler) => {
+          expect(clientOf(handler, CLIENT).streamKeepAliveMs()).toBe(200);
+        }
+      );
+    }, 30_000);
+
+    it("warns when a keep-alive finds the slot already gone", async () => {
+      await run(
+        { rateLimit: [slot], requestOptions: { concurrencySlotTtl: 300 } },
+        async (handler, backend) => {
+          const warnings = captureWarnings(clientOf(handler, CLIENT));
+          backend.touchConcurrency = async () => false;
+          const res = await stream(handler, "id=a&chunks=5&gap=100");
+          await readAll(res.data);
+          expect(
+            warnings.some((line) => /no longer holds its slot/.test(line))
+          ).toBe(true);
+        }
+      );
+    }, 30_000);
+
     it("is released when the caller closes the stream", async () => {
       await run({ rateLimit: [slot] }, async (handler) => {
         const res = await stream(handler, "id=a&hang");
@@ -270,6 +329,20 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
       });
     }, 30_000);
 
+    it("settles at the last chunk when the caller reads after the upstream finished", async () => {
+      await run({ rateLimit: [otpm] }, async (handler, backend) => {
+        const res = await stream(
+          handler,
+          "id=a&chunks=120&gap=1&pad=1000&out=400",
+          { cost: 100, settleStream: usageObserver }
+        );
+        await sleep(1_000);
+        for await (const _chunk of res.data) await sleep(10);
+        await res.dianemo!.finished;
+        expect(await balance(backend)).toBe(600);
+      });
+    }, 30_000);
+
     it("settles a stream cut short at what it generated", async () => {
       await run({ rateLimit: [otpm] }, async (handler, backend) => {
         const res = await stream(handler, "id=a&chunks=100&gap=20", {
@@ -316,6 +389,37 @@ describe.each(harnesses(15))("streaming — $name", (harness) => {
         await expect(
           stream(handler, "id=a", { settleStream: usageObserver })
         ).rejects.toThrow(/backend implementing settleTokens/);
+      });
+    }, 30_000);
+  });
+
+  describe("an error at the headers", () => {
+    it("closes the body of an attempt it retries", async () => {
+      await run(
+        {
+          rateLimit: [slot],
+          retryOptions: { maxRetries: 1, retryBackoffBaseTime: 10 },
+        },
+        async (handler) => {
+          upstream.respond(503);
+          const res = await stream(handler, "id=a&holdError&chunks=0");
+          await readAll(res.data);
+          await sleep(200);
+          expect(upstream.ends.has("a:error")).toBe(true);
+        }
+      );
+    }, 30_000);
+
+    it("hands the caller the error body as a readable stream", async () => {
+      await run({ rateLimit: [slot] }, async (handler) => {
+        upstream.respond(400);
+        const error = await stream(handler, "id=a&holdError").catch(
+          (caught: unknown) => caught
+        );
+        expect(isAxiosError(error)).toBe(true);
+        const body = (error as AxiosError<Readable>).response?.data;
+        expect(typeof body?.pipe).toBe("function");
+        body?.destroy();
       });
     }, 30_000);
   });

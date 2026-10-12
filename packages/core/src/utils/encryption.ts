@@ -87,7 +87,11 @@ export function decrypt(encrypted: string, secret: string): string {
   const ciphertext = data.subarray(SALT_LENGTH + IV_LENGTH + AUTH_TAG_LENGTH);
 
   const key = deriveKey(secret, salt);
-  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+  // Without `authTagLength`, Node accepts a tag as short as 4 bytes, so a
+  // truncated ciphertext would be verified against a fraction of its tag.
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, {
+    authTagLength: AUTH_TAG_LENGTH,
+  });
   decipher.setAuthTag(authTag);
 
   return Buffer.concat([

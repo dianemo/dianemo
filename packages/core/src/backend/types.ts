@@ -18,7 +18,11 @@ export interface TokenBucketConfig {
 export interface ClaimMark {
   /** Identifies the attempt; the mark lives at `claimMarkKey(bucketKey, id)`. */
   id: string;
-  /** How long a settlement may arrive after the claim. */
+  /**
+   * How long a settlement may arrive after the claim, in seconds. Read by
+   * `normalizeStateTtlSeconds`, so zero or below throws a `RangeError` before
+   * the claim spends anything.
+   */
   ttlSeconds: number;
 }
 
@@ -193,6 +197,14 @@ export interface QueuedRequest {
    * for it leaves a claim mark. Stored only when true.
    */
   settles?: boolean;
+  /**
+   * Backend-clock epoch ms at which {@link DianemoBackend.getNextRequest}
+   * handed the entry out, while that claim is unconfirmed. Absent on a pending
+   * entry and on one whose admission {@link DianemoBackend.confirmRequest}
+   * recorded; an entry still carrying it after `QUEUE_CLAIM_LEASE_MS` is handed
+   * out again.
+   */
+  claimedAt?: number;
 }
 
 /** A client's or grant's freeze, as stored under its freeze key. */
@@ -356,8 +368,8 @@ export interface DianemoBackend {
    * `cost`.
    *
    * @param ttl The bucket key's lifetime in seconds, default 86400, raised to
-   * cover a refill from empty. Normalised as {@link DianemoBackend.set}'s
-   * `ttlSeconds` is, so an unusable one throws a `RangeError` before anything
+   * cover a refill from empty. Normalised by `normalizeStateTtlSeconds`, so a
+   * non-finite one, or zero or below, throws a `RangeError` before anything
    * is read.
    */
   tryAdmitImmediately(
@@ -389,8 +401,8 @@ export interface DianemoBackend {
    * `config` or `cost`.
    *
    * @param ttl The ledger key's lifetime in seconds, default 86400. Normalised
-   * as {@link DianemoBackend.set}'s `ttlSeconds` is, so an unusable one throws
-   * a `RangeError` before anything is read.
+   * by `normalizeStateTtlSeconds`, so a non-finite one, or zero or below,
+   * throws a `RangeError` before anything is read.
    */
   tryAdmitConcurrency(
     queueKey: string,
@@ -485,7 +497,9 @@ export interface DianemoBackend {
   /**
    * Restamps a held slot as claimed now, so a request still streaming its
    * response is not reaped by `requestTtl` while it is alive. A slot that is
-   * gone stays gone. `ttlSeconds` re-arms the ledger key's expiry.
+   * gone stays gone. `ttlSeconds` re-arms the ledger key's expiry, and is
+   * normalised by `normalizeStateTtlSeconds`: one that is not finite and above
+   * 0 throws a `RangeError` rather than deleting every holder's slot.
    *
    * Optional so an earlier backend still satisfies the interface; without it a
    * stream that outlives `concurrencySlotTtl` loses its slot to the reaper.
@@ -499,7 +513,8 @@ export interface DianemoBackend {
   ): Promise<boolean>;
   /**
    * Extends a claim mark's lifetime, so a stream that outlives its
-   * `settleWindow` can still settle. A mark that is gone stays gone.
+   * `settleWindow` can still settle. A mark that is gone stays gone. A
+   * `ttlSeconds` that is not finite and above 0 throws a `RangeError`.
    *
    * @returns Whether the mark still existed.
    */
@@ -539,7 +554,9 @@ export interface DianemoBackend {
   /**
    * The no-queue fast path for several budgets: admit only if nothing is queued,
    * none of `freezeKeys` stands or owes thaw probes, and every budget can be
-   * claimed at once. `ttl` is the key lifetime in seconds, default 86400.
+   * claimed at once. `ttl` is the key lifetime in seconds, default 86400,
+   * normalised by `normalizeStateTtlSeconds`: one that is not finite and above
+   * 0 throws a `RangeError` before anything is claimed.
    *
    * Optional; without it a client with several limits always queues.
    */
@@ -614,7 +631,8 @@ export interface DianemoBackend {
    * a removal and a later add of one id never both happen.
    *
    * @param ttl Lifetime in seconds of the queue key and the entry's metadata,
-   * default 86400. Normalised as {@link DianemoBackend.set}'s `ttlSeconds` is.
+   * default 86400. Normalised by `normalizeStateTtlSeconds`, so zero or below
+   * throws rather than expiring a queue other callers share.
    * @throws {RangeError} before anything is written, for an unusable `ttl` or
    * a request `calculateQueueScore` cannot score.
    */
@@ -626,8 +644,15 @@ export interface DianemoBackend {
   ): Promise<boolean>;
   /**
    * Claims the lowest-scored `pending` entry and returns it, flipping its
-   * status to `inProgress` in the same step so no other caller is handed it.
-   * `null` when nothing eligible is queued.
+   * status to `inProgress` and stamping `claimedAt` in the same step so no
+   * other caller is handed it. `null` when nothing eligible is queued.
+   *
+   * A claim is a lease: an `inProgress` entry whose `claimedAt` is
+   * `QUEUE_CLAIM_LEASE_MS` old is eligible again, and is handed out with its
+   * thaw-probe mark cleared, so a claimer that never answers — its reply lost,
+   * its process gone — does not strand the entry. An entry missing `requestId`,
+   * `clientName` or `status`, or with no `requestName` field at all, is passed
+   * over rather than claimed, since it could not be returned.
    *
    * @param skipGrantIds Grants whose entries to pass over, such as frozen
    * ones. An entry with no grant is never skipped by this.
@@ -644,6 +669,18 @@ export interface DianemoBackend {
     skipRequestIds?: string[]
   ): Promise<QueuedRequest | null>;
   /**
+   * Records that the claim {@link getNextRequest} stamped with `claimedAt` led
+   * to admission, so the entry is never handed out again. True only while the
+   * entry is still `inProgress` under that same claim; false when it is gone or
+   * its lease lapsed and another caller claimed it, in which case the caller
+   * must not dispatch it.
+   */
+  confirmRequest(
+    metadataKeyPrefix: string,
+    requestId: string,
+    claimedAt: number
+  ): Promise<boolean>;
+  /**
    * The entry's stored metadata, or `null` when it is gone or lacks a required
    * field. Reads only; the queue order is not consulted.
    */
@@ -654,6 +691,7 @@ export interface DianemoBackend {
   /**
    * Updates `status`, `retries`, `priority` and `isThawRequest` on an existing
    * entry; other fields in `updates` are ignored, as is a non-finite number. A
+   * `status` written here ends any claim, clearing `claimedAt`. A
    * change to `retries` or `priority` re-scores the entry in the same step,
    * clamping rather than throwing where `calculateQueueScore` would. A no-op
    * for an entry that is gone.

@@ -4,7 +4,9 @@
 rateLimit: [{ type: "noLimit" }]
 ```
 
-This is also what a client gets when it omits `rateLimit` altogether.
+This is also what a root client gets when it omits `rateLimit` altogether. A
+[sub-client](../concepts.md#sub-clients) that omits it inherits its parent's
+limits instead, metered as a budget of its own under the sub-client's name.
 
 No budget to coordinate. A request is admitted the moment it arrives, unless
 the client is frozen or work is already queued ahead of it — see

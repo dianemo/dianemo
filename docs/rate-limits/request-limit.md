@@ -31,8 +31,8 @@ is deliberate, and it is the single most consequential thing on this page.
 ## Refill granularity dominates tail latency
 
 `interval`/`tokensToAdd` and its scaled-down equivalent grant the same average
-rate. They do not produce the same latency. Measured at an identical 140 req/s
-average:
+rate. They do not produce the same latency. Each row is configured for the same
+140 req/s average:
 
 | Configuration                        | Throughput | p99        |
 | ------------------------------------ | ---------- | ---------- |
@@ -40,9 +40,12 @@ average:
 | `interval: 1000, tokensToAdd: 140`   | 142/s      | 602 ms     |
 | `interval: 100, tokensToAdd: 14`     | 142/s      | **199 ms** |
 
-**24× better p99 at the same throughput**, purely from granularity. With a lump,
-the budget is spent early in the interval and everything that arrives afterwards
-waits for the next refill. With a trickle, waits are short and even.
+**About 3× better p99 at the same throughput** going from a one-second interval
+to a 100 ms one, purely from granularity. The ten-second lump's p99 is 24× the
+trickle's, but that run also measured a different throughput, so it is not a
+like-for-like comparison. With a lump, the budget is spent early in the interval
+and everything that arrives afterwards waits for the next refill. With a
+trickle, waits are short and even.
 
 So a vendor limit quoted as "1400 per 10 seconds" invites exactly the wrong
 configuration. Prefer the smallest interval that still expresses the limit
@@ -110,18 +113,18 @@ buckets.
 A 5xx or a dropped connection freezes the client too, but leaves the bucket as
 it is: that is upstream trouble, not proof the budget was wrong.
 
-**Two durations, not one**, and this is the type where the difference shows. A
-429's freeze empties the bucket, so every freeze is floored at `interval` — a
-freeze that lapsed sooner would reopen admission onto zero tokens, which buys
-nothing. The failing
-request's own retry back-off is **not** floored, except after a 429: a 5xx or a
-dropped socket is upstream trouble rather than a budget problem, the bucket is
-untouched by it, and flooring that back-off would stop the fleet for a full window
-over one bad response.
+**The floor depends on the response**, and this is the type where the difference
+shows. A 429 empties the bucket, so both its freeze and the failing request's
+retry wait are floored at `interval` — lapsing sooner would reopen admission onto
+zero tokens, which buys nothing. A 5xx or a dropped socket leaves the bucket
+untouched, so its freeze and its retry wait both take the configured back-off,
+`retryBackoffBaseTime`, with no floor at `interval`: flooring them would stop
+the fleet for a full window over one bad response. For the freeze, a zero,
+negative or `NaN` back-off becomes 1000 ms, as described in
+[choosing a rate limit](README.md#a-zero-back-off-does-not-disarm-it).
 
-That distinction exists because of the advice at the top of this page. Expressing
-a limit with the smallest honest `interval` is good for latency, but it also makes
-`interval` a poor back-off — so the two were separated rather than one number
-being asked to serve both. Setting `retryBackoffBaseTime` therefore tunes how soon
-_this request_ tries again, and the refill interval decides how long the _fleet_
-stands down.
+That split exists because of the advice at the top of this page. Expressing a
+limit with the smallest honest `interval` is good for latency, but it also makes
+`interval` a poor back-off for upstream trouble. So `retryBackoffBaseTime`
+decides how long the fleet stands down over a 5xx, and the refill interval is
+the least it stands down over a 429.

@@ -52,6 +52,12 @@ list.
 > fast path runs on every replica independently, so for the length of the
 > rollout the fleet can send up to **twice** the agreed rate at the vendor.
 >
+> Limit changes do not cross versions either. A `rateLimitChange` result or an
+> operator update is published in its sender's format, and only replicas on the
+> sender's version apply it: an old replica ignores a list, and a new one
+> refuses a 1.x bare object and logs it. For the length of the rollout, a retune
+> reaches only part of the fleet.
+>
 > Stop the fleet, then start it on the new version. If you cannot, do the
 > rollout inside a window where a doubled rate is acceptable, and expect the
 > one-time burst above on top.
@@ -69,7 +75,7 @@ list.
 
 ## What may go in the list
 
-Any of the four types, in any combination:
+Any combination of `requestLimit`, `concurrencyLimit` and `noLimit`:
 
 | Entry              | Contributes                                  |
 | ------------------ | -------------------------------------------- |
@@ -141,10 +147,15 @@ not say *which* limit was breached, and zeroing a per-day bucket over a
 per-second breach would stand the client down until tomorrow. The freeze window
 is the stand-down instead: floored at the **shortest** refill interval in the
 list — the soonest anything here can hand out a token at all — and lengthened by
-each further 429, with recovery probed one request at a time as usual.
+each further 429, with recovery probed one request at a time as usual. The
+refused request's own retry wait takes the same floor.
 
 The shortest, not the longest, for the same reason: flooring a freeze at a
 per-day interval would pause the fleet for a day over one per-second refusal.
+
+Only a 429 is floored. A 5xx or a dropped connection says nothing about any
+budget, so its freeze and its retry wait take the configured back-off,
+`retryBackoffBaseTime`, whatever the intervals in the list.
 
 ## `sharedLimit` stands alone
 

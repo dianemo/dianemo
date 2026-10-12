@@ -97,15 +97,16 @@ upstream that has just refused us, so it is not permitted to produce a
 zero-length freeze — which the arming gate would read as no freeze at all.
 
 For the freeze, a zero back-off is replaced by **1000ms**; a positive one is
-used as it is. That is the whole rule for the types that derive the freeze from
-the configured back-off, `concurrencyLimit` and `noLimit`. `requestLimit` also
-floors its freeze at the refill interval, since a 429 empties the bucket and
-the freeze is not over until the bucket can refill; a `sharedLimit` child floors it at its
-parent's shortest refill interval, and a client with
-[several limits](multiple-limits.md) at the shortest of its own. The same
-replacement catches a `retryBackoffBaseTime` that is negative or `NaN` — an
-unset `Number(process.env.…)` is the usual source, and a negative would
-otherwise put `frozenUntil` in the past and leave the client in permanent
+used as it is. That is the whole rule for a freeze armed by a 5xx or a dropped
+connection, on every type, and for every freeze on `concurrencyLimit` and
+`noLimit`. Only a 429's freeze on a client with a refill interval is floored
+further: [`requestLimit`](request-limit.md#freezing) floors it at the refill
+interval, since the freeze is not over until the bucket can refill; a
+`sharedLimit` child floors it at its parent's shortest refill interval, and a
+client with [several limits](multiple-limits.md) at the shortest of its own.
+The same replacement catches a `retryBackoffBaseTime` that is negative or
+`NaN` — an unset `Number(process.env.…)` is the usual source, and a negative
+would otherwise put `frozenUntil` in the past and leave the client in permanent
 single-probe thaw.
 
 So `retryBackoffBaseTime: 0` on a `noLimit` client gives you a request that

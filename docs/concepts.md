@@ -82,13 +82,17 @@ await handler.registerClientTemplate("acme", (creds) => [
 ]);
 ```
 
-A sub-client **inherits** the parent's endpoint configuration, authentication,
-retry options and `rateLimitChange`, and **overrides** whatever it declares —
-most usefully its own `rateLimit`. An inherited `rateLimitChange` runs on the
-sub-client's own responses and retunes the sub-client's own budget, so a callback
-written for the parent's limit names has to cope with the child's. Objects that
-are not plain — an `httpAgent`, a `Buffer` — are shared with the parent as the
-same object rather than copied.
+A sub-client **inherits** every field of its parent that it does not declare
+itself — endpoint configuration, authentication, retry options,
+`rateLimitChange` and `rateLimit` among them — and **overrides** whatever it
+declares, most usefully its own `rateLimit`. An inherited `rateLimit` is a copy
+of the parent's limits, not a share of them: the sub-client meters it as a
+separate budget under its own name. (An inherited `sharedLimit` still names the
+same owner, so it draws on that owner's budget.) An inherited `rateLimitChange`
+runs on the sub-client's own responses and retunes the sub-client's own budget,
+so a callback written for the parent's limit names has to cope with the
+child's. Objects that are not plain — an `httpAgent`, a `Buffer` — are shared
+with the parent as the same object rather than copied.
 
 A sub-client that declares its own `authentication` authenticates as itself: its
 tokens are filed under its own name, not its parent's. One that declares none
@@ -214,6 +218,9 @@ This is the operator-side escape hatch and needs no permission from the template
 For a choice the plugin itself sanctions — a subscription plan, picked from a
 list the plugin wrote — see
 [letting callers pick a plan](writing-plugins.md#letting-callers-pick-a-plan).
+When a tenant is on a plan, its overrides apply on top of the plan's limits, so
+the override wins, and an unnamed limit in an override takes the name of the
+plan's limit of that type.
 
 ## Instances, controllers and leader election
 
@@ -240,6 +247,18 @@ reset or timeout, freezes the client as well, but leaves every bucket as it is
 and needs no thaw probes: the upstream was unwell, which says nothing about the
 budget, and that freeze ends when its deadline lapses.
 
+The two kinds of freeze are timed differently, for the same reason. A 5xx's
+freeze, like the failing request's retry wait, takes the configured back-off,
+`retryBackoffBaseTime`, with a zero, negative or `NaN` back-off replaced by
+1000 ms for the freeze. Only a 429's freeze is floored at the client's shortest
+refill interval, and on a client that owns its budgets so is the 429's retry
+wait. See
+[a zero back-off does not disarm it](rate-limits/README.md#a-zero-back-off-does-not-disarm-it).
+
+A claim handed back unsent — an aborted or abandoned request — is refunded even
+while a freeze stands, unless that freeze emptied the bucket, which only a 429
+on a client with exactly one `requestLimit` does.
+
 Recovery from a 429 is not "everyone retries at once". Once the deadline
 passes, one request at a time across the whole fleet is nominated as the **thaw
 probe**. Each probe that succeeds counts toward `thawRequestCount` (default 3),
@@ -254,9 +273,11 @@ probe one at a time like everything else.
 ### Clearing a freeze by hand
 
 A freeze ends once its deadline has lapsed and its probe budget is spent — by
-successful probes after a 429, at once for a freeze that has none. Nothing in
-the library ends one early, deliberately:
-arming a freeze keeps the **longer** of the two deadlines, so that failures
+successful probes after a 429, at once for a freeze that has none. Probes only
+finish a freeze whose window has lapsed: if a failure re-arms the window while a
+probe is in flight, that probe succeeding leaves the new deadline standing.
+Nothing in the library ends a freeze before its deadline, deliberately: arming
+a freeze keeps the **longer** of the two deadlines, so that failures
 arming concurrently cannot cut each other short. The same rule keeps a deadline
 computed from a skewed clock or from an extreme `retryBackoffBaseTime`. Such a
 deadline is bounded — both backends clamp it to 2^53-1 — but bounded far past

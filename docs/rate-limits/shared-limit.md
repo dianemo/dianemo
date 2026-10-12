@@ -55,6 +55,11 @@ budget — which is usually right, because the vendor is counting them together.
 If a 429 on one credential should _not_ pause the others, they do not actually
 share a limit, and this is the wrong type.
 
+A 429's freeze is floored at the parent's shortest refill interval, matching the
+freeze the parent would arm itself; the child's own retry wait is not floored.
+A 5xx or a dropped connection freezes the shared budget for the child's
+configured back-off, `retryBackoffBaseTime`, with no floor at any interval.
+
 One consequence worth stating: a child with `retry429s: false` will not arm the
 freeze at all, so a 429 it receives does not pause its siblings. Turning off 429
 retries on one member of a shared budget disables the shared back-off with it.

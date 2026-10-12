@@ -116,10 +116,12 @@ always had.
 
 ## What the tightest limit decides
 
-- **The cost ceiling.** `cost` is measured against the smallest ceiling in the
-  list — the lowest `maxTokens` or `maxConcurrency`. A cost above it can never
-  be admitted, so it is failed with `RequestCostExceedsBudgetError` rather than
-  queued forever.
+- **The cost ceiling.** A number `cost` is charged to every limit, so it is
+  measured against the smallest ceiling in the list — the lowest `maxTokens` or
+  `maxConcurrency`. A [per-limit cost](README.md#cost-and-priority-apply-to-all-of-them)
+  is measured limit by limit, each amount against its own ceiling. Either way, a
+  cost no wait could admit is failed with `RequestCostExceedsBudgetError`,
+  naming the limit it exceeds, rather than queued forever.
 - **The throughput.** Whichever budget runs out first is the one that holds the
   client, which is the whole point.
 
@@ -257,3 +259,7 @@ day without traffic.
 A client declaring one limit reports a list of one, named `default`. A consumer
 that read `rateLimit.type` reads `rateLimit[0].type`, or looks the entry up by
 name.
+
+`requestsInQueue.cost` and `requestsInProgress.cost` are totals per limit, keyed
+the same way — `{ per_second: 3, per_day: 3 }` — since a per-limit cost can
+charge each limit differently. A number cost counts toward every one.

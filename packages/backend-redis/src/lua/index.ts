@@ -7,8 +7,10 @@ import {
   tryAdmitConcurrency,
 } from "./concurrency.js";
 import {
+  emptyTokenBucket,
   refundTokens,
   resetTokenBucket,
+  settleTokens,
   tokenBucket,
   tryAdmitImmediately,
 } from "./tokenBucket.js";
@@ -45,13 +47,15 @@ import {
  * count silently shifts every ARGV slot along — see `ttlArgvWarning` in
  * `fragments.ts` for how invisible that class of mistake is.
  *
- * `"variadic"` is for the multi-limit scripts alone, whose key count comes from
- * a client's configuration. ioredis then expects the count as the call's first
- * argument instead, so those callers pass it and everything after it shifts by
- * one — `ctx.runVariadic` is the only way to invoke them.
+ * `"variadic"` is for the multi-limit and settlement scripts, whose key count
+ * comes from a client's configuration. ioredis then expects the count as the
+ * call's first argument instead, so those callers pass it and everything after
+ * it shifts by one — `ctx.runVariadic` is the only way to invoke them.
  */
 export const SCRIPTS = {
-  dianemoTokenBucket: { keys: 1, lua: tokenBucket },
+  dianemoTokenBucket: { keys: 2, lua: tokenBucket },
+  dianemoEmptyTokenBucket: { keys: 1, lua: emptyTokenBucket },
+  dianemoSettleTokens: { keys: "variadic", lua: settleTokens },
   dianemoAcquireMultiLimit: { keys: "variadic", lua: acquireMultiLimit },
   dianemoReleaseMultiLimit: { keys: "variadic", lua: releaseMultiLimit },
   dianemoTryAdmitMultiLimit: { keys: "variadic", lua: tryAdmitMultiLimit },
@@ -66,7 +70,7 @@ export const SCRIPTS = {
   dianemoUpdateThawProgress: { keys: 2, lua: updateThawProgress },
   dianemoWriteFreezeState: { keys: 1, lua: writeFreezeState },
   dianemoReadFreezeState: { keys: 1, lua: readFreezeState },
-  dianemoTryAdmitImmediately: { keys: 3, lua: tryAdmitImmediately },
+  dianemoTryAdmitImmediately: { keys: 4, lua: tryAdmitImmediately },
   dianemoTryAdmitNoLimit: { keys: 2, lua: tryAdmitNoLimit },
   dianemoTryAdmitConcurrency: { keys: 3, lua: tryAdmitConcurrency },
   dianemoAddRequest: { keys: 3, lua: addRequest },

@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { harnesses as clientTypeHarnesses } from "./clientTypes/harness.js";
+import type { RequestCost } from "../packages/core/src/request/types.js";
 import { memoryBackend } from "../packages/core/src/backend/memory.js";
 import { redisBackend } from "../packages/backend-redis/src/index.js";
 import { Redis } from "ioredis";
@@ -266,6 +267,209 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       });
       const res = await backend.acquireTokens(KEY, 1, config);
       expect(res.remainingTokens).toBe(config.maxTokens - 1);
+    });
+  });
+
+  // ------------------------------------------------------------- settlement
+
+  describe("settlement", () => {
+    const KEY = "st:rateLimit";
+    // A refill interval long enough that nothing refills unless a test moves
+    // `lastUpdate` back on purpose.
+    const config = { maxTokens: 100, tokensToAdd: 100, interval: 60_000 };
+    const mark = (id = "a1") => ({ id, ttlSeconds: 900 });
+    const settle = (actual: number, maxDebt = 0, markId = "a1") =>
+      backend.settleTokens!([{ key: KEY, markId, actual, config, maxDebt }]);
+    const balance = async () =>
+      (await backend.getTokenBucketState(KEY, config)).tokens;
+    /** Moves the bucket's refill clock back by whole intervals. */
+    const age = async (intervals: number) => {
+      const state = await backend.getTokenBucketState(KEY, config);
+      await backend.hset(KEY, {
+        lastUpdate: state.lastUpdate - intervals * config.interval,
+      });
+    };
+
+    it("charges a debit for what the claim under-reserved", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      expect(await settle(30)).toEqual([
+        { key: KEY, settled: true, applied: 20, unapplied: 0 },
+      ]);
+      expect(await balance()).toBe(70);
+    });
+
+    it("hands back what the claim over-reserved", async () => {
+      await backend.acquireTokens(KEY, 50, config, mark());
+      expect((await settle(10))[0]).toMatchObject({ applied: -40 });
+      expect(await balance()).toBe(90);
+    });
+
+    it("applies once however many times it is asked", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      await settle(30);
+      expect((await settle(30))[0]).toMatchObject({
+        settled: false,
+        applied: 0,
+      });
+      expect(await balance()).toBe(70);
+    });
+
+    it("leaves no mark unless the claim asked for one", async () => {
+      await backend.acquireTokens(KEY, 10, config);
+      expect((await settle(30))[0].settled).toBe(false);
+      expect(await balance()).toBe(90);
+    });
+
+    it("leaves no mark for a claim that was refused", async () => {
+      await backend.acquireTokens(KEY, 100, config);
+      await backend.acquireTokens(KEY, 10, config, mark());
+      expect((await settle(0))[0].settled).toBe(false);
+    });
+
+    it("stops a debit at zero by default and reports the rest", async () => {
+      await backend.acquireTokens(KEY, 90, config, mark());
+      expect((await settle(200))[0]).toMatchObject({
+        applied: 10,
+        unapplied: 100,
+      });
+      expect(await balance()).toBe(0);
+    });
+
+    it("takes the balance into debt as far as maxDebt allows", async () => {
+      await backend.acquireTokens(KEY, 90, config, mark());
+      expect((await settle(200, 50))[0]).toMatchObject({
+        applied: 60,
+        unapplied: 50,
+      });
+      expect(await balance()).toBe(-50);
+    });
+
+    it("forgives a debit the bucket has already refilled past", async () => {
+      // Refill to the ceiling discards 95: had the extra 40 been charged at the
+      // claim, that discarded refill would have paid it off.
+      await backend.acquireTokens(KEY, 5, config, mark());
+      await age(1);
+      expect((await settle(45))[0]).toMatchObject({ applied: 0 });
+      expect(await balance()).toBe(100);
+    });
+
+    it("charges only the part of a debit the discarded refill did not cover", async () => {
+      // 60 claimed leaves 40; one interval adds 100, of which 40 is discarded.
+      // A debit of 50 is reduced by that 40 to 10.
+      await backend.acquireTokens(KEY, 60, config, mark());
+      await age(1);
+      expect((await settle(110))[0]).toMatchObject({ applied: 10 });
+      expect(await balance()).toBe(90);
+    });
+
+    it("charges a late debit in full when the bucket filled without discarding", async () => {
+      // Claiming the whole bucket and refilling one interval lands exactly on the
+      // ceiling, discarding nothing — so the debit still counts in full.
+      await backend.acquireTokens(KEY, 100, config, mark());
+      await age(1);
+      expect((await settle(130))[0]).toMatchObject({ applied: 30 });
+      expect(await balance()).toBe(70);
+    });
+
+    it("drops a credit once the bucket has filled since the claim", async () => {
+      await backend.acquireTokens(KEY, 60, config, mark());
+      await age(1);
+      await backend.acquireTokens(KEY, 50, config);
+      expect((await settle(0))[0]).toMatchObject({
+        settled: true,
+        applied: 0,
+      });
+      expect(await balance()).toBe(50);
+    });
+
+    it("applies nothing across a freeze emptying the bucket", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      await backend.emptyTokenBucket!(KEY, config);
+      expect((await settle(80))[0]).toMatchObject({
+        settled: true,
+        applied: 0,
+      });
+      expect(await balance()).toBe(0);
+    });
+
+    it("applies nothing across a reset", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      await backend.resetTokenBucket(KEY, config.maxTokens);
+      expect((await settle(0))[0].applied).toBe(0);
+      expect(await balance()).toBe(100);
+    });
+
+    it("applies nothing to a bucket that expired since the claim", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      await backend.del(KEY);
+      expect((await settle(80))[0]).toMatchObject({
+        settled: true,
+        applied: 0,
+      });
+    });
+
+    it("refuses an unusable actual without consuming the mark", async () => {
+      await backend.acquireTokens(KEY, 10, config, mark());
+      expect((await settle(-1))[0].settled).toBe(false);
+      expect((await settle(NaN))[0].settled).toBe(false);
+      expect((await settle(30))[0]).toMatchObject({ applied: 20 });
+    });
+
+    it("keeps a balance already in debt when a freeze empties the bucket", async () => {
+      await backend.acquireTokens(KEY, 90, config, mark());
+      await settle(150, 100);
+      expect(await balance()).toBe(-50);
+      await backend.emptyTokenBucket!(KEY, config);
+      expect(await balance()).toBe(-50);
+    });
+
+    it("waits out a debt before admitting again", async () => {
+      await backend.acquireTokens(KEY, 100, config, mark());
+      await settle(150, 100);
+      const refused = await backend.acquireTokens(KEY, 1, config);
+      expect(refused.acquired).toBe(false);
+      // 51 tokens short, and one interval adds 100.
+      expect(refused.waitTime).toBeGreaterThan(0);
+      expect(refused.waitTime).toBeLessThanOrEqual(config.interval);
+    });
+
+    it("leaves a mark from the fast path", async () => {
+      expect(
+        await backend.tryAdmitImmediately(
+          "st:queue",
+          KEY,
+          "st:freeze",
+          10,
+          config,
+          86400,
+          mark()
+        )
+      ).toBe(true);
+      expect((await settle(30))[0]).toMatchObject({ applied: 20 });
+    });
+
+    it("leaves a mark from a multi-limit claim, on the bucket that asked", async () => {
+      const other = "st:other";
+      expect(
+        (
+          await backend.acquireMultiLimit!([
+            { kind: "tokenBucket", key: KEY, cost: 10, config, mark: mark() },
+            { kind: "tokenBucket", key: other, cost: 1, config },
+          ])
+        ).acquired
+      ).toBe(true);
+      const results = await backend.settleTokens!([
+        { key: KEY, markId: "a1", actual: 30, config, maxDebt: 0 },
+        { key: other, markId: "a1", actual: 5, config, maxDebt: 0 },
+      ]);
+      expect(results).toEqual([
+        { key: KEY, settled: true, applied: 20, unapplied: 0 },
+        { key: other, settled: false, applied: 0, unapplied: 0 },
+      ]);
+    });
+
+    it("settles nothing for an empty list", async () => {
+      expect(await backend.settleTokens!([])).toEqual([]);
     });
   });
 
@@ -827,6 +1031,7 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         retries: number;
         timestamp: number;
         grantId: string;
+        cost: RequestCost;
       }> = {}
     ) =>
       backend.addRequest(QUEUE, PREFIX, {
@@ -835,7 +1040,7 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         requestName: "r",
         status: "pending",
         priority: overrides.priority ?? 5,
-        cost: 1,
+        cost: overrides.cost ?? 1,
         retries: overrides.retries ?? 0,
         timestamp: overrides.timestamp ?? Date.now(),
         grantId: overrides.grantId,
@@ -911,6 +1116,41 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         pending: 1,
         inProgress: 1,
         totalCost: 2,
+        costByLimit: {},
+      });
+    });
+
+    it("totals per-limit costs by limit, apart from number costs", async () => {
+      await add("number", { cost: 2 });
+      await add("tokens", { cost: { rpm: 1, otpm: 400 } });
+      await add("more", { cost: { rpm: 1, otpm: 100, itpm: 0 } });
+      expect(await backend.getQueueStats(QUEUE, PREFIX)).toEqual({
+        pending: 3,
+        inProgress: 0,
+        totalCost: 2,
+        costByLimit: { rpm: 2, otpm: 500, itpm: 0 },
+      });
+    });
+
+    it("round-trips a per-limit cost", async () => {
+      await add("tokens", { cost: { rpm: 1, otpm: 0.5 } });
+      expect((await backend.getRequest(PREFIX, "tokens"))?.cost).toEqual({
+        rpm: 1,
+        otpm: 0.5,
+      });
+    });
+
+    it("reads a corrupt per-limit cost as unspendable, not as a cost of 1", async () => {
+      await add("broken", { cost: { rpm: 1 } });
+      await backend.hset(`${PREFIX}:broken`, { cost: "{not json" });
+
+      // Admission refuses NaN with a reason; reading 1 instead would charge one
+      // token against a token budget and send the request.
+      expect((await backend.getRequest(PREFIX, "broken"))?.cost).toBeNaN();
+      // And the stats read survives it, counting it toward nothing.
+      expect(await backend.getQueueStats(QUEUE, PREFIX)).toMatchObject({
+        totalCost: 0,
+        costByLimit: {},
       });
     });
 
@@ -960,6 +1200,7 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         pending: 0,
         inProgress: 0,
         totalCost: 0,
+        costByLimit: {},
       });
     });
 
@@ -1929,16 +2170,16 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
     const bucket = { maxTokens: 2, tokensToAdd: 2, interval: 60_000 };
     const slots = { maxConcurrency: 1, requestTtl: 60_000 };
     const specs = (slotId: string): MultiLimitSpec[] => [
-      { kind: "tokenBucket", key: "ml:bucket", config: bucket },
-      { kind: "concurrency", key: "ml:slots", config: slots, slotId },
+      { kind: "tokenBucket", cost: 1, key: "ml:bucket", config: bucket },
+      { kind: "concurrency", cost: 1, key: "ml:slots", config: slots, slotId },
     ];
 
     it("claims every budget or none of them", async () => {
-      expect(await backend.acquireMultiLimit!(specs("a"), 1)).toMatchObject({
+      expect(await backend.acquireMultiLimit!(specs("a"))).toMatchObject({
         acquired: true,
       });
       // The slot ledger is full, so the bucket must not be spent either.
-      expect(await backend.acquireMultiLimit!(specs("b"), 1)).toMatchObject({
+      expect(await backend.acquireMultiLimit!(specs("b"))).toMatchObject({
         acquired: false,
         blockedBy: "ml:slots",
       });
@@ -1948,8 +2189,8 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
     });
 
     it("reports a wait of 0 when only a slot ledger declines", async () => {
-      await backend.acquireMultiLimit!(specs("a"), 1);
-      expect(await backend.acquireMultiLimit!(specs("b"), 1)).toEqual({
+      await backend.acquireMultiLimit!(specs("a"));
+      expect(await backend.acquireMultiLimit!(specs("b"))).toEqual({
         acquired: false,
         waitTime: 0,
         blockedBy: "ml:slots",
@@ -1957,8 +2198,8 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
     });
 
     it("hands back the tokens and the slot it claimed", async () => {
-      await backend.acquireMultiLimit!(specs("a"), 1);
-      await backend.releaseMultiLimit!(specs("a"), 1);
+      await backend.acquireMultiLimit!(specs("a"));
+      await backend.releaseMultiLimit!(specs("a"));
       expect(
         (await backend.getTokenBucketState("ml:bucket", bucket)).tokens
       ).toBe(2);
@@ -1970,12 +2211,12 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
 
     it("admits on the fast path only while nothing is queued", async () => {
       expect(
-        await backend.tryAdmitMultiLimit!("ml:q", ["ml:fz"], specs("a"), 1)
+        await backend.tryAdmitMultiLimit!("ml:q", ["ml:fz"], specs("a"))
       ).toBe(true);
-      await backend.releaseMultiLimit!(specs("a"), 1);
+      await backend.releaseMultiLimit!(specs("a"));
       await backend.addRequest("ml:q", "ml:m", queued("waiting"));
       expect(
-        await backend.tryAdmitMultiLimit!("ml:q", ["ml:fz"], specs("b"), 1)
+        await backend.tryAdmitMultiLimit!("ml:q", ["ml:fz"], specs("b"))
       ).toBe(false);
       expect(
         (await backend.getTokenBucketState("ml:bucket", bucket)).tokens
@@ -1985,7 +2226,7 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
     it("refuses the fast path while any of its freezes stands", async () => {
       await backend.armFreeze("ml:fz", (await backend.now()) + 60_000, 0);
       expect(
-        await backend.tryAdmitMultiLimit!("ml:q", ["ml:fz"], specs("a"), 1)
+        await backend.tryAdmitMultiLimit!("ml:q", ["ml:fz"], specs("a"))
       ).toBe(false);
     });
   });
@@ -2021,12 +2262,12 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
 
     it("admits as one of several budgets", async () => {
       const spec: MultiLimitSpec[] = [
-        { kind: "tokenBucket", key: "glacial", config: glacial },
+        { kind: "tokenBucket", cost: 1, key: "glacial", config: glacial },
       ];
-      expect(await backend.acquireMultiLimit!(spec, 1)).toMatchObject({
+      expect(await backend.acquireMultiLimit!(spec)).toMatchObject({
         acquired: true,
       });
-      expect(await backend.tryAdmitMultiLimit!("gq", [], spec, 1)).toBe(true);
+      expect(await backend.tryAdmitMultiLimit!("gq", [], spec)).toBe(true);
       expect(
         (await backend.getTokenBucketState("glacial", glacial)).tokens
       ).toBe(9_998);
@@ -2082,8 +2323,7 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         backend.tryAdmitMultiLimit!(
           "fq",
           [],
-          [{ kind: "tokenBucket", key: "fb", config: bucket }],
-          1,
+          [{ kind: "tokenBucket", cost: 1, key: "fb", config: bucket }],
           ttl
         )
       ).rejects.toThrow(RangeError);
@@ -2133,10 +2373,9 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
           await backend.tryAdmitConcurrency("lq", "lc", "lf", 1, "a", config)
         ).toBe(false);
         expect(
-          await backend.acquireMultiLimit!(
-            [{ kind: "concurrency", key: "lc", config, slotId: "a" }],
-            1
-          )
+          await backend.acquireMultiLimit!([
+            { kind: "concurrency", cost: 1, key: "lc", config, slotId: "a" },
+          ])
         ).toEqual({ acquired: false, error: refused.error });
         expect(
           (await backend.getConcurrencyState("lc", 60_000)).activeRequests
@@ -2162,10 +2401,9 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         ).toBe(false);
         expect(
           (
-            await backend.acquireMultiLimit!(
-              [{ kind: "tokenBucket", key: "mf", config }],
-              1
-            )
+            await backend.acquireMultiLimit!([
+              { kind: "tokenBucket", cost: 1, key: "mf", config },
+            ])
           ).error
         ).toContain(field);
       }
@@ -2307,6 +2545,7 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         pending: 1,
         inProgress: 0,
         totalCost: 1,
+        costByLimit: {},
       });
     });
 
@@ -2524,16 +2763,17 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       const specs: MultiLimitSpec[] = [
         {
           kind: "tokenBucket",
+          cost: 1,
           key: "rf:b",
           config: bucket,
           freezeKey: "rf:fz",
         },
       ];
-      await backend.acquireMultiLimit!(specs, 1);
+      await backend.acquireMultiLimit!(specs);
       await backend.armFreeze("rf:fz", await later(), 0, {
         emptiesBucket: false,
       });
-      await backend.releaseMultiLimit!(specs, 1);
+      await backend.releaseMultiLimit!(specs);
       expect(await tokens()).toBe("10");
     });
 
@@ -2541,14 +2781,15 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       const specs: MultiLimitSpec[] = [
         {
           kind: "tokenBucket",
+          cost: 1,
           key: "rf:b",
           config: bucket,
           freezeKey: "rf:fz",
         },
       ];
-      await backend.acquireMultiLimit!(specs, 1);
+      await backend.acquireMultiLimit!(specs);
       await backend.armFreeze("rf:fz", await later(), 2);
-      await backend.releaseMultiLimit!(specs, 1);
+      await backend.releaseMultiLimit!(specs);
       expect(await tokens()).toBe("9");
     });
   });
@@ -2563,8 +2804,8 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       expect((await backend.hgetall(key)).tokens).toBe("0");
     };
     const tokens = async (key: string) => (await backend.hgetall(key)).tokens;
-    const specs = (key: string): MultiLimitSpec[] => [
-      { kind: "tokenBucket", key, config: bucket },
+    const specs = (key: string, cost = 1): MultiLimitSpec[] => [
+      { kind: "tokenBucket", key, cost, config: bucket },
     ];
     const costs: Array<[string, number]> = [
       ["NaN", NaN],
@@ -2599,12 +2840,12 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       async (label, cost) => {
         const key = `uk:ml:${label}`;
         await drained(key);
-        expect(await backend.acquireMultiLimit!(specs(key), cost)).toEqual({
+        expect(await backend.acquireMultiLimit!(specs(key, cost))).toEqual({
           acquired: false,
           error: COST_ERROR,
         });
         expect(
-          await backend.tryAdmitMultiLimit!("uk:q", [], specs(key), cost)
+          await backend.tryAdmitMultiLimit!("uk:q", [], specs(key, cost))
         ).toBe(false);
         expect(await tokens(key)).toBe("0");
       }
@@ -2615,7 +2856,7 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       async (label, cost) => {
         const key = `uk:rel:${label}`;
         await drained(key);
-        await backend.releaseMultiLimit!(specs(key), cost);
+        await backend.releaseMultiLimit!(specs(key, cost));
         expect(await tokens(key)).toBe("0");
       }
     );
@@ -2628,16 +2869,18 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
       {
         kind: "tokenBucket",
         key: "e:bucket",
+        cost: 1,
         config: { maxTokens: 5, tokensToAdd: 1, interval: 1000 },
       },
       {
         kind: "concurrency",
         key: "e:slots",
+        cost: 1,
         config: { maxConcurrency: NaN, requestTtl: 60_000 },
         slotId: "a",
       },
     ];
-    expect(await backend.tryAdmitMultiLimit!("e:q", [], specs, 1)).toBe(false);
+    expect(await backend.tryAdmitMultiLimit!("e:q", [], specs)).toBe(false);
     expect(await backend.hgetall("e:bucket")).toEqual({});
   });
 
@@ -2735,7 +2978,7 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
         lastUpdate: String(await backend.now()),
       });
     const one = (key: string, config: typeof plain): MultiLimitSpec[] => [
-      { kind: "tokenBucket", key, config },
+      { kind: "tokenBucket", key, cost: 1, config },
     ];
 
     it("reports an infinite wait for a refill too small to measure", async () => {
@@ -2748,16 +2991,14 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
     });
 
     it("reports an infinite wait across several budgets for a refill too small to measure", async () => {
-      await backend.acquireMultiLimit!(one("iw:mtiny", tiny), 1);
-      expect(
-        await backend.acquireMultiLimit!(one("iw:mtiny", tiny), 1)
-      ).toEqual({
+      await backend.acquireMultiLimit!(one("iw:mtiny", tiny));
+      expect(await backend.acquireMultiLimit!(one("iw:mtiny", tiny))).toEqual({
         acquired: false,
         waitTime: Infinity,
         blockedBy: "iw:mtiny",
       });
       expect(
-        await backend.tryAdmitMultiLimit!("iw:q", [], one("iw:mtiny", tiny), 1)
+        await backend.tryAdmitMultiLimit!("iw:q", [], one("iw:mtiny", tiny))
       ).toBe(false);
     });
 
@@ -2772,9 +3013,7 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
 
     it("reports an infinite wait across several budgets for a stored balance of -1e308", async () => {
       await plant("iw:mneg");
-      expect(
-        await backend.acquireMultiLimit!(one("iw:mneg", plain), 1)
-      ).toEqual({
+      expect(await backend.acquireMultiLimit!(one("iw:mneg", plain))).toEqual({
         acquired: false,
         waitTime: Infinity,
         blockedBy: "iw:mneg",

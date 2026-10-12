@@ -1,17 +1,8 @@
+import { assertUsableCost, describe } from "../utils/cost.js";
 import type { RequestOptions } from "../client/types.js";
 import { ConfigurationError } from "../errors.js";
 import type * as RequestTypes from "./types.js";
 import crypto from "node:crypto";
-
-/**
- * Renders a rejected value readably. `JSON.stringify(NaN)` is `"null"`, which
- * sends a caller looking for a null they never passed.
- */
-function describe(value: unknown): string {
-  if (typeof value === "number" && !Number.isFinite(value))
-    return String(value);
-  return JSON.stringify(value) ?? String(value);
-}
 
 /** Matches the priority band the backends clamp to when computing a queue score. */
 const MAX_PRIORITY = 10;
@@ -24,7 +15,7 @@ const MAX_PRIORITY = 10;
  */
 function assertUsableRequest(
   priority: number,
-  cost: number,
+  cost: unknown,
   grantId?: string,
   signal?: unknown
 ): void {
@@ -43,17 +34,7 @@ function assertUsableRequest(
       )}.`
     );
   }
-  // `Number.EPSILON` is the floor, not zero: a positive value below it cannot be
-  // subtracted from a balance of 1 or more in floating point — `tokens - cost`
-  // returns `tokens` — so `cost: 5e-324` would spend nothing and buy a request.
-  if (!Number.isFinite(cost) || cost < Number.EPSILON) {
-    throw new ConfigurationError(
-      "invalid_request_cost",
-      `cost must be a finite number of at least ${Number.EPSILON}. Received ${describe(
-        cost
-      )}.`
-    );
-  }
+  assertUsableCost(cost);
   if (
     !Number.isFinite(priority) ||
     priority < 0 ||
@@ -103,8 +84,8 @@ export default class Request {
   private priority: number;
   private clientName: string;
   private timestamp: number;
-  private cost: number;
-  private explicitCost?: number;
+  private cost: RequestTypes.RequestCost;
+  private explicitCost?: RequestTypes.RequestCost;
   private requestName: string;
   private status: RequestTypes.RequestStatus = "inQueue";
   private ownerId: string;
@@ -172,6 +153,7 @@ export default class Request {
       retries: this.retries,
       grantId: this.config.grantId,
       isThawRequest: this.isThawRequest,
+      ...(this.config.settle ? { settles: true } : {}),
       fastPath: this.fastPath,
       claimedKeys: this.claimedKeys,
       ownerId: this.ownerId,

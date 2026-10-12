@@ -1,5 +1,4 @@
-import type { RequestDoneData, RequestMetadata } from "../../request/types.js";
-import type { MultiLimitSpec } from "../../backend/types.js";
+import { ClientFrozenError, ConfigurationError } from "../../errors.js";
 import BaseClient from "../index.js";
 import {
   assertUsableRateLimits,
@@ -8,11 +7,24 @@ import {
   shortestRefillInterval,
   soleRateLimit,
 } from "../../utils/rateLimit.js";
+import type {
+  ClaimMark,
+  MultiLimitSpec,
+  SettleSpec,
+  TokenBucketConfig,
+} from "../../backend/types.js";
+import type {
+  RequestCost,
+  RequestDoneData,
+  RequestMetadata,
+} from "../../request/types.js";
 import {
-  ClientFrozenError,
-  ConfigurationError,
-  RequestCostExceedsBudgetError,
-} from "../../errors.js";
+  budgetLimitsFor,
+  claimedAmount,
+  costFor,
+  settledCostProblem,
+  unusableCostReason,
+} from "../../utils/cost.js";
 import type {
   AcquireTurnResult,
   ClientConstructorData,
@@ -126,13 +138,21 @@ class MeteredClient extends BaseClient {
 
   /**
    * Every budget a request must claim, in the order declared, each keyed by its
-   * own name under this client's namespace. A `noLimit` entry contributes
-   * nothing, which is what makes it legal here.
+   * own name under this client's namespace and charged its own share of `cost`.
+   * A `noLimit` entry contributes nothing, which is what makes it legal here.
+   *
+   * `forRelease` reads amounts through `claimedAmount`, so a limit added since
+   * the claim was made yields a spec rather than throwing; `claimedKeys` then
+   * keeps it out of the release.
    */
   public getLimitSpecs(
     grantId: string | undefined,
-    slotId: string
+    slotId: string,
+    cost: RequestCost,
+    forRelease = false
   ): MultiLimitSpec[] {
+    const amountFor = (name: string) =>
+      forRelease ? claimedAmount(cost, name) : costFor(cost, name);
     const specs: MultiLimitSpec[] = [];
     for (const limit of this.rateLimit) {
       if (limit.type === "requestLimit") {
@@ -140,6 +160,7 @@ class MeteredClient extends BaseClient {
           kind: "tokenBucket",
           key: this.getBucketKey(limit.name, grantId),
           freezeKey: this.getFreezeStateKey(grantId),
+          cost: amountFor(limit.name),
           config: this.bucketConfig(limit),
         });
       } else if (limit.type === "concurrencyLimit") {
@@ -147,6 +168,7 @@ class MeteredClient extends BaseClient {
           kind: "concurrency",
           key: this.getSlotKey(limit.name, grantId),
           freezeKey: this.getFreezeStateKey(grantId),
+          cost: amountFor(limit.name),
           config: {
             maxConcurrency: limit.maxConcurrency,
             requestTtl: this.requestTtl,
@@ -203,12 +225,15 @@ class MeteredClient extends BaseClient {
     if (sole?.type === "requestLimit") {
       const key = this.getBucketKey(sole.name);
       request.claimedKeys = [key];
+      const config = this.bucketConfig(sole);
       return this.backend.tryAdmitImmediately(
         this.getQueueKey(),
         key,
         this.getFreezeStateKey(),
-        cost,
-        this.bucketConfig(sole)
+        costFor(cost, sole.name),
+        config,
+        undefined,
+        this.markFor(request, config)
       );
     }
     if (sole?.type === "concurrencyLimit") {
@@ -218,7 +243,7 @@ class MeteredClient extends BaseClient {
         this.getQueueKey(),
         key,
         this.getFreezeStateKey(),
-        cost,
+        costFor(cost, sole.name),
         this.getSlotId(request),
         { maxConcurrency: sole.maxConcurrency, requestTtl: this.requestTtl }
       );
@@ -226,14 +251,16 @@ class MeteredClient extends BaseClient {
 
     const tryAdmit = this.backend.tryAdmitMultiLimit;
     if (!tryAdmit) return false;
-    const specs = this.getLimitSpecs(undefined, this.getSlotId(request));
+    const specs = this.withMarks(
+      request,
+      this.getLimitSpecs(undefined, this.getSlotId(request), cost)
+    );
     request.claimedKeys = specs.map((spec) => spec.key);
     return tryAdmit.call(
       this.backend,
       this.getQueueKey(),
       [this.getFreezeStateKey()],
-      specs,
-      cost
+      specs
     );
   }
 
@@ -261,22 +288,18 @@ class MeteredClient extends BaseClient {
     // keyspace write access can present a negative cost that `tokens - cost`
     // would add to the bucket. The origination check is policy; this one guards
     // the arithmetic.
-    if (!Number.isFinite(cost) || cost < Number.EPSILON) {
+    const unusable = unusableCostReason(cost);
+    if (unusable) {
       throw new ConfigurationError(
         "invalid_request_cost",
-        `Client ${this.name} refused a queued request whose cost is not spendable: ${String(
-          cost
-        )}.`
+        `Client ${this.name} refused a queued request whose cost is not spendable: ${unusable}`
       );
     }
 
-    // The ceiling is re-read here rather than checked once up front: a
-    // `rateLimitChange` can shrink the tightest budget below the cost of an
-    // already-queued request, which then reports "not acquired, wait 0ms" forever.
-    const ceiling = this.getCostCeilingForQueue();
-    if (ceiling !== undefined && cost > ceiling) {
-      throw new RequestCostExceedsBudgetError(this.name, cost, ceiling);
-    }
+    // Re-asked rather than cached: see getCostProblem. A budget shrunk below a
+    // queued cost would otherwise report "not acquired, wait 0ms" forever.
+    const problem = this.getCostProblemForQueue(cost);
+    if (problem) throw problem;
 
     // A 429 can land on another request between admission and here, and sending
     // this one would walk into a door that just closed.
@@ -314,7 +337,7 @@ class MeteredClient extends BaseClient {
   /** The claim itself, by whichever backend call fits this client's budgets. */
   private async claim(
     request: RequestMetadata,
-    cost: number
+    cost: RequestCost
   ): Promise<{ acquired: boolean; waitTime?: number; error?: string }> {
     const sole = this.sole;
     const { grantId } = request;
@@ -322,7 +345,13 @@ class MeteredClient extends BaseClient {
     if (sole?.type === "requestLimit") {
       const key = this.getBucketKey(sole.name, grantId);
       request.claimedKeys = [key];
-      return this.backend.acquireTokens(key, cost, this.bucketConfig(sole));
+      const config = this.bucketConfig(sole);
+      return this.backend.acquireTokens(
+        key,
+        costFor(cost, sole.name),
+        config,
+        this.markFor(request, config)
+      );
     }
     if (sole?.type === "concurrencyLimit") {
       const config = {
@@ -332,6 +361,7 @@ class MeteredClient extends BaseClient {
       const key = this.getSlotKey(sole.name, grantId);
       request.claimedKeys = [key];
       const slotId = this.getSlotId(request);
+      const amount = costFor(cost, sole.name);
       // Claims only while the entry is still `inProgress`, in one operation. The
       // request can finish between the drain loop selecting it and this claim, and
       // admission excludes a request's own id from the occupancy sum — so a claim
@@ -343,11 +373,11 @@ class MeteredClient extends BaseClient {
             this.backend,
             key,
             this.getRequestMetadataKey(request.requestId),
-            cost,
+            amount,
             slotId,
             config
           )
-        : this.backend.acquireConcurrency(key, cost, slotId, config);
+        : this.backend.acquireConcurrency(key, amount, slotId, config);
     }
 
     const acquire = this.backend.acquireMultiLimit;
@@ -357,9 +387,103 @@ class MeteredClient extends BaseClient {
         `Client "${this.name}" declares several rate limits, which needs a backend implementing acquireMultiLimit.`
       );
     }
-    const specs = this.getLimitSpecs(grantId, this.getSlotId(request));
+    const specs = this.withMarks(
+      request,
+      this.getLimitSpecs(grantId, this.getSlotId(request), cost)
+    );
     request.claimedKeys = specs.map((spec) => spec.key);
-    return acquire.call(this.backend, specs, cost);
+    return acquire.call(this.backend, specs);
+  }
+
+  /**
+   * The mark a token-bucket claim leaves for a request that will settle, sized
+   * to `settleWindow` but never shorter than the bucket's refill from empty —
+   * until then the claim still shapes the balance a settlement corrects.
+   */
+  private markFor(
+    request: RequestMetadata,
+    config: TokenBucketConfig
+  ): ClaimMark | undefined {
+    if (!request.settles) return undefined;
+    const window = this.requestOptions.settleWindow;
+    const windowMs =
+      window !== undefined && Number.isFinite(window) && window > 0
+        ? window
+        : DEFAULT_SETTLE_WINDOW_MS;
+    const refillMs =
+      Math.ceil(config.maxTokens / config.tokensToAdd) * config.interval;
+    return {
+      id: this.getSlotId(request),
+      ttlSeconds: Math.ceil(Math.max(windowMs, refillMs) / 1000),
+    };
+  }
+
+  private withMarks(
+    request: RequestMetadata,
+    specs: MultiLimitSpec[]
+  ): MultiLimitSpec[] {
+    if (!request.settles) return specs;
+    return specs.map((spec) =>
+      spec.kind === "tokenBucket"
+        ? { ...spec, mark: this.markFor(request, spec.config) }
+        : spec
+    );
+  }
+
+  /**
+   * Corrects what an attempt claimed to what its response reported. Runs on the
+   * replica that sent the request, against the buckets the attempt claimed from;
+   * the backend reads each claim's mark, so a repeat applies nothing.
+   *
+   * A result that names the wrong limits is logged and dropped rather than
+   * thrown: the vendor has already answered, and the caller must not see a
+   * failure for a request that succeeded.
+   */
+  public async settleAttempt(
+    request: RequestMetadata,
+    settled: RequestCost
+  ): Promise<void> {
+    const settleTokens = this.backend.settleTokens;
+    if (!settleTokens) return;
+    const problem = settledCostProblem(
+      settled,
+      budgetLimitsFor(this.rateLimit) ?? []
+    );
+    if (problem) {
+      this.logger.error(
+        `Client ${this.name} | request ${request.requestId} was not settled: ${problem}`
+      );
+      return;
+    }
+
+    const markId = this.getSlotId(request);
+    const specs: SettleSpec[] = [];
+    for (const limit of this.rateLimit) {
+      if (limit.type !== "requestLimit") continue;
+      const key = this.getBucketKey(limit.name, request.grantId);
+      if (!wasClaimed(request, key)) continue;
+      specs.push({
+        key,
+        markId,
+        actual: costFor(settled, limit.name),
+        config: this.bucketConfig(limit),
+        maxDebt: limit.maxDebt ?? 0,
+      });
+    }
+    if (!specs.length) return;
+
+    const results = await settleTokens.call(this.backend, specs);
+    for (const result of results) {
+      if (result.unapplied > 0) {
+        this.logger.warn(
+          `Client ${this.name} | request ${request.requestId} under-reserved ${result.key} by ${result.unapplied} more than maxDebt lets the balance absorb; raise its cost or maxDebt`
+        );
+      }
+    }
+    // A credit is capacity no booked wake-up knows about.
+    if (results.some((result) => result.applied < 0)) {
+      await this.notifyRequestAdded();
+    }
   }
 
   /**
@@ -372,10 +496,10 @@ class MeteredClient extends BaseClient {
    */
   private async releaseClaim(
     request: RequestMetadata,
-    cost: number
+    cost: RequestCost
   ): Promise<void> {
     const slotId = this.getSlotId(request);
-    const specs = this.getLimitSpecs(request.grantId, slotId);
+    const specs = this.getLimitSpecs(request.grantId, slotId, cost, true);
     await this.releaseStaleSlots(request, specs, slotId);
     const claimed = specs.filter((spec) => wasClaimed(request, spec.key));
     if (claimed.length === 0) return;
@@ -385,7 +509,7 @@ class MeteredClient extends BaseClient {
       if (!this.backend.refundTokens) return;
       await this.backend.refundTokens(
         claimed[0].key,
-        cost,
+        claimed[0].cost,
         sole.maxTokens,
         this.getFreezeStateKey(request.grantId)
       );
@@ -398,7 +522,7 @@ class MeteredClient extends BaseClient {
     // The freeze key always goes along: whether the standing freeze emptied
     // the buckets is recorded on the freeze itself (`emptiesBucket`), and the
     // limits in force now may not be the ones in force when it was armed.
-    await this.backend.releaseMultiLimit?.(claimed, cost);
+    await this.backend.releaseMultiLimit?.(claimed);
   }
 
   /** Whether a freeze empties a bucket here; see `handleFreezeOwnTypeRequests`. */
@@ -484,7 +608,7 @@ class MeteredClient extends BaseClient {
         ? { ...data, retries: Math.max(0, data.retries - 1) }
         : data;
     const slotId = this.getSlotId(attempt);
-    const specs = this.getLimitSpecs(data.grantId, slotId);
+    const specs = this.getLimitSpecs(data.grantId, slotId, data.cost, true);
     await this.releaseStaleSlots(data, specs, slotId);
     for (const spec of specs) {
       if (spec.kind !== "concurrency" || !wasClaimed(data, spec.key)) continue;
@@ -521,7 +645,12 @@ class MeteredClient extends BaseClient {
     )!;
     // Keyed by grant so an isolated grant's freeze empties its own bucket rather
     // than the client-level one.
-    await this.backend.hset(this.getBucketKey(bucket.name, grantId), {
+    const key = this.getBucketKey(bucket.name, grantId);
+    if (this.backend.emptyTokenBucket) {
+      await this.backend.emptyTokenBucket(key, this.bucketConfig(bucket));
+      return;
+    }
+    await this.backend.hset(key, {
       tokens: 0,
       lastUpdate: await this.backend.now(),
     });
@@ -591,6 +720,9 @@ class MeteredClient extends BaseClient {
 }
 
 /** True unless the attempt recorded its claims and this key is not among them. */
+/** See `RequestOptions.settleWindow`. */
+const DEFAULT_SETTLE_WINDOW_MS = 900_000;
+
 function wasClaimed(request: RequestMetadata, key: string): boolean {
   return request.claimedKeys?.includes(key) ?? true;
 }

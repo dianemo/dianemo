@@ -1,7 +1,32 @@
-import type { AcquireTokensResult, TokenBucketConfig } from "@dianemo/core";
-import { normalizeTtlSeconds, parseFiniteStored } from "@dianemo/core";
+import { KeyIndex, wire } from "./multiLimit.js";
 import { parseLuaNumber } from "../luaNumber.js";
 import type { Ctx } from "../context.js";
+import type {
+  AcquireTokensResult,
+  ClaimMark,
+  SettleResult,
+  SettleSpec,
+  TokenBucketConfig,
+} from "@dianemo/core";
+import {
+  claimMarkKey,
+  normalizeTtlSeconds,
+  parseFiniteStored,
+} from "@dianemo/core";
+
+/**
+ * A mark's key and lifetime as the scripts take them: an empty key and no
+ * lifetime when the claim asked for none. Normalised before the script runs,
+ * which spends before it writes the mark — a TTL Redis rejects would raise with
+ * the budget already gone.
+ */
+function markArgs(bucketKey: string, mark?: ClaimMark): [string, number] {
+  if (!mark) return ["", 0];
+  return [
+    claimMarkKey(bucketKey, mark.id),
+    normalizeTtlSeconds(mark.ttlSeconds),
+  ];
+}
 
 /** Token-bucket operations. Twin of the memory backend's token-bucket section. */
 export function tokenBucketOps(ctx: Ctx) {
@@ -16,22 +41,26 @@ export function tokenBucketOps(ctx: Ctx) {
       freezeKey: string,
       cost: number,
       config: TokenBucketConfig,
-      ttl = 86400
+      ttl = 86400,
+      mark?: ClaimMark
     ): Promise<boolean> {
       // Normalised here rather than left to the script, which spends the tokens
       // before its EXPIRE: a TTL Redis rejects would raise with the budget
       // already gone and nothing on this path to refund it.
       const ttlSeconds = normalizeTtlSeconds(ttl);
+      const [markKey, markTtl] = markArgs(bucketKey, mark);
       const result = await ctx.run(
         "dianemoTryAdmitImmediately",
         queueKey,
         bucketKey,
         freezeKey,
+        markKey,
         cost,
         config.maxTokens,
         config.tokensToAdd,
         config.interval,
-        ttlSeconds
+        ttlSeconds,
+        markTtl
       );
       return result === 1;
     },
@@ -39,16 +68,20 @@ export function tokenBucketOps(ctx: Ctx) {
     async acquireTokens(
       key: string,
       cost: number,
-      config: TokenBucketConfig
+      config: TokenBucketConfig,
+      mark?: ClaimMark
     ): Promise<AcquireTokensResult> {
+      const [markKey, markTtl] = markArgs(key, mark);
       const result = await ctx.run(
         "dianemoTokenBucket",
         key,
+        markKey,
         cost,
         config.maxTokens,
         config.tokensToAdd,
         config.interval,
-        86400 // TTL for the key
+        86400, // TTL for the key
+        markTtl
       );
 
       const parsed = JSON.parse(result as string) as AcquireTokensResult;
@@ -124,6 +157,46 @@ export function tokenBucketOps(ctx: Ctx) {
      */
     async resetTokenBucket(key: string, maxTokens: number): Promise<void> {
       await ctx.run("dianemoResetTokenBucket", key, maxTokens);
+    },
+
+    async emptyTokenBucket(
+      key: string,
+      config: TokenBucketConfig
+    ): Promise<void> {
+      await ctx.run(
+        "dianemoEmptyTokenBucket",
+        key,
+        wire(config.maxTokens),
+        wire(config.tokensToAdd),
+        wire(config.interval),
+        86400
+      );
+    },
+
+    async settleTokens(specs: SettleSpec[]): Promise<SettleResult[]> {
+      // An empty list would come back from cjson as `{}`, not `[]`.
+      if (specs.length === 0) return [];
+      const index = new KeyIndex();
+      const entries = specs.map((spec) => ({
+        k: index.of(spec.key),
+        mk: index.of(claimMarkKey(spec.key, spec.markId)),
+        actual: wire(spec.actual),
+        maxTokens: wire(spec.config.maxTokens),
+        tokensToAdd: wire(spec.config.tokensToAdd),
+        interval: wire(spec.config.interval),
+        maxDebt: wire(spec.maxDebt),
+      }));
+      const result = await ctx.runVariadic(
+        "dianemoSettleTokens",
+        index.keys,
+        JSON.stringify(entries),
+        86400
+      );
+      const parsed = JSON.parse(result as string) as Omit<
+        SettleResult,
+        "key"
+      >[];
+      return specs.map((spec, i) => ({ key: spec.key, ...parsed[i] }));
     },
 
     /**

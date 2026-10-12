@@ -1,5 +1,9 @@
 import type { QueuedRequest } from "@dianemo/core";
-import { parsePriority } from "@dianemo/core";
+import {
+  formatStoredCost,
+  parsePriority,
+  parseStoredCost,
+} from "@dianemo/core";
 
 /**
  * The one place a queue entry crosses between a `QueuedRequest` and the Redis
@@ -52,11 +56,12 @@ export function decodeRequest(
     requestName: metadata.requestName,
     status: metadata.status as "pending" | "inProgress",
     priority: parsePriority(metadata.priority),
-    cost: parseFloat(metadata.cost) || 1,
+    cost: parseStoredCost(metadata.cost),
     retries: parseInt(metadata.retries, 10) || 0,
     timestamp: parseInt(metadata.timestamp, 10) || 0,
     grantId: metadata.grantId || undefined,
     isThawRequest: metadata.isThawRequest === "true",
+    ...(metadata.settles === "true" ? { settles: true } : {}),
     ownerId: metadata.ownerId || "",
   };
 }
@@ -69,12 +74,13 @@ export function encodeRequestFields(request: QueuedRequest): string[] {
     requestName: request.requestName,
     status: request.status,
     priority: request.priority.toString(),
-    cost: request.cost.toString(),
+    cost: formatStoredCost(request.cost),
     retries: request.retries.toString(),
     timestamp: request.timestamp.toString(),
     grantId: request.grantId || "",
     isThawRequest: request.isThawRequest ? "true" : "false",
     ownerId: request.ownerId,
+    ...(request.settles ? { settles: "true" } : {}),
   };
   const flat: string[] = [];
   for (const [k, v] of Object.entries(fields)) flat.push(k, v);

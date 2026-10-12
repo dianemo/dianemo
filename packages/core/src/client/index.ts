@@ -1,8 +1,7 @@
-import type { RequestDoneData, RequestMetadata } from "../request/types.js";
 import { ClientUnavailableError, NotOAuth2ClientError } from "../errors.js";
-import { costCeilingFor, normalizeRateLimit } from "../utils/rateLimit.js";
 import { isCredentialWriteRetired } from "./methods/authenticate.js";
 import { REQUEST_TOMBSTONE_TTL_SECONDS } from "../backend/ttl.js";
+import { normalizeRateLimit } from "../utils/rateLimit.js";
 import processRequests from "./methods/processRequests.js";
 import type { QueuedRequest } from "../backend/types.js";
 import handleRequest from "./methods/handleRequest.js";
@@ -17,10 +16,25 @@ import {
   DEFAULT_REFRESH_TOKEN_TTL_SECONDS,
 } from "../utils/credentialTtl.js";
 import type {
+  RequestCost,
+  RequestDoneData,
+  RequestMetadata,
+} from "../request/types.js";
+import type {
   DianemoBackend,
   FreezeState,
   MultiLimitSpec,
 } from "../backend/types.js";
+import {
+  budgetLimitsFor,
+  costFor,
+  costProblem,
+  type MeteredLimit,
+} from "../utils/cost.js";
+import type {
+  RequestCostExceedsBudgetError,
+  RequestCostMismatchError,
+} from "../errors.js";
 
 /**
  * Shortest base duration for a client-wide freeze, used when the configured
@@ -132,6 +146,7 @@ abstract class BaseClient {
       // and cancels the probe budget a 429 was owed.
       thawRequestCount: usableThawRequestCount(retryOptions?.thawRequestCount),
       retryHandler: retryOptions?.retryHandler,
+      classifyError: retryOptions?.classifyError,
     };
     this.authData = data.client.authentication;
     this.key = data.key;
@@ -830,18 +845,31 @@ abstract class BaseClient {
   }
   private sensitiveHeaderNames?: ReadonlySet<string>;
 
-  /** Public view of {@link getCostCeiling}, for the drain loop. */
-  public getCostCeilingForQueue(): number | undefined {
-    return this.getCostCeiling();
+  /** Public view of {@link getCostProblem}, for the drain loop. */
+  public getCostProblemForQueue(
+    cost: RequestCost
+  ): RequestCostMismatchError | RequestCostExceedsBudgetError | undefined {
+    return this.getCostProblem(cost);
   }
 
   /**
-   * The largest `cost` this client could ever admit, or undefined when it has no
-   * ceiling. A `sharedLimit` client answers for its parent, whose budget it
-   * spends; `noLimit` has none, and several limits are bounded by the tightest.
+   * Why this client could never admit `cost`, or undefined when it could. A
+   * per-limit cost must name exactly the metered limits, and each amount must fit
+   * its own limit's ceiling. A `sharedLimit` client answers for its parent, whose
+   * budget it spends; `noLimit` admits any number.
+   *
+   * Asked again whenever a queued request is considered, not only where it was
+   * made: a `rateLimitChange` can rename a limit or shrink a ceiling under it.
    */
-  protected getCostCeiling(): number | undefined {
-    return costCeilingFor(this.rateLimit, () => this.getParentRateLimit?.());
+  protected getCostProblem(
+    cost: RequestCost
+  ): RequestCostMismatchError | RequestCostExceedsBudgetError | undefined {
+    return costProblem(this.name, cost, this.getBudgetLimits());
+  }
+
+  /** The metered limits a request here spends — the owner's, when shared. */
+  protected getBudgetLimits(): MeteredLimit[] | undefined {
+    return budgetLimitsFor(this.rateLimit, () => this.getParentRateLimit?.());
   }
 
   /**
@@ -857,9 +885,23 @@ abstract class BaseClient {
    */
   public getLimitSpecs(
     _grantId: string | undefined,
-    _slotId: string
+    _slotId: string,
+    _cost: RequestCost
   ): MultiLimitSpec[] {
     return [];
+  }
+
+  /**
+   * Corrects what an attempt claimed to what its response reported, for a
+   * request that declares `settle`. Nothing here meters a bucket of its own; a
+   * `sharedLimit` client settles against its owner's, which made the claim.
+   */
+  public async settleAttempt(
+    request: RequestMetadata,
+    settled: RequestCost
+  ): Promise<void> {
+    const owner = this.getBudgetOwnerClient?.();
+    if (owner && owner !== this) await owner.settleAttempt(request, settled);
   }
 
   /**
@@ -1526,15 +1568,32 @@ abstract class BaseClient {
       ? freezeState.thawRequestCount > 0 && !isFrozen
       : false;
 
+    const budgetNames = (this.getBudgetLimits() ?? []).map(
+      (limit) => limit.name
+    );
+    const emptyCosts = () =>
+      Object.fromEntries(budgetNames.map((name) => [name, 0]));
     const requestsInQueue: ClientTypes.ClientRequestsStatistics = {
       count: 0,
-      cost: 0,
+      cost: emptyCosts(),
       requests: [],
     };
     const requestsInProgress: ClientTypes.ClientRequestsStatistics = {
       count: 0,
-      cost: 0,
+      cost: emptyCosts(),
       requests: [],
+    };
+    // Per limit, because a request can spend different amounts against each. A
+    // stored cost that no longer names a limit — renamed while it waited —
+    // contributes nothing to that limit rather than failing the stats read.
+    const addCost = (
+      totals: Record<string, number>,
+      cost: RequestCost
+    ): void => {
+      for (const name of budgetNames) {
+        if (typeof cost !== "number" && !Object.hasOwn(cost, name)) continue;
+        totals[name] += costFor(cost, name);
+      }
     };
 
     for (const request of allRequests) {
@@ -1554,11 +1613,11 @@ abstract class BaseClient {
 
       if (request.status === "pending") {
         requestsInQueue.count++;
-        requestsInQueue.cost += request.cost;
+        addCost(requestsInQueue.cost, request.cost);
         requestsInQueue.requests.push(metadata);
       } else {
         requestsInProgress.count++;
-        requestsInProgress.cost += request.cost;
+        addCost(requestsInProgress.cost, request.cost);
         requestsInProgress.requests.push(metadata);
       }
     }

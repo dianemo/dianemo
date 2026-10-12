@@ -1,5 +1,5 @@
+import type { AxiosError, AxiosResponse, CreateAxiosDefaults } from "axios";
 import type { RequestConfig, RequestMetadata } from "../request/types.js";
-import type { AxiosResponse, CreateAxiosDefaults } from "axios";
 import type { DianemoBackend } from "../backend/types.js";
 import type { Logger } from "../logger.js";
 import type EventEmitter from "events";
@@ -272,6 +272,17 @@ export interface RequestLimitClientOptions {
   tokensToAdd: number;
   /** Bucket ceiling, and so the largest `cost` this client can ever admit. */
   maxTokens: number;
+  /**
+   * How far below zero settlement may take the balance when a response reports
+   * more than the request reserved. A request is admitted only once the bucket
+   * has refilled past its debt, so the client waits for the vendor's budget to
+   * recover instead of meeting a 429. Settlement only — admission never spends
+   * below zero. See `RequestConfig.settle`.
+   *
+   * **Default value: 0**, so an under-reservation beyond the balance goes
+   * uncharged and is logged.
+   */
+  maxDebt?: number;
 }
 
 /**
@@ -313,6 +324,16 @@ export interface RequestLimitClientStats extends RequestLimitClientOptions {
 }
 
 export interface RequestOptions {
+  /**
+   * How long after admission a request's `settle` may still correct what it
+   * claimed, in milliseconds. A token bucket's window is never shorter than the
+   * time it takes to refill from empty, since until then the claim still shapes
+   * its balance.
+   *
+   * Default: 900000 milliseconds (15 minutes), long enough for a non-streamed
+   * response that takes ten minutes to generate.
+   */
+  settleWindow?: number;
   /**
    * When cleaning up requests, how long until the request is counted as timed-out.
    *
@@ -364,6 +385,16 @@ export interface RetryOptions {
   /** Default: true. */
   retry5xxs: boolean;
   retryHandler?: RetryHandler;
+  /**
+   * Classifies a failure before the built-in rules do, deciding whether it is
+   * retried and whether it freezes the fleet. Return `undefined` to leave a
+   * failure to the built-in rules. Runs for every failed attempt, the last one
+   * included, since a freeze is about the upstream rather than this request.
+   *
+   * A throw is logged and the built-in rules decide. See
+   * docs/rate-limits/README.md#classifying-failures.
+   */
+  classifyError?: ErrorClassifier;
   /** Retried without freezing the fleet, unlike a 429 or 5xx. */
   retryStatusCodes: number[];
   /**
@@ -387,6 +418,22 @@ export type BackoffType = "exponential" | "linear";
  * classify itself. A retry granted here does not freeze the fleet.
  */
 export type RetryHandler = (error: unknown) => Promise<boolean> | boolean;
+
+/** What `classifyError` decides about a failed attempt. */
+export type ErrorDecision =
+  /** Terminal: the caller gets the error now, and nothing is frozen. */
+  | { action: "fail" }
+  /** Retry this request, within `maxRetries`, without freezing the fleet. */
+  | { action: "retry"; freeze?: false }
+  /**
+   * Retry this request and freeze the fleet. `freezeMs` is a floor on the
+   * freeze and the retry wait, like `retry-after`: the longer wins.
+   */
+  | { action: "retry"; freeze: true; freezeMs?: number };
+
+export type ErrorClassifier = (
+  error: AxiosError
+) => ErrorDecision | undefined | Promise<ErrorDecision | undefined>;
 
 /**
  * Last chance to change a request before it is sent. **Must return a config
@@ -422,7 +469,12 @@ export interface ClientStatistics {
 
 export interface ClientRequestsStatistics {
   count: number;
-  cost: number;
+  /**
+   * Total cost against each limit the client meters, by limit name. A number
+   * cost counts against every one of them; a client that meters nothing has no
+   * entries.
+   */
+  cost: Record<string, number>;
   requests: RequestMetadata[];
 }
 

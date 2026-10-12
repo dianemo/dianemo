@@ -231,22 +231,52 @@ end`,
  * runs even when no refill did: `maxTokens` can shrink under a stocked bucket
  * via `rateLimitChange`, and the old balance would otherwise stay spendable.
  *
- * Requires: `now`, `tokens`, `lastUpdate`, `interval`, `tokensToAdd`,
- * `maxTokens`. Mutates `tokens` and `lastUpdate`; declares `elapsed` and
- * `intervalsElapsed`.
+ * `overflow` totals the refill the clamp discards and `fills` counts the times
+ * the balance reaches the ceiling; settlement compares both against a claim
+ * mark. Every caller writes them back with `tokens`, never without — counted on
+ * a refill that is then thrown away, they would be counted again by the next.
+ * Twin of the memory backend's `refill`.
+ *
+ * Requires: `now`, `tokens`, `lastUpdate`, `overflow`, `fills`, `interval`,
+ * `tokensToAdd`, `maxTokens`. Mutates `tokens`, `lastUpdate`, `overflow` and
+ * `fills`; declares `belowCap`, `elapsed` and `intervalsElapsed`.
  */
 export const lazyRefill = (prefix = "  "): string =>
   indent(
-    `local elapsed = now - lastUpdate
+    `local belowCap = tokens < maxTokens
+local elapsed = now - lastUpdate
 if elapsed > 0 and interval > 0 then
   local intervalsElapsed = math.floor(elapsed / interval)
   if intervalsElapsed > 0 then
-    tokens = math.min(tokens + (intervalsElapsed * tokensToAdd), maxTokens)
+    tokens = tokens + (intervalsElapsed * tokensToAdd)
     lastUpdate = lastUpdate + (intervalsElapsed * interval)
   end
 end
 
-if tokens > maxTokens then tokens = maxTokens end`,
+if tokens > maxTokens then
+  overflow = overflow + (tokens - maxTokens)
+  tokens = maxTokens
+  fills = fills + 1
+elseif belowCap and tokens >= maxTokens then
+  fills = fills + 1
+end`,
+    prefix
+  );
+
+/**
+ * Declares `writeMark(markKey, ttl, claimed, overflow, fills, bucketKey)`, which
+ * records what a claim took and how far its bucket had got, for settlement.
+ * Twin of the memory backend's `writeMark`.
+ *
+ * Requires: `finiteNumber`. Declares `writeMark`.
+ */
+export const writeMarkFn = (prefix = "  "): string =>
+  indent(
+    `local function writeMark(markKey, ttl, claimed, overflow, fills, bucketKey)
+  local generation = finiteNumber(redis.call('HGET', bucketKey, 'generation'), 0)
+  redis.call('HSET', markKey, 'claimed', claimed, 'overflow', overflow, 'fills', fills, 'generation', generation)
+  redis.call('EXPIRE', markKey, ttl)
+end`,
     prefix
   );
 

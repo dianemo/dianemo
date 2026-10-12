@@ -1,6 +1,35 @@
-import type { AxiosRequestConfig, Method } from "axios";
+import type { AxiosRequestConfig, AxiosResponse, Method } from "axios";
 
 export type RequestStatus = "inQueue" | "inProgress";
+
+/**
+ * What a request spends: one amount charged to every limit the client declares,
+ * or an amount per limit, keyed by limit name.
+ *
+ * The keyed form must name every `requestLimit` and `concurrencyLimit` the client
+ * declares and nothing else. An entry may be 0 — an embeddings call that produces
+ * no output tokens — but at least one must be positive. A `sharedLimit` client
+ * names its owner's limits, since those are the budgets it spends.
+ */
+export type RequestCost = number | Readonly<Record<string, number>>;
+
+/** What one attempt came back with, as `settle` receives it. */
+export type AttemptOutcome =
+  | { response: AxiosResponse; error?: undefined }
+  | { response?: AxiosResponse; error: unknown };
+
+/**
+ * Reports what an attempt actually cost, once its response is in. Returns the
+ * same shape as `cost`, or `undefined` to let the claim stand — after a network
+ * error, say, where the vendor's charge is unknown.
+ *
+ * A keyed result must name every `requestLimit` the client declares and no
+ * `concurrencyLimit`: a slot is returned at completion whatever the response
+ * said. Entries may be 0.
+ */
+export type SettleFunction = (
+  outcome: AttemptOutcome
+) => RequestCost | undefined | Promise<RequestCost | undefined>;
 
 export interface RequestConfig<
   TRequestData = unknown,
@@ -21,12 +50,21 @@ export interface RequestConfig<
   metadata?: Record<string, unknown>;
   /**
    * Budget this request spends, for vendors that do not price every endpoint the
-   * same. Fractional costs spend fractionally, and cost decides what a request
-   * spends rather than where it sits in the queue.
+   * same — or, keyed by limit name, a different amount against each limit, as for
+   * an API that meters requests and tokens separately. Fractional costs spend
+   * fractionally, and cost decides what a request spends rather than where it
+   * sits in the queue. See {@link RequestCost}.
    *
    * **Default value: 1**
    */
-  cost?: number;
+  cost?: RequestCost;
+  /**
+   * Corrects what this request spent to what its response reports — for a
+   * vendor that meters usage known only afterwards, such as the tokens an AI
+   * response generated. Runs once per attempt, on the replica that sent it. See
+   * {@link SettleFunction} and docs/rate-limits/settlement.md.
+   */
+  settle?: SettleFunction;
   /**
    * Set by the handler before any `requestInterceptor` runs, and unique per
    * `handleRequest` call: every retry of that call carries the same id. A value
@@ -54,13 +92,13 @@ export interface RequestMetadata {
   priority: number;
   timestamp: number;
   clientName: string;
-  cost: number;
+  cost: RequestCost;
   /**
    * `cost` as the call site actually set it, undefined when it did not — which is how
    * the metrics path tells a cost-budgeted endpoint from a count-budgeted one. The
    * rate limiter uses the post-default `cost` above.
    */
-  explicitCost?: number;
+  explicitCost?: RequestCost;
   requestName: string;
   retries: number;
   grantId?: string;
@@ -68,6 +106,8 @@ export interface RequestMetadata {
   isThawRequest: boolean;
   /** Admitted without queueing; no queue entry exists for it. */
   fastPath?: boolean;
+  /** Declares `settle`, so its claim leaves a mark. See `QueuedRequest.settles`. */
+  settles?: boolean;
   /**
    * The budget keys this attempt claimed from, set by whoever claimed it.
    * Release and refund act on these rather than on the keys the client's

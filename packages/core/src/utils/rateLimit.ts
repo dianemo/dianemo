@@ -219,6 +219,12 @@ export function assertUsableBudget(
   if (!Number.isFinite(rateLimit.maxTokens) || rateLimit.maxTokens <= 0) {
     problems.push(`maxTokens must be greater than 0`);
   }
+  if (
+    rateLimit.maxDebt !== undefined &&
+    (!Number.isFinite(rateLimit.maxDebt) || rateLimit.maxDebt < 0)
+  ) {
+    problems.push(`maxDebt must be a finite number that is not negative`);
+  }
   if (!problems.length) return;
   throw new ConfigurationError(
     "invalid_rate_limit",
@@ -228,6 +234,9 @@ export function assertUsableBudget(
       maxTokens: rateLimit.maxTokens,
       tokensToAdd: rateLimit.tokensToAdd,
       interval: rateLimit.interval,
+      ...(rateLimit.maxDebt === undefined
+        ? {}
+        : { maxDebt: rateLimit.maxDebt }),
     })}.`
   );
 }
@@ -256,38 +265,6 @@ export function assertUsableConcurrency(
 
 function describeEntry(entryName?: string): string {
   return entryName === undefined ? "" : ` rate limit "${entryName}"`;
-}
-
-/**
- * The largest `cost` a config could ever admit, or undefined when nothing in it
- * imposes a ceiling. Several limits mean the tightest one decides.
- *
- * `resolveShared` answers for a `sharedLimit` entry, whose ceiling belongs to the
- * client that owns the budget; it returns undefined when that client is gone,
- * which is reported by the queue path rather than here.
- */
-export function costCeilingFor(
-  config: readonly NamedRateLimitData[],
-  resolveShared?: (
-    clientName: string
-  ) => readonly NamedRateLimitData[] | undefined
-): number | undefined {
-  let ceiling: number | undefined;
-  const consider = (value: number | undefined) => {
-    if (value === undefined) return;
-    ceiling = ceiling === undefined ? value : Math.min(ceiling, value);
-  };
-  for (const limit of config) {
-    if (limit.type === "requestLimit") consider(limit.maxTokens);
-    else if (limit.type === "concurrencyLimit") consider(limit.maxConcurrency);
-    else if (limit.type === "sharedLimit") {
-      const owner = resolveShared?.(limit.clientName);
-      // Not recursed through another `sharedLimit`: registration refuses a
-      // budget owner that is itself shared, so one hop always reaches the owner.
-      if (owner) consider(costCeilingFor(owner));
-    }
-  }
-  return ceiling;
 }
 
 /**

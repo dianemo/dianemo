@@ -255,6 +255,11 @@ refill interval, and on a client that owns its budgets so is the 429's retry
 wait. See
 [a zero back-off does not disarm it](rate-limits/README.md#a-zero-back-off-does-not-disarm-it).
 
+A response's `retry-after` sets the minimum for the freeze, and
+`retryOptions.classifyError` can fail a 429 without freezing anything or freeze
+on a status the built-in rules would not; see
+[classifying failures](rate-limits/README.md#classifying-failures).
+
 A claim handed back unsent — an aborted or abandoned request — is refunded even
 while a freeze stands, unless that freeze emptied the bucket, which only a 429
 on a client with exactly one `requestLimit` does.
@@ -413,7 +418,8 @@ if (typeof err.statusCode === "number" && typeof err.code === "string") {
 | `ClientConflictError`           | 409    | Duplicate client registration.                                                             |
 | `RequestTimeoutError`           | 408    | Queued past `cleanupTimeout` without being admitted.                                       |
 | `RequestAbortedError`           | 499    | The caller's `signal` fired before the request was sent.                                   |
-| `RequestCostExceedsBudgetError` | 400    | A request's `cost` exceeds its tightest `maxTokens` or `maxConcurrency`.                   |
+| `RequestCostExceedsBudgetError` | 400    | A request's `cost` exceeds a limit's `maxTokens` or `maxConcurrency`.                      |
+| `RequestCostMismatchError`      | 400    | A per-limit `cost` does not name exactly the limits the client meters.                     |
 | `NotOAuth2ClientError`          | 400    | Grant-token operations attempted on a client that is not OAuth2.                           |
 | `GrantRefreshTokenMissingError` | 400    | An OAuth2 grant was asked to refresh but has no stored refresh token.                      |
 | `NoResponseError`               | 500    | Defensive: the retry loop ended with no response and nothing to rethrow.                   |

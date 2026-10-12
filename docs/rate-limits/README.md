@@ -48,6 +48,24 @@ await handler.handleRequest({
 export can legitimately count as ten calls. `priority` exists so a backfill can
 be admitted behind interactive traffic instead of starving it.
 
+A number is charged to every limit the client declares. When the limits meter
+different things — an AI API limiting requests and tokens per minute — give an
+amount per limit instead, keyed by name:
+
+```ts
+cost: { rpm: 1, itpm: 1_200, otpm: 4_096 },
+```
+
+The object must name every `requestLimit` and `concurrencyLimit` the client
+declares and nothing else, or the request fails with
+`RequestCostMismatchError`. An entry may be `0` — an embeddings call spends no
+output tokens — but at least one must be positive. A single limit declared
+without a name is called `default`, and a `sharedLimit` client names its
+owner's limits, since those are the budgets it spends.
+
+When the true cost is only known from the response — the tokens an AI model
+generated — reserve an estimate and [settle](settlement.md) it afterwards.
+
 `priority` feeds one packed sorted-set score: priority first, then retry count,
 then arrival time; `cost` is not part of it. A retried request sorts ahead of a
 fresh one at equal priority, so work already part-done finishes rather than
@@ -112,3 +130,48 @@ single-probe thaw.
 So `retryBackoffBaseTime: 0` on a `noLimit` client gives you a request that
 retries immediately and a fleet that still stands down for a second. The
 retry wait and the freeze are separate numbers and are allowed to disagree.
+
+### `retry-after` sets the minimum
+
+When a failed response carries `retry-after` — seconds, or an HTTP date — it
+becomes the minimum for both the retry wait and the freeze. The back-off above
+still applies when it asks for longer, so repeated failures lengthen a freeze
+past what the header said. A wait is capped at 2^31-1 ms, about 24.8 days,
+the longest a Node timer holds.
+
+### Classifying failures
+
+Every 429 is retried and freezes the fleet; so is every 5xx. Some failures
+deserve neither. Anthropic's spend-cap 429 does not clear until the next month,
+and retrying it only refreezes the fleet on every request until then.
+`retryOptions.classifyError` decides before the built-in rules do:
+
+```ts
+retryOptions: {
+  classifyError: (error) => {
+    const body = error.response?.data as
+      | { error?: { details?: { error_code?: string } } }
+      | undefined;
+    return body?.error?.details?.error_code === "enforced_spend_limit_reached"
+      ? { action: "fail" }
+      : undefined;
+  },
+},
+```
+
+It returns one of:
+
+- **`{ action: "fail" }`**: the caller gets the error now, with no retry and no
+  freeze.
+- **`{ action: "retry" }`**: this request is retried within `maxRetries`, and
+  the fleet carries on.
+- **`{ action: "retry", freeze: true, freezeMs? }`**: retried, and the fleet
+  freezes. `freezeMs` is a minimum like `retry-after`: the longer of the two
+  wins. The freeze counts as a rate limit — emptying the bucket and owing thaw
+  probes — only when the status was 429.
+- **`undefined`**: the built-in rules decide.
+
+It runs on every failed attempt, the last included, because a freeze is about
+the upstream rather than the request. A `classifyError` that throws, or returns
+anything else, is logged and the built-in rules decide. `retryHandler` still
+runs for what the built-in rules leave to it.

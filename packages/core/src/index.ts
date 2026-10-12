@@ -89,6 +89,7 @@ export {
   NotOAuth2ClientError,
   GrantRefreshTokenMissingError,
   RequestCostExceedsBudgetError,
+  RequestCostMismatchError,
   RequestAbortedError,
   RequestError,
   getOriginalStatus,
@@ -108,8 +109,10 @@ export {
   QUEUE_SCORE_EPOCH_MS,
 } from "./backend/queueScore.js";
 export {
+  formatStoredCost,
   parseFiniteStored,
   parsePriority,
+  parseStoredCost,
   parseStoredNumber,
 } from "./backend/parseStored.js";
 export {
@@ -118,12 +121,14 @@ export {
   REDIS_MAX_TTL_SECONDS,
   REQUEST_TOMBSTONE_TTL_SECONDS,
 } from "./backend/ttl.js";
+export { claimMarkKey } from "./backend/settlement.js";
 export type {
   AcquireConcurrencyResult,
   AcquireMultiLimitResult,
   AcquireTokensResult,
   BatchOp,
   BatchOptions,
+  ClaimMark,
   ConcurrencyConfig,
   DianemoBackend,
   FreezeState,
@@ -131,6 +136,8 @@ export type {
   MultiLimitSpec,
   QueueStats,
   QueuedRequest,
+  SettleResult,
+  SettleSpec,
   TokenBucketConfig,
 } from "./backend/types.js";
 
@@ -147,7 +154,11 @@ export {
   type TryHandleRequestOptions,
 } from "./tryHandleRequest.js";
 
-export type { RequestConfig, RequestMetadata } from "./request/types.js";
+export type {
+  RequestConfig,
+  RequestCost,
+  RequestMetadata,
+} from "./request/types.js";
 export type {
   CreateClientData,
   RateLimitData,
@@ -160,6 +171,8 @@ export type {
   SharedLimitClientOptions,
   RateLimitStats,
   NamedRateLimitStats,
+  ErrorClassifier,
+  ErrorDecision,
 } from "./client/types.js";
 export type {
   RequestHandlerConstructorOptions,

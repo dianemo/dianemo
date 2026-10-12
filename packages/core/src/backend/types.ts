@@ -1,3 +1,5 @@
+import type { RequestCost } from "../request/types.js";
+
 /** A token bucket as the backend meters it: a `requestLimit` without its name. */
 export interface TokenBucketConfig {
   /** Bucket ceiling; a bucket with no stored state reads as this full. */
@@ -6,6 +8,45 @@ export interface TokenBucketConfig {
   tokensToAdd: number;
   /** ms between token additions */
   interval: number;
+}
+
+/**
+ * Asks a token-bucket claim to leave a mark a later settlement can find: what
+ * was claimed, and how far the bucket had got when it was. See
+ * docs/proposals/usage-based-limits.md#2-settlement.
+ */
+export interface ClaimMark {
+  /** Identifies the attempt; the mark lives at `claimMarkKey(bucketKey, id)`. */
+  id: string;
+  /** How long a settlement may arrive after the claim. */
+  ttlSeconds: number;
+}
+
+/** One bucket's share of a settlement. */
+export interface SettleSpec {
+  /** The bucket the attempt claimed from. */
+  key: string;
+  /** The `ClaimMark.id` the claim was made under. */
+  markId: string;
+  /** What the response says the attempt actually cost against this bucket. */
+  actual: number;
+  config: TokenBucketConfig;
+  /** How far below zero a debit may take the balance. */
+  maxDebt: number;
+}
+
+export interface SettleResult {
+  key: string;
+  /** False when no mark was found: expired, already settled, or never written. */
+  settled: boolean;
+  /**
+   * Change applied to the balance: positive for a debit, negative for a credit.
+   * Less than the difference from the claim when the bucket had already
+   * forgotten some of it — see the proposal.
+   */
+  applied: number;
+  /** Debit `maxDebt` would not let the balance absorb. */
+  unapplied: number;
 }
 
 /** A slot ledger as the backend meters it. */
@@ -72,8 +113,21 @@ export type MultiLimitSpec = {
    * `releaseMultiLimit` withholds a refund while it stands.
    */
   freezeKey?: string;
+  /**
+   * What the request spends against this budget. Per budget, not per claim,
+   * because a request can charge each limit differently — one request against
+   * a per-minute request limit, a thousand tokens against a token limit. May be
+   * 0, which this budget then admits without spending.
+   */
+  cost: number;
 } & (
-  | { kind: "tokenBucket"; key: string; config: TokenBucketConfig }
+  | {
+      kind: "tokenBucket";
+      key: string;
+      config: TokenBucketConfig;
+      /** Leave a mark for settlement, written only if the whole claim admits. */
+      mark?: ClaimMark;
+    }
   | {
       kind: "concurrency";
       key: string;
@@ -119,8 +173,11 @@ export interface QueuedRequest {
   status: "pending" | "inProgress";
   /** Higher served first. Part of the queue score, which clamps it to 0-10. */
   priority: number;
-  /** Budget spent on admission. Read back as 1 if zero or unparseable. */
-  cost: number;
+  /**
+   * Budget spent on admission: a number, or one amount per limit name. Stored
+   * through `formatStoredCost` and read back through `parseStoredCost`.
+   */
+  cost: RequestCost;
   /** Attempts already failed; more retries sort ahead. Part of the score. */
   retries: number;
   /** Arrival in epoch ms; earlier sorts ahead at equal priority and retries. */
@@ -131,6 +188,11 @@ export interface QueuedRequest {
   isThawRequest: boolean;
   /** Instance id of the replica that queued it, for orphan cleanup. */
   ownerId: string;
+  /**
+   * The request will settle its cost against its response, so whoever claims
+   * for it leaves a claim mark. Stored only when true.
+   */
+  settles?: boolean;
 }
 
 /** A client's or grant's freeze, as stored under its freeze key. */
@@ -145,7 +207,14 @@ export interface FreezeState {
 export interface QueueStats {
   pending: number;
   inProgress: number;
+  /** Summed over requests whose cost is a single number. */
   totalCost: number;
+  /**
+   * Summed per limit name over requests whose cost names its limits. Kept apart
+   * from `totalCost` because the backend does not know which limits a number
+   * applies to — the client does, and combines the two.
+   */
+  costByLimit: Record<string, number>;
 }
 
 /**
@@ -297,7 +366,8 @@ export interface DianemoBackend {
     freezeKey: string,
     cost: number,
     config: TokenBucketConfig,
-    ttl?: number
+    ttl?: number,
+    mark?: ClaimMark
   ): Promise<boolean>;
 
   /**
@@ -335,7 +405,8 @@ export interface DianemoBackend {
   // ------------------------------------------------------------ token bucket
 
   /**
-   * Spends `cost` from the bucket at `key` if its balance covers it.
+   * Spends `cost` from the bucket at `key` if its balance covers it, and leaves
+   * `mark` beside the bucket when it does.
    *
    * Refills lazily first, crediting `tokensToAdd` per whole `interval` elapsed
    * up to `maxTokens`; a bucket with no stored state reads as full. The refill
@@ -348,7 +419,8 @@ export interface DianemoBackend {
   acquireTokens(
     key: string,
     cost: number,
-    config: TokenBucketConfig
+    config: TokenBucketConfig,
+    mark?: ClaimMark
   ): Promise<AcquireTokensResult>;
   /**
    * The balance as {@link DianemoBackend.acquireTokens} would see it now,
@@ -359,7 +431,10 @@ export interface DianemoBackend {
     key: string,
     config: TokenBucketConfig
   ): Promise<{ tokens: number; lastUpdate: number }>;
-  /** Writes the bucket full at `maxTokens`, its refill clock restarted now. */
+  /**
+   * Writes the bucket full at `maxTokens`, its refill clock restarted now. This
+   * ends every outstanding settlement.
+   */
   resetTokenBucket(key: string, maxTokens: number): Promise<void>;
   /**
    * Returns budget claimed for a request that was never dispatched, up to
@@ -382,6 +457,29 @@ export interface DianemoBackend {
     freezeKey?: string
   ): Promise<void>;
 
+  // -------------------------------------------------------------- settlement
+
+  /**
+   * Empties a bucket for a freeze: to zero, or left where it is if already in
+   * debt, so a freeze never forgives what settlement charged. Ends every
+   * outstanding settlement on the bucket, as a reset does.
+   *
+   * Optional so an earlier backend still satisfies the interface; without it a
+   * client writes `tokens: 0` directly, and settlement is unavailable.
+   */
+  emptyTokenBucket?(key: string, config: TokenBucketConfig): Promise<void>;
+  /**
+   * Corrects each claim to what its response reported, in one operation.
+   *
+   * Reads and deletes each claim's mark, so a retried settlement applies once.
+   * A debit is reduced by the refill the bucket has discarded at its ceiling
+   * since the claim; a credit is dropped once the bucket has filled since, and
+   * both are dropped across an `emptyTokenBucket` or `resetTokenBucket`. The
+   * arithmetic:
+   * docs/proposals/usage-based-limits.md#settling-late-against-a-bucket-that-has-moved-on.
+   */
+  settleTokens?(specs: SettleSpec[]): Promise<SettleResult[]>;
+
   // ------------------------------------------------------------ several budgets
 
   /**
@@ -397,10 +495,7 @@ export interface DianemoBackend {
    * An unusable configuration is reported through `error` rather than thrown,
    * as {@link acquireTokens} does.
    */
-  acquireMultiLimit?(
-    specs: MultiLimitSpec[],
-    cost: number
-  ): Promise<AcquireMultiLimitResult>;
+  acquireMultiLimit?(specs: MultiLimitSpec[]): Promise<AcquireMultiLimitResult>;
   /**
    * Hands back what `acquireMultiLimit` claimed for a request that was never
    * dispatched. Token buckets are credited, up to each spec's
@@ -411,7 +506,7 @@ export interface DianemoBackend {
    * the bucket stands, matching {@link DianemoBackend.refundTokens}, as does a
    * cost that is negative or not finite. Slots are released regardless.
    */
-  releaseMultiLimit?(specs: MultiLimitSpec[], cost: number): Promise<void>;
+  releaseMultiLimit?(specs: MultiLimitSpec[]): Promise<void>;
   /**
    * The no-queue fast path for several budgets: admit only if nothing is queued,
    * none of `freezeKeys` stands or owes thaw probes, and every budget can be
@@ -423,7 +518,6 @@ export interface DianemoBackend {
     queueKey: string,
     freezeKeys: string[],
     specs: MultiLimitSpec[],
-    cost: number,
     ttl?: number
   ): Promise<boolean>;
 

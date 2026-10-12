@@ -1,3 +1,5 @@
+import type { RequestCost } from "../request/types.js";
+
 /**
  * Shared reads of numeric fields stored as strings, used by every backend.
  *
@@ -48,4 +50,42 @@ export function parseFiniteStored(
 ): number {
   const parsed = parseStoredNumber(raw, fallback);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/**
+ * A queued request's cost as the string both backends store: a number as
+ * itself, a per-limit cost as JSON. The two cannot be confused on the way back,
+ * since a stored number never begins with `{`.
+ */
+export function formatStoredCost(cost: RequestCost): string {
+  return typeof cost === "number" ? String(cost) : JSON.stringify(cost);
+}
+
+/**
+ * Reads back what {@link formatStoredCost} wrote.
+ *
+ * A number keeps the long-standing lenient read — absent, empty, unparseable and
+ * zero all mean 1 — so entries queued before per-limit costs existed decode as
+ * they always did. A per-limit cost that does not parse decodes to `NaN` rather
+ * than to that default: charging 1 against every limit would meter a token
+ * budget as though it counted requests, where `NaN` is refused when the request
+ * is admitted and says what went wrong.
+ */
+export function parseStoredCost(raw: string | undefined): RequestCost {
+  if (raw === undefined || !raw.trimStart().startsWith("{")) {
+    return parseFloat(raw ?? "") || 1;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed)
+    ) {
+      return parsed as Record<string, number>;
+    }
+  } catch {
+    // Reported as NaN below.
+  }
+  return NaN;
 }

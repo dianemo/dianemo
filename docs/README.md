@@ -35,6 +35,8 @@ that is easiest to configure.
 - [`sharedLimit`](rate-limits/shared-limit.md) — several credentials, one budget
 - [Several limits at once](rate-limits/multiple-limits.md) — per-second *and*
   per-day, or a rate *and* a concurrency ceiling
+- [Settling against the response](rate-limits/settlement.md) — a cost known
+  only afterwards, such as an AI API's tokens
 
 ## Backends
 
@@ -54,5 +56,7 @@ own, see [writing a plugin](writing-plugins.md).
 ## Project
 
 - [Roadmap](roadmap.md) — what is planned, and why
+- [Proposal: usage-based limits](proposals/usage-based-limits.md) — per-limit
+  cost, settling against the response, and streaming
 - [Contributing](../CONTRIBUTING.md) — how to verify a change, and the bar for
   comments and docs

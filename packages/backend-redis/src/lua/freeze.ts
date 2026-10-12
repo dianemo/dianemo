@@ -178,8 +178,9 @@ ${redisNow()}
     return reply(frozenUntil, thawRequestCount)
   end
 
-  local newCount = thawRequestCount - 1
-  if newCount <= 0 then
+  local newCount = math.max(0, thawRequestCount - 1)
+  -- A window re-armed while this probe was in flight still stands.
+  if newCount == 0 and now >= frozenUntil then
     redis.call('DEL', key)
     return nil
   end

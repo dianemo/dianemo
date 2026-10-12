@@ -348,27 +348,14 @@ async function waitFor(
 
 describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
   /**
-   * The retry wait and the freeze are paid once between them, not stacked.
-   *
-   * `requestLimit` is the only type where the question is decidable: its retry
-   * wait honours the configured back-off for a non-429 failure while its freeze
-   * is floored at the refill interval, so the two are genuinely different
-   * numbers. Everywhere else they read the same field.
-   *
-   * Both windows open at the moment of refusal, so the caller owes the LARGER of
-   * the two. A change that made the local wait run after the freeze rather than
-   * inside it would double every 5xx retry's latency and pass every other
-   * assertion in this suite. Deliberately far apart — overlapping costs ~2500ms,
-   * stacking ~4500ms — because an earlier draft using interval 3000 / base 200
-   * left only 200ms between the two hypotheses and was measuring the machine.
+   * Both windows open at the moment of refusal, so the caller owes the larger
+   * of its own retry wait and the fleet's freeze, not their sum. Deliberately
+   * long, so overlapping (~2000ms) and stacking (~4000ms) cannot be confused.
    */
   it("pays the retry wait and the freeze once, not twice", async () => {
     const upstream = await startScriptedUpstream();
-    const INTERVAL = 2500;
     const BACKOFF = 2000;
     try {
-      // 503, not 429: for a rate-limit response the retry wait is floored at the
-      // interval too, which makes the two numbers equal and the question moot.
       upstream.onlyOnce("/pay", 503);
       await withClient(
         harness,
@@ -376,7 +363,7 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
         {
           rateLimit: {
             type: "requestLimit",
-            interval: INTERVAL,
+            interval: 250,
             tokensToAdd: 100,
             maxTokens: 100,
           },
@@ -396,10 +383,8 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
 
           expect(result.status).toBe(200);
           expect(upstream.calls("/pay")).toBe(2);
-          // The freeze is the longer of the two, so it sets the floor.
-          expect(elapsed).toBeGreaterThanOrEqual(INTERVAL - 150);
-          // And it is not charged on top of the local wait.
-          expect(elapsed).toBeLessThan(INTERVAL + BACKOFF - 500);
+          expect(elapsed).toBeGreaterThanOrEqual(BACKOFF - 150);
+          expect(elapsed).toBeLessThan(2 * BACKOFF - 500);
         },
         "rlpay"
       );
@@ -548,7 +533,11 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
       await run(
         {
           rateLimit: { interval: 250, tokensToAdd: 5, maxTokens: 5 },
-          client: { retryOptions: { maxRetries: 2, retryBackoffBaseTime: 20 } },
+          // Long enough for the freeze, which now takes this back-off, to be
+          // observed before it lapses.
+          client: {
+            retryOptions: { maxRetries: 2, retryBackoffBaseTime: 400 },
+          },
         },
         async (ctx) => {
           const inFlight = send(ctx.handler, url);
@@ -1520,22 +1509,11 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
   }, 30_000);
 
   /**
-   * A 5xx or a dropped socket is not a budget problem, so it is backed off by
-   * the time the operator configured.
-   *
-   * `getRetryBackoffBaseTime` used to return `max(interval, base)` for every
-   * failure. That floor is honest only after a 429, which empties the bucket —
-   * for an upstream failure the bucket is untouched, and flooring at the
-   * interval stopped the whole fleet for a full window over one bad response.
-   * On a client transcribing an hourly vendor limit literally, one 502 stopped
-   * it for an hour.
-   *
-   * Read off the `requestDone` payload rather than timed, because the two
-   * durations are now different numbers and only the payload separates them:
-   * `waitTime` is this request's own back-off, `freezeTime` is how long the
-   * fleet stands down. Wall-clock latency conflates them with the next refill.
+   * Read off the `requestDone` payload rather than timed: `waitTime` is this
+   * request's own back-off and `freezeTime` how long the fleet stands down, and
+   * wall-clock latency conflates them with the next refill.
    */
-  it("backs a 502 off by the configured base time, not the refill interval", async () => {
+  it("backs a 502 and its freeze off by the configured base time, not the refill interval", async () => {
     upstream.onlyOnce("/coarse", 502);
     await run(
       {
@@ -1547,15 +1525,9 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
         const failure = ctx
           .completions()
           .find((done) => done.httpStatus === 502);
-        // A 5xx is still a fleet-wide statement about the upstream...
         expect(failure?.freezeClient).toBe(true);
         expect(failure?.isRateLimited).toBe(false);
-        // ...so the freeze it arms still outlasts a refill, floored at the
-        // interval like every freeze on this type...
-        expect(failure?.freezeTime).toBe(400);
-        // ...but this request's own back-off is the 20ms that was configured.
-        // Charging it a refill interval was the defect: the bucket had a full
-        // twenty tokens and the upstream, not the budget, was the problem.
+        expect(failure?.freezeTime).toBe(20);
         expect(failure?.waitTime).toBe(20);
       }
     );
@@ -1957,7 +1929,9 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
     await run(
       {
         rateLimit: { interval: 60_000, tokensToAdd: 5, maxTokens: 5 },
-        client: { retryOptions: { maxRetries: 0, retryBackoffBaseTime: 20 } },
+        client: {
+          retryOptions: { maxRetries: 0, retryBackoffBaseTime: 2_000 },
+        },
       },
       async (ctx) => {
         const failure = await sendCatching(ctx.handler, "/unavailable");
@@ -1979,7 +1953,9 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
     await run(
       {
         rateLimit: { interval: 60_000, tokensToAdd: 5, maxTokens: 5 },
-        client: { retryOptions: { maxRetries: 0, retryBackoffBaseTime: 20 } },
+        client: {
+          retryOptions: { maxRetries: 0, retryBackoffBaseTime: 2_000 },
+        },
       },
       async (ctx) => {
         await sendCatching(ctx.handler, "/refund.5xx");

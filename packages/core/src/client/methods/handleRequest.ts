@@ -82,6 +82,12 @@ async function handleRequest(this: BaseClient, config: RequestConfig) {
           // or spent tokens, so a throw has to hand those back explicitly.
           try {
             await handlePreRequest.bind(this)(request);
+            // The interceptor and a token refresh run after admission, and an
+            // abort landing there would otherwise reach axios as its own
+            // `CanceledError`, with the claim still spent.
+            if (request.config.signal?.aborted) {
+              throw new RequestAbortedError(request.id);
+            }
           } catch (error) {
             await releaseAbandonedRequest.bind(this)(request, error);
             throw error;
@@ -634,7 +640,7 @@ function handleBackoff(
   const attempt = Math.max(1, request.retries);
   const multiplier = Math.pow(attempt, power);
   data.waitTime = multiplier * this.getRetryBackoffBaseTime(data.isRateLimited);
-  data.freezeTime = multiplier * this.getFreezeBaseTime();
+  data.freezeTime = multiplier * this.getFreezeBaseTime(data.isRateLimited);
   data.message += ` | Will retry...`;
   return data;
 }

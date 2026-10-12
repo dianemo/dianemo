@@ -541,19 +541,21 @@ class MeteredClient extends BaseClient {
   }
 
   /**
-   * A freeze is not over until a budget can refill, so the shortest refill
+   * A 429's freeze is not over until a budget can refill, so the shortest refill
    * interval floors it — the shortest because it is the soonest anything here can
    * hand out a token at all, where the longest would pause the fleet for a day
-   * over a per-second refusal.
+   * over a per-second refusal. A 5xx or dropped connection says nothing about
+   * the budget, so its freeze takes the plain back-off, as its retry does.
    *
    * Through `super`, never `this.retryOptions`: `Math.max(interval, NaN)` is NaN,
    * which serialises as `null` and reads as falsy at the arming gate, so a raw
    * read arms no freeze at all for an unset `Number(process.env.BACKOFF)`.
    */
-  protected getFreezeBaseTime(): number {
+  protected getFreezeBaseTime(isRateLimited = false): number {
     const base = super.getFreezeBaseTime();
     const interval = shortestRefillInterval(this.rateLimit);
-    return interval === undefined ? base : Math.max(interval, base);
+    if (!isRateLimited || interval === undefined) return base;
+    return Math.max(interval, base);
   }
 
   /** Only a 429, and only where there is exactly one bucket to empty. */

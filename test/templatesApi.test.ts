@@ -557,6 +557,55 @@ describe("the handler API", () => {
     }
   });
 
+  it("lets a startup hook remove a template client without hanging start()", async () => {
+    const backend = memoryBackend();
+    const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "ha" });
+    handler.use({
+      name: "acme",
+      registerTemplate: async (h) => {
+        await h.registerClientTemplate(
+          "acme" as never,
+          ((c: { instanceId: string }) => [
+            { name: `acme:_:${c.instanceId}` },
+          ]) as never
+        );
+        await h.removeTemplateClient("acme" as never, "gone");
+      },
+      createRequests: () => ({}),
+    });
+    try {
+      const outcome = await Promise.race([
+        handler.start().then(() => "started"),
+        sleep(2_000).then(() => "hung"),
+      ]);
+      expect(outcome).toBe("started");
+    } finally {
+      await handler.stop();
+    }
+  });
+
+  it("registers none of a use() call's plugins when one of them is refused", async () => {
+    const handler = new RequestHandler({
+      key: KEY,
+      backend: memoryBackend(),
+      keyPrefix: "ha",
+    });
+    const plugin = (name: string) => ({
+      name,
+      registerTemplate: async () => {},
+      createRequests: () => ({}),
+    });
+    handler.use(plugin("a"));
+    expect(() => handler.use(plugin("b"), plugin("a"))).toThrow(
+      expect.objectContaining({ code: "duplicate_plugin" })
+    );
+    expect(() => handler.use(plugin("b"))).not.toThrow();
+    expect(() => handler.use(plugin("c"), plugin("c"))).toThrow(
+      expect.objectContaining({ code: "duplicate_plugin" })
+    );
+    expect(() => handler.use(plugin("c"))).not.toThrow();
+  });
+
   it("registers a plugin's template once when use() is called during start()", async () => {
     const backend = memoryBackend();
     const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "ha" });
@@ -609,6 +658,47 @@ describe("the handler API", () => {
       ).rejects.toMatchObject({ code: "invalid_client_name_segment" });
     } finally {
       await handler.stop();
+    }
+  });
+
+  it("leaves no grant tokens behind when a removal races the write", async () => {
+    const upstream = await startAuthServer();
+    const backend = memoryBackend();
+    const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "gr" });
+    await handler.registerClientTemplate(
+      "acme" as never,
+      ((c: { instanceId: string }): CreateClientData[] => [
+        {
+          name: `acme:_:${c.instanceId}`,
+          authentication: upstream.oauth("A"),
+          requestOptions: { defaults: { baseURL: upstream.baseURL } },
+        },
+      ]) as never
+    );
+    try {
+      await handler.addTemplateClient(
+        "acme" as never,
+        { instanceId: "a" } as never
+      );
+      const [write] = await Promise.allSettled([
+        handler.setGrantTokens("acme:_:a", "g1", {
+          accessToken: "at",
+          refreshToken: "rt",
+          expiresAt: Date.now() + 3_600_000,
+          refreshTokenExpiresAt: Date.now() + 86_400_000,
+        }),
+        handler.removeTemplateClient("acme" as never, "a"),
+      ]);
+      expect(
+        await backend.hgetall("gr:requestHandler:acme:_:a:oauth2:g1")
+      ).toEqual({});
+      expect(write).toMatchObject({
+        status: "rejected",
+        reason: { code: "client_removed" },
+      });
+    } finally {
+      await handler.stop();
+      await upstream.close();
     }
   });
 
@@ -1011,5 +1101,40 @@ for (const harness of harnesses(8)) {
         await rig.stop();
       }
     }, 10_000);
+  });
+}
+
+for (const harness of harnesses(8)) {
+  describe(`a handler restarted in the same process (${harness.name})`, () => {
+    it("rebuilds the template clients it had stored", async () => {
+      const { backend, cleanup } = await harness.create();
+      const handler = new RequestHandler({
+        key: KEY,
+        backend,
+        keyPrefix: uniquePrefix("restart"),
+      });
+      await handler.registerClientTemplate(
+        "acme" as never,
+        ((c: { instanceId: string }) => [
+          { name: `acme:_:${c.instanceId}` },
+        ]) as never
+      );
+      try {
+        await handler.addTemplateClient(
+          "acme" as never,
+          {
+            instanceId: "a",
+          } as never
+        );
+        await handler.stop();
+        await handler.start();
+        expect(handler.getLoadedClients().map((c) => c.name)).toContain(
+          "acme:_:a"
+        );
+      } finally {
+        await handler.stop();
+        await cleanup();
+      }
+    });
   });
 }

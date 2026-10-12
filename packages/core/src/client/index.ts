@@ -291,7 +291,7 @@ abstract class BaseClient {
    * Subclasses override to raise the floor further and must fold this result in
    * rather than re-reading the raw field.
    */
-  protected getFreezeBaseTime(): number {
+  protected getFreezeBaseTime(_isRateLimited = false): number {
     const base = this.retryOptions.retryBackoffBaseTime;
     return Number.isFinite(base) && base > 0 ? base : MIN_FREEZE_BASE_MS;
   }
@@ -1628,6 +1628,15 @@ abstract class BaseClient {
     );
     // Nothing else knows which grants exist, and removal has to enumerate them.
     await this.trackGrantId(grantId);
+    // A removal that purged while the write was in flight never saw this
+    // grant, so the write has to undo itself.
+    if (isCredentialWriteRetired(this)) {
+      await this.backend.del(key);
+      throw new ClientUnavailableError(
+        "client_removed",
+        `Client "${this.name}" was removed while grant tokens for "${grantId}" were being stored; they were discarded.`
+      );
+    }
 
     this.logger.debug(
       `Set grant tokens for client ${this.name}, grant ${grantId}`

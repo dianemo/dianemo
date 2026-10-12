@@ -1504,8 +1504,9 @@ class MemoryBackend implements DianemoBackend {
     }
     if (!success) return { frozenUntil, thawRequestCount };
 
-    const newCount = thawRequestCount - 1;
-    if (newCount <= 0) {
+    const newCount = Math.max(0, thawRequestCount - 1);
+    // A window re-armed while this probe was in flight still stands.
+    if (newCount === 0 && Date.now() >= frozenUntil) {
       this.store.delete(key);
       return null;
     }
@@ -1685,7 +1686,6 @@ class MemoryBackend implements DianemoBackend {
     this.bus.removeAllListeners();
     this.busListening = false;
     this.subscribed.clear();
-    this.store.clear();
   }
 }
 

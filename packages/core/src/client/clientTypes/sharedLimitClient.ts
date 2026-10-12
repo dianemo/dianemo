@@ -73,12 +73,13 @@ class SharedLimitClient extends BaseClient {
   }
 
   /**
-   * Floored at the owner's refill interval, matching what the parent would write:
-   * the freeze goes to shared state, so answering from this client's own back-off
-   * would give one upstream two recovery windows. Only the freeze is floored —
-   * `getRetryBackoffBaseTime` still paces this request's own retries.
+   * After a 429, floored at the owner's refill interval, matching what the
+   * parent would write: the freeze goes to shared state, so answering from this
+   * client's own back-off would give one upstream two recovery windows. Only the
+   * freeze is floored — `getRetryBackoffBaseTime` still paces this request's own
+   * retries.
    */
-  protected getFreezeBaseTime(): number {
+  protected getFreezeBaseTime(isRateLimited = false): number {
     // Delegated, not re-read: the base class sanitises a zero, negative or NaN
     // back-off into a usable floor, and a raw `retryOptions` read here arms no freeze
     // at all for a child with `retryBackoffBaseTime: 0`.
@@ -87,7 +88,8 @@ class SharedLimitClient extends BaseClient {
     // The shortest of the owner's refill intervals when it declares several: the
     // longest would floor every freeze at the owner's slowest quota.
     const interval = parent ? shortestRefillInterval(parent) : undefined;
-    return interval === undefined ? base : Math.max(interval, base);
+    if (!isRateLimited || interval === undefined) return base;
+    return Math.max(interval, base);
   }
 
   protected handleDestroy() {}

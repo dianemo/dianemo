@@ -297,16 +297,22 @@ export default class RequestHandler {
     const namespaces = {} as Record<string, unknown>;
     const tryHandleRequest = createTryHandleRequest(this, this.logger);
 
+    // Template names are the first segment of a `:`-delimited client name and
+    // the key credentials are filed under. Two plugins claiming one name would
+    // silently route one's credentials to the other's builder, so refuse — and
+    // before registering any, so a refused call leaves nothing behind.
+    const claimed = new Set<string>();
     for (const plugin of plugins) {
-      // Template names are the first segment of a `:`-delimited client name and
-      // the key credentials are filed under. Two plugins claiming one name would
-      // silently route one's credentials to the other's builder, so refuse.
-      if (this.pluginNames.has(plugin.name)) {
+      if (this.pluginNames.has(plugin.name) || claimed.has(plugin.name)) {
         throw new ConfigurationError(
           "duplicate_plugin",
           `Plugin "${plugin.name}" is already registered on this handler.`
         );
       }
+      claimed.add(plugin.name);
+    }
+
+    for (const plugin of plugins) {
       this.pluginNames.add(plugin.name);
 
       const ctx: PluginContext = {
@@ -650,8 +656,11 @@ export default class RequestHandler {
       this.subscriptionsStarted = false;
       // Drop the client instances too. Retaining them makes a later start()
       // treat them as unchanged and skip init(), leaving them with no
-      // health-check interval — no orphan cleanup, no queue poke.
+      // health-check interval — no orphan cleanup, no queue poke. The template
+      // map goes with them, or the next start() skips every stored tenant as
+      // already built.
       this.clients.clear();
+      this.templateClientMap.clear();
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = undefined;
       this.startPromise = null;
@@ -1208,7 +1217,7 @@ export default class RequestHandler {
     instanceId: string
   ): Promise<void> {
     this.assertTemplateMutationAllowed();
-    if (this.status !== "started") await this.start();
+    if (this.status === "stopped") await this.start();
 
     // Purges credentials, unlike the rebuild and peer-notification paths.
     await destroyTemplateClients.bind(this)(templateName, instanceId, true);

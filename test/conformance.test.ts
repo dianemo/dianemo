@@ -1099,11 +1099,31 @@ describe.each(harnesses)("backend conformance — $name", (harness) => {
 
   // ------------------------------------------------------------- freeze / thaw
 
+  it("keeps what it stores across close()", async () => {
+    await backend.set("close:k", "v");
+    await backend.close();
+    expect(await backend.get("close:k")).toBe("v");
+  });
+
   describe("freeze and thaw", () => {
     const FROZEN = "ft:frozenGrants";
     const QUEUE = "ft:queue";
     const PREFIX = "ft:request";
     const freezeKey = "ft:freezeState";
+
+    it("keeps a window re-armed while its probe was in flight when that probe succeeds", async () => {
+      const now = await backend.now();
+      await backend.armFreeze(freezeKey, now - 10, 1);
+      await backend.armFreeze(freezeKey, now + 60_000, 0, {
+        emptiesBucket: false,
+      });
+      await backend.updateThawProgress(freezeKey, true);
+      expect(await backend.isFrozen(freezeKey)).toBe(true);
+      expect(await backend.getFreezeState(freezeKey)).toMatchObject({
+        frozenUntil: now + 60_000,
+        thawRequestCount: 0,
+      });
+    });
 
     const enqueueInProgress = async (requestId: string, grantId?: string) => {
       await backend.addRequest(QUEUE, PREFIX, {

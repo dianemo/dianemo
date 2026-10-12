@@ -86,6 +86,71 @@ describe.each(harnesses(8))("regressions — $name", (harness) => {
    * later request to that client timed out. Permanently, on the single most
    * ordinary sequence there is.
    */
+  it("refunds and reports an abort that lands after admission, before dispatch", async () => {
+    const { backend, cleanup } = await harness.create();
+    const handler = new RequestHandler({
+      key: KEY,
+      backend,
+      keyPrefix: "abort",
+    });
+    const controller = new AbortController();
+    await handler.registerClientTemplate(
+      "abort" as never,
+      ((c: { instanceId: string }) => [
+        {
+          name: `abort:_:${c.instanceId}`,
+          rateLimit: [
+            {
+              type: "requestLimit",
+              maxTokens: 5,
+              tokensToAdd: 5,
+              interval: 600_000,
+            },
+          ],
+          requestOptions: {
+            defaults: { baseURL: upstream.baseURL },
+            requestInterceptor: (config: Record<string, unknown>) => {
+              controller.abort();
+              return config;
+            },
+          },
+        },
+      ]) as never
+    );
+    try {
+      await handler.addTemplateClient(
+        "abort" as never,
+        {
+          instanceId: "a",
+        } as never
+      );
+      const sent = upstream.seen().length;
+      await expect(
+        handler.handleRequest({
+          clientName: "abort:_:a",
+          requestName: "t",
+          method: "GET",
+          url: "/",
+          signal: controller.signal,
+        })
+      ).rejects.toMatchObject({ code: "request_aborted" });
+      expect(upstream.seen().length).toBe(sent);
+      expect(
+        await waitFor(
+          async () =>
+            (
+              (await handler.getClientStats("abort:_:a")).rateLimit[0] as {
+                tokens?: number;
+              }
+            ).tokens === 5
+        )
+      ).toBe(true);
+    } finally {
+      await handler.stop();
+      await cleanup();
+    }
+  });
+
   it("leaves no phantom queue entry when a fast-path request retries", async () => {
     upstream.script(429, 200);
     await withHandler(

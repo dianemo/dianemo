@@ -38,9 +38,9 @@ const MIN_FREEZE_BASE_MS = 1000;
 const MAX_DRAIN_DELAY_MS = 60_000;
 
 /**
- * How many health ticks a worker keeps re-announcing a completion it owns that
- * no controller has acknowledged. Bounds the traffic and the memory while no
- * controller exists at all; long past any election gap.
+ * How many times an owner re-announces a completion no controller has
+ * acknowledged before giving up on it, whatever kept it unacknowledged. Bounds
+ * the traffic and the memory; long past any election gap.
  */
 const MAX_COMPLETION_FORWARDS = 30;
 

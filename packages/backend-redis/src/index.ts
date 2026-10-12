@@ -442,9 +442,10 @@ class RedisBackend implements DianemoBackend {
 
 /**
  * Coordinates through Redis — the right choice for anything running more than
- * one process, and a safe choice for one. Valkey and DragonflyDB connections
- * work unchanged. Run the server with `maxmemory-policy noeviction`: an evicted
- * bucket reads as full. See docs/backends/redis.md.
+ * one process, and a safe choice for one. Valkey connections work unchanged;
+ * DragonflyDB does not by default. Run the server with
+ * `maxmemory-policy noeviction`: an evicted bucket reads as full. See
+ * docs/backends/redis.md.
  *
  * Registers dianemo's Lua scripts on `redis` as custom commands, and opens one
  * duplicate connection of its own for pub/sub on the first `subscribe`;

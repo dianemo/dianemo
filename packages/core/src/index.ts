@@ -1,14 +1,17 @@
 import type { DianemoResponse, RequestConfig } from "./request/types.js";
 import { createTryHandleRequest } from "./tryHandleRequest.js";
 import startSubscriptions from "./utils/startSubscriptions.js";
+import { settleWithin, TIMED_OUT } from "./utils/deadline.js";
 import updateClientRoles from "./utils/updateClientRoles.js";
 import { generateClients } from "./utils/createClients.js";
 import { assertNameSegment } from "./utils/clientName.js";
 import type { DianemoBackend } from "./backend/types.js";
 import { noopLogger, type Logger } from "./logger.js";
+import { clampDelay } from "./utils/retryAfter.js";
 import type BaseClient from "./client/index.js";
 import EventEmitter from "node:events";
 import crypto from "node:crypto";
+import os from "node:os";
 import {
   loadTemplateClientsFromBackend,
   buildAndRegisterTemplateClients,
@@ -101,28 +104,7 @@ export {
 export { noopLogger, type LogFn, type Logger } from "./logger.js";
 
 export { default as MemoryBackend, memoryBackend } from "./backend/memory.js";
-export {
-  calculateQueueScore,
-  MAX_QUEUE_PRIORITY,
-  MAX_QUEUE_RETRIES,
-  QUEUE_PRIORITY_BAND,
-  QUEUE_RETRY_BAND,
-  QUEUE_SCORE_EPOCH_MS,
-} from "./backend/queueScore.js";
-export {
-  formatStoredCost,
-  parseFiniteStored,
-  parsePriority,
-  parseStoredCost,
-  parseStoredNumber,
-} from "./backend/parseStored.js";
-export {
-  normalizeTombstoneTtl,
-  normalizeTtlSeconds,
-  REDIS_MAX_TTL_SECONDS,
-  REQUEST_TOMBSTONE_TTL_SECONDS,
-} from "./backend/ttl.js";
-export { claimMarkKey } from "./backend/settlement.js";
+// Implementing a backend: the helpers are on `@dianemo/core/backend`.
 export type {
   AcquireConcurrencyResult,
   AcquireMultiLimitResult,
@@ -204,15 +186,93 @@ function assertInstanceSegments(credentials: unknown): void {
   }
 }
 
+/** The shortest `key` the handler accepts, in characters. */
+const MIN_KEY_LENGTH = 32;
+
 /** How long shutdown waits for closed streams to release their slots. */
 const STREAM_CLOSE_TIMEOUT_MS = 5_000;
+
+/**
+ * How long shutdown gives deregistration, and then `backend.close()`, on a
+ * backend that has stopped answering. Sized so the default worst case, in
+ * README.md#shutdown, fits Kubernetes' default 30 s termination grace period.
+ */
+const SHUTDOWN_BACKEND_GRACE_MS = 1_000;
+
+const SHUTDOWN_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
+
+/** Handlers whose signal-triggered `stop()` has not settled yet. */
+const signalStops = new Set<RequestHandler>();
+
+/** Every listener dianemo has registered for a shutdown signal. */
+const ownSignalListeners = new WeakSet<(...args: never[]) => unknown>();
+
+/**
+ * Signals the host has listened for at any point since dianemo registered.
+ * Sticky, because a `process.once` listener is already removed by the time
+ * `stop()` settles, so a count taken then would miss a host mid-shutdown.
+ */
+const hostSignals = new Set<NodeJS.Signals>();
+let watchingHostSignals = false;
+
+function watchHostSignals(): void {
+  for (const signal of SHUTDOWN_SIGNALS) {
+    const host = process
+      .rawListeners(signal)
+      .some((l) => !ownSignalListeners.has(originalListener(l)));
+    if (host) hostSignals.add(signal);
+  }
+  if (watchingHostSignals) return;
+  watchingHostSignals = true;
+  process.on("newListener", (event, listener) => {
+    if (
+      (SHUTDOWN_SIGNALS as readonly unknown[]).includes(event) &&
+      !ownSignalListeners.has(listener)
+    ) {
+      hostSignals.add(event as NodeJS.Signals);
+    }
+  });
+}
+
+function originalListener(
+  l: (...args: never[]) => unknown
+): (...args: never[]) => unknown {
+  return (l as { listener?: (...args: never[]) => unknown }).listener ?? l;
+}
+
+/**
+ * Re-raises `signal` once no handler is still stopping for it, unless the host
+ * has listened for it. Any listener disables Node's default action for a
+ * signal, so with ours gone and none of the host's, the re-raised one ends the
+ * process with the conventional signal status.
+ */
+function restoreSignalDefault(signal: NodeJS.Signals): void {
+  if (signalStops.size > 0 || hostSignals.has(signal)) return;
+  try {
+    process.kill(process.pid, signal);
+  } catch {
+    // Windows' process.kill supports only SIGTERM, SIGINT and SIGKILL, and
+    // throws on SIGHUP (nodejs.org/api/process.html#signal-events).
+    process.exit(128 + (os.constants.signals[signal] ?? 0));
+  }
+}
 
 /**
  * The host for every outbound client in one process, and this process's seat
  * in the fleet that shares their budgets through `backend`.
  *
  * Construct one per process. It starts itself on the first request or
- * template mutation, and stops on SIGTERM, SIGINT or SIGHUP.
+ * template mutation, and stops on SIGTERM, SIGINT or SIGHUP. Once stopped it
+ * stays stopped: work is refused until `start()` is called again.
+ *
+ * On one of those signals it runs `stop()` and then, unless the host has
+ * listened for that signal at any point since the handler registered, re-raises
+ * it so the process ends by that signal, as it would have without dianemo. A
+ * host that listens for the signal itself, with `process.on` or `process.once`,
+ * owns the exit: call `stop()` from that listener and exit when it resolves. A second signal while `stop()` is running is not caught by
+ * dianemo, so with no listener of the host's it ends the process at once.
+ * There is no option to skip these listeners; one of your own takes the exit
+ * over, as above.
  *
  * ```ts
  * import RequestHandler, { memoryBackend } from "@dianemo/core";
@@ -237,8 +297,9 @@ const STREAM_CLOSE_TIMEOUT_MS = 5_000;
  * });
  * ```
  *
- * @throws {ConfigurationError} `backend_required` without a `backend`, and
- * `key_required` for an empty or non-string `key`.
+ * @throws {ConfigurationError} `backend_required` without a `backend`,
+ * `key_required` for an empty or non-string `key`, and `key_too_short` for a
+ * `key` under 32 characters.
  */
 export default class RequestHandler {
   protected id: string;
@@ -260,12 +321,14 @@ export default class RequestHandler {
   protected startupHooks: StartupHook[] = [];
   /** Whether the current start has passed its loop over `startupHooks`. */
   private startupHooksRan = false;
+  /** Set whenever `stop()` resolves, in any state; only `start()` clears it. */
+  private stoppedByCaller = false;
   protected startPromise: Promise<void> | null = null;
   protected stopPromise: Promise<void> | null = null;
   protected shutdownHooksRegistered = false;
   /** Whether pub/sub handlers are installed, so a retried start cannot duplicate them. */
   public subscriptionsStarted = false;
-  protected shutdownHandler?: () => void;
+  protected shutdownHandler?: (signal: NodeJS.Signals) => void;
   private rolesRunning = false;
   private rolesRerun = false;
   private rolesRerunStartup = false;
@@ -287,7 +350,13 @@ export default class RequestHandler {
     if (typeof data.key !== "string" || data.key.length === 0) {
       throw new ConfigurationError(
         "key_required",
-        "RequestHandler requires a non-empty `key`. It encrypts stored credentials, so use a high-entropy secret (32+ characters) from your secret store, not a literal."
+        `RequestHandler requires a non-empty \`key\`. It encrypts stored credentials, so use a high-entropy secret (${MIN_KEY_LENGTH}+ characters) from your secret store, not a literal.`
+      );
+    }
+    if (data.key.length < MIN_KEY_LENGTH) {
+      throw new ConfigurationError(
+        "key_too_short",
+        `RequestHandler's \`key\` is ${data.key.length} characters; it needs at least ${MIN_KEY_LENGTH}. It encrypts stored credentials, so use a high-entropy secret from your secret store. Credentials stored under the old key cannot be read under a new one: add them again.`
       );
     }
     this.id = crypto.randomUUID();
@@ -417,6 +486,7 @@ export default class RequestHandler {
    */
   public async start(): Promise<void> {
     if (this.stopPromise) await this.stopPromise;
+    this.stoppedByCaller = false;
     if (this.status === "started") return;
     if (this.startPromise) return this.startPromise;
     this.startPromise = this.doStart().catch(async (err) => {
@@ -475,27 +545,37 @@ export default class RequestHandler {
     if (this.shutdownHooksRegistered) return;
     this.shutdownHooksRegistered = true;
 
-    this.shutdownHandler = () => {
-      this.stop().catch((err) => {
-        this.logger.error(
-          {
-            error: err,
-          },
-          "Failed to stop request handler during shutdown"
-        );
-      });
+    this.shutdownHandler = (signal) => {
+      signalStops.add(this);
+      this.stop()
+        .catch((err) => {
+          this.logger.error(
+            {
+              error: err,
+            },
+            "Failed to stop request handler during shutdown"
+          );
+        })
+        .finally(() => {
+          signalStops.delete(this);
+          restoreSignalDefault(signal);
+        });
     };
 
-    process.once("SIGTERM", this.shutdownHandler);
-    process.once("SIGINT", this.shutdownHandler);
-    process.once("SIGHUP", this.shutdownHandler);
+    ownSignalListeners.add(this.shutdownHandler);
+    watchHostSignals();
+    for (const signal of SHUTDOWN_SIGNALS) {
+      process.once(signal, this.shutdownHandler);
+    }
   }
 
   private unregisterShutdownHooks(): void {
     if (!this.shutdownHooksRegistered || !this.shutdownHandler) return;
-    process.removeListener("SIGTERM", this.shutdownHandler);
-    process.removeListener("SIGINT", this.shutdownHandler);
-    process.removeListener("SIGHUP", this.shutdownHandler);
+    // Removed for every signal as soon as stopping begins, so a second signal
+    // meets Node's default action, or the host's own listener, instead of ours.
+    for (const signal of SHUTDOWN_SIGNALS) {
+      process.removeListener(signal, this.shutdownHandler);
+    }
     this.shutdownHandler = undefined;
     this.shutdownHooksRegistered = false;
   }
@@ -507,19 +587,26 @@ export default class RequestHandler {
    * the same budget again for requests already upstream, deregisters, and
    * closes what the backend opened — never the connection you passed in.
    *
+   * Each backend call it makes is bounded — by the drain budget, or by one
+   * second for deregistering and one for closing — so a backend that stops
+   * answering logs a warning instead of holding this open. See
+   * README.md#shutdown for the worst case.
+   *
    * Idempotent; a stop during `start()` lets the start finish first. Always
    * ends `stopped`, even when deregistration fails, though that error still
-   * rejects this.
+   * rejects this. Requests and template mutations are then refused with
+   * `ClientUnavailableError` `handler_stopped` rather than restarting the
+   * handler — also after a stop before the first start, or during a start
+   * that fails; call `start()` to bring it back.
    */
   public async stop(): Promise<void> {
-    if (
-      this.status !== "started" &&
-      this.status !== "starting" &&
-      !this.stopPromise
-    )
-      return;
     if (this.stopPromise) return this.stopPromise;
+    if (this.status !== "started" && this.status !== "starting") {
+      this.stoppedByCaller = true;
+      return;
+    }
     this.stopPromise = this.finishStartupThenStop().finally(() => {
+      this.stoppedByCaller = true;
       this.stopPromise = null;
     });
     return this.stopPromise;
@@ -564,16 +651,27 @@ export default class RequestHandler {
     while (Date.now() < deadline) {
       let outstanding = 0;
       for (const client of clients) {
+        let busy: boolean | typeof TIMED_OUT;
         try {
           // This replica's own work, not the queue's total. The queue key is
           // fleet-wide, and a worker cannot advance a peer's entry at all —
           // `processRequests` returns immediately for that role — so counting all of
           // it spends the whole drain budget on someone else's backlog.
-          if (await client.hasOutstandingWork()) outstanding++;
+          busy = await settleWithin(
+            client.hasOutstandingWork(),
+            deadline - Date.now()
+          );
         } catch {
           // A backend already going away cannot say what is left.
           return;
         }
+        if (busy === TIMED_OUT) {
+          this.logger.warn(
+            `Shutdown drain got no answer from the backend within ${this.drainTimeoutMs}ms; failing what is left`
+          );
+          return;
+        }
+        if (busy) outstanding++;
       }
       if (outstanding === 0) return;
       // Nothing else pokes the loop once new requests stop arriving.
@@ -669,15 +767,23 @@ export default class RequestHandler {
       // already upstream releases its slot when the response lands, and that call
       // needs the backend still open.
       await this.awaitInFlightRequests();
-      await this.backend.batch([
-        { op: "srem", key: `${this.namespace}:instances`, member: this.id },
-        { op: "del", key: `${this.namespace}:instance:${this.id}` },
-        {
-          op: "publish",
-          channel: `${this.namespace}:instanceStopped`,
-          message: this.id,
-        },
-      ]);
+      const deregistered = await settleWithin(
+        this.backend.batch([
+          { op: "srem", key: `${this.namespace}:instances`, member: this.id },
+          { op: "del", key: `${this.namespace}:instance:${this.id}` },
+          {
+            op: "publish",
+            channel: `${this.namespace}:instanceStopped`,
+            message: this.id,
+          },
+        ]),
+        SHUTDOWN_BACKEND_GRACE_MS
+      );
+      if (deregistered === TIMED_OUT) {
+        this.logger.warn(
+          `Shutdown could not deregister within ${SHUTDOWN_BACKEND_GRACE_MS}ms; peers will presume this instance lost when its heartbeat lapses`
+        );
+      }
     } finally {
       // Reaching the terminal state is not optional even when a step above throws,
       // and this path is reachable in ordinary operation: deregistration fails
@@ -691,7 +797,15 @@ export default class RequestHandler {
         // Closes only what the backend opened for itself. A connection handed to
         // the backend belongs to the caller, who may still be using it — closing
         // that here would break unrelated work in the same process.
-        await this.backend.close();
+        const closed = await settleWithin(
+          this.backend.close(),
+          SHUTDOWN_BACKEND_GRACE_MS
+        );
+        if (closed === TIMED_OUT) {
+          this.logger.warn(
+            `Shutdown gave up closing the backend after ${SHUTDOWN_BACKEND_GRACE_MS}ms`
+          );
+        }
       } catch (error) {
         this.logger.error(
           { error },
@@ -710,6 +824,11 @@ export default class RequestHandler {
       this.templateClientMap.clear();
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = undefined;
+      // Also cleared here, after every wait: a peer timer must not outlive `stop()`.
+      for (const timeout of this.heartbeatTimeouts.values()) {
+        clearTimeout(timeout);
+      }
+      this.heartbeatTimeouts.clear();
       this.startPromise = null;
       this.status = "stopped";
     }
@@ -803,16 +922,18 @@ export default class RequestHandler {
    * Sends one request through `config.clientName`'s budgets, waiting its turn
    * in the fleet-wide queue, and resolves with the axios response.
    *
-   * Starts the handler if it is not started. Retries 429s, 5xxs and network
+   * Starts the handler if it is not started, unless `stop()` stopped it.
+   * Retries 429s, 5xxs and network
    * failures (`ECONNRESET`, `ETIMEDOUT`, `ECONNABORTED`) per the client's
    * `retryOptions`, freezing the client fleet-wide on each. Rejects with:
    *
    * - `ClientUnavailableError` — `handler_stopping` during `stop()`,
-   *   `handler_stopped` if shutdown or the removal of its client failed it
-   *   while queued, and `shared_limit_parent_missing` for a `sharedLimit`
-   *   client whose owner is gone.
+   *   `handler_stopped` after it, or if shutdown or the removal of its client
+   *   failed it while queued or waiting to retry, and
+   *   `shared_limit_parent_missing` for a `sharedLimit` client whose owner is
+   *   gone.
    * - `ClientNotFoundError` when no client of that name appears within 5 s.
-   * - `ConfigurationError` — `invalid_request_cost`,
+   * - `ConfigurationError` — `invalid_request_name`, `invalid_request_cost`,
    *   `invalid_request_priority`, `invalid_grant_id` or
    *   `invalid_request_signal` for an unusable field.
    * - `RequestCostExceedsBudgetError` for a `cost` above the client's tightest
@@ -821,7 +942,8 @@ export default class RequestHandler {
    * - `RequestTimeoutError` when it is not admitted within the client's
    *   `requestOptions.cleanupTimeout` (default 60 s).
    * - `RequestAbortedError` when `config.signal` aborts before dispatch,
-   *   including after admission while the interceptor or a token refresh runs;
+   *   including during a retry's back-off and after admission while the
+   *   interceptor or a token refresh runs;
    *   what the request claimed is handed back. An abort once it is upstream
    *   reaches axios instead.
    * - From pre-request auth on an OAuth2 client:
@@ -843,6 +965,7 @@ export default class RequestHandler {
         "Request handler is stopping and cannot accept new requests."
       );
     }
+    this.assertNotStopped("accept new requests");
     if (this.status !== "started") await this.start();
     const client = await this.waitForClient(config.clientName);
     return (await client.handleRequest(config as never)) as DianemoResponse<
@@ -931,7 +1054,7 @@ export default class RequestHandler {
             `Timed out after ${timeoutMs}ms awaiting client "${clientName}"`
           )
         );
-      }, timeoutMs);
+      }, clampDelay(timeoutMs));
       const cleanup = () => {
         clearTimeout(warnTimer);
         clearTimeout(timeoutTimer);
@@ -963,22 +1086,29 @@ export default class RequestHandler {
    * Called after `start()`, it immediately builds any credentials already
    * stored, logging and skipping one whose stored settings cannot be built.
    *
-   * @throws {ConfigurationError} `invalid_template_name` for a name containing
-   * `:`, and the codes {@link ClientTemplateOptions} lists for unusable plans.
+   * @throws {ConfigurationError} `invalid_template_name` for an empty name or
+   * one containing `:` or whitespace, and the codes
+   * {@link ClientTemplateOptions} lists for unusable plans.
    */
   public async registerClientTemplate<K extends keyof ClientTemplates>(
     name: K,
     builder: ClientTemplateBuilder<ClientTemplates[K]>,
     options: ClientTemplateOptions = {}
   ): Promise<void> {
-    // Template names occupy parts[0] of clientName, which is `:`-delimited
-    // (`<template>:<orgId>:<alias>[:<sub>]`). A template containing `:`
-    // would shift every subsequent segment and break parseClientName, so
-    // reject loudly at registration time.
-    if ((name as string).includes(":")) {
+    // The same rules `assertNameSegment` applies to the other segments: a `:`
+    // shifts every later segment of the client name, and whitespace is
+    // normalized to `_` in backend keys, so "my tpl" and "my_tpl" would share
+    // one budget and one credential entry.
+    const templateName: unknown = name;
+    if (
+      typeof templateName !== "string" ||
+      templateName.length === 0 ||
+      templateName.includes(":") ||
+      /\s/.test(templateName)
+    ) {
       throw new ConfigurationError(
         "invalid_template_name",
-        `Template name "${String(name)}" must not contain ":"`
+        `Template name ${JSON.stringify(name)} must be a non-empty string with no ":" and no whitespace — it is the first segment of every client name it builds, and backend keys normalize whitespace to "_".`
       );
     }
     assertTemplateOptions(name as string, options);
@@ -1055,7 +1185,8 @@ export default class RequestHandler {
 
   /**
    * Adds a template client, encrypting its credentials into the backend so peers and
-   * restarts can rebuild it. Auto-starts the handler.
+   * restarts can rebuild it. Auto-starts the handler unless `stop()` stopped
+   * it.
    *
    * For credentials one writer distributes to many readers; use
    * {@link addLocalTemplateClient} for per-replica ones.
@@ -1083,7 +1214,8 @@ export default class RequestHandler {
    * codes `CreateClientData.rateLimit` lists, or the builder's own error. A
    * re-add refused this way leaves the instance's existing clients running on
    * what was stored before.
-   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
+   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`, and
+   * `handler_stopped` after it until `start()` is called.
    */
   public async addTemplateClient<K extends keyof ClientTemplates>(
     templateName: K,
@@ -1116,7 +1248,8 @@ export default class RequestHandler {
    * `organizationId` are validated the same way, with the same
    * `ConfigurationError` codes. An unregistered template is logged and skipped.
    *
-   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
+   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`, and
+   * `handler_stopped` after it until `start()` is called.
    */
   public async addLocalTemplateClient<K extends keyof ClientTemplates>(
     templateName: K,
@@ -1269,10 +1402,12 @@ export default class RequestHandler {
    * Removes a template instance everywhere: destroys its clients here, failing
    * their parked requests, deletes its stored credentials, settings and OAuth
    * tokens, and tells every replica to destroy theirs. Starts the handler if it
-   * is `"stopped"`; one already starting is not awaited, so this is safe from a
-   * startup hook. A no-op for an instance that does not exist.
+   * is `"stopped"` and `stop()` did not stop it; one already starting is not
+   * awaited, so this is safe from a startup hook. A no-op for an instance that
+   * does not exist.
    *
-   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`.
+   * @throws {ClientUnavailableError} `handler_stopping` during `stop()`, and
+   * `handler_stopped` after it until `start()` is called.
    */
   public async removeTemplateClient<K extends keyof ClientTemplates>(
     templateName: K,
@@ -1308,6 +1443,20 @@ export default class RequestHandler {
         "Request handler is stopping and cannot mutate template clients."
       );
     }
+    this.assertNotStopped("mutate template clients");
+  }
+
+  /**
+   * Refuses work after `stop()`, which would otherwise auto-start the handler
+   * again — re-registering it with the fleet and re-arming the heartbeat that
+   * keeps the process alive.
+   */
+  private assertNotStopped(action: string): void {
+    if (!this.stoppedByCaller) return;
+    throw new ClientUnavailableError(
+      "handler_stopped",
+      `Request handler was stopped and cannot ${action} until start() is called again.`
+    );
   }
 
   protected getClient(clientName: string): BaseClient {

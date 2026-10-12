@@ -1,6 +1,9 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { redisBackend } from "../packages/backend-redis/src/index.js";
+import { createServer as createTcpServer, connect } from "node:net";
 import RequestHandler from "../packages/core/src/index.js";
+import { createServer } from "node:http";
+import type { Socket } from "node:net";
 import { Redis } from "ioredis";
 import type {
   BatchOp,
@@ -33,6 +36,48 @@ const describeIfRedis = REDIS_URL ? describe : describe.skip;
  * matrix.
  */
 const TEST_DB = 1;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * A relay in front of Redis that can stop forwarding in both directions while
+ * every socket stays open: a paused or stalled server, or a partition without
+ * RST, as ioredis sees it.
+ */
+async function blackholeProxy(target: URL) {
+  let holed = false;
+  const clients = new Set<Socket>();
+  const server = createTcpServer((client) => {
+    const upstream = connect(Number(target.port || 6379), target.hostname);
+    clients.add(client);
+    client.on("data", (d) => {
+      if (!holed) upstream.write(d);
+    });
+    upstream.on("data", (d) => {
+      if (!holed) client.write(d);
+    });
+    const close = () => {
+      clients.delete(client);
+      client.destroy();
+      upstream.destroy();
+    };
+    client.on("error", close).on("close", close);
+    upstream.on("error", close).on("close", close);
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const { port } = server.address() as { port: number };
+  return {
+    url: `redis://127.0.0.1:${port}`,
+    blackhole: () => {
+      holed = true;
+    },
+    openConnections: () => clients.size,
+    close: async () => {
+      for (const client of clients) client.destroy();
+      await new Promise<void>((r) => server.close(() => r()));
+    },
+  };
+}
 
 describeIfRedis("handler lifecycle against a real Redis", () => {
   let redis: Redis;
@@ -364,4 +409,149 @@ describeIfRedis("handler lifecycle against a real Redis", () => {
     await expect(backend.close()).resolves.toBeUndefined();
     unreachable.disconnect();
   }, 20_000);
+
+  it("completes stop() within its drain budget when Redis stops answering", async () => {
+    const proxy = await blackholeProxy(new URL(REDIS_URL!));
+    const stalled = new Redis(`${proxy.url}/${TEST_DB}`);
+    stalled.on("error", () => {});
+    const warnings: string[] = [];
+    const handler = new RequestHandler({
+      key: "0123456789abcdef0123456789abcdef",
+      backend: redisBackend(stalled),
+      keyPrefix: "stall",
+      logger: {
+        debug: () => {},
+        info: () => {},
+        warn: (a: unknown, b?: unknown) => warnings.push(String(b ?? a)),
+        error: () => {},
+      },
+    });
+    try {
+      await handler.registerClientTemplate(
+        "stall" as never,
+        (() => [
+          {
+            name: "stall:_:a",
+            rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 2 }],
+            requestOptions: { defaults: { baseURL: "http://127.0.0.1:9" } },
+          },
+        ]) as never
+      );
+      await handler.start();
+      await handler.addLocalTemplateClient(
+        "stall" as never,
+        { instanceId: "a" } as never
+      );
+      handler.setDrainTimeout(1000);
+      // The caller's connection and the backend's pub/sub duplicate.
+      expect(proxy.openConnections()).toBe(2);
+
+      proxy.blackhole();
+      const started = Date.now();
+      const outcome = await Promise.race([
+        handler.stop().then(() => "resolved"),
+        sleep(15_000).then(() => "still pending"),
+      ]);
+      const elapsed = Date.now() - started;
+      // Commands queued on the caller's connection stay queued; that socket is
+      // theirs. The duplicate is the backend's, and must not outlive stop().
+      for (let i = 0; i < 20 && proxy.openConnections() > 1; i++) {
+        await sleep(50);
+      }
+      expect({
+        outcome,
+        // Drain (1 s), deregistration (1 s) and close (under 1 s), with slack.
+        withinBudget: elapsed < 4500,
+        openConnections: proxy.openConnections(),
+        status: handler.getMetadata().status,
+      }).toEqual({
+        outcome: "resolved",
+        withinBudget: true,
+        openConnections: 1,
+        status: "stopped",
+      });
+      expect(warnings).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/no answer from the backend/),
+          expect.stringMatching(/could not deregister/),
+        ])
+      );
+    } finally {
+      stalled.disconnect();
+      await proxy.close();
+    }
+  }, 30_000);
+
+  it("leaves no peer-heartbeat timer armed once stop() resolves with a request still upstream", async () => {
+    const slow = createServer((_req, res) => {
+      setTimeout(() => res.end("{}"), 4000);
+    });
+    await new Promise<void>((r) => slow.listen(0, "127.0.0.1", () => r()));
+    const { port } = slow.address() as { port: number };
+    const make = () => {
+      const connection = new Redis(`${REDIS_URL}/${TEST_DB}`);
+      const handler = new RequestHandler({
+        key: "0123456789abcdef0123456789abcdef",
+        backend: redisBackend(connection),
+        keyPrefix: "peers",
+      });
+      return { connection, handler };
+    };
+    const a = make();
+    const b = make();
+    let inFlight: Promise<unknown> = Promise.resolve();
+    try {
+      for (const { handler } of [a, b]) {
+        await handler.registerClientTemplate(
+          "hb" as never,
+          (() => [
+            {
+              name: "hb:_:a",
+              rateLimit: [{ type: "noLimit" }],
+              requestOptions: {
+                defaults: { baseURL: `http://127.0.0.1:${port}` },
+              },
+            },
+          ]) as never
+        );
+        await handler.start();
+        await handler.addLocalTemplateClient(
+          "hb" as never,
+          { instanceId: "a" } as never
+        );
+      }
+      // Long enough for each to hear the other's heartbeat.
+      await sleep(1500);
+      // Shorter than the response, so stop() reaches its wait for requests
+      // already upstream, which runs with the subscription still open.
+      a.handler.setDrainTimeout(1500);
+      inFlight = a.handler
+        .handleRequest({
+          clientName: "hb:_:a",
+          requestName: "hb.slow",
+          method: "GET",
+          url: "/",
+        })
+        .catch(() => undefined);
+      await sleep(200);
+      await a.handler.stop();
+      const armed = (
+        a.handler as unknown as {
+          heartbeatTimeouts: Map<string, NodeJS.Timeout>;
+        }
+      ).heartbeatTimeouts;
+      const refd = [...armed.values()].filter((t) => t.hasRef()).length;
+      for (const t of armed.values()) clearTimeout(t);
+      expect({ armedAfterStop: armed.size, refd }).toEqual({
+        armedAfterStop: 0,
+        refd: 0,
+      });
+    } finally {
+      await b.handler.stop().catch(() => {});
+      await inFlight;
+      await a.connection.quit().catch(() => {});
+      await b.connection.quit().catch(() => {});
+      await new Promise<void>((r) => slow.close(() => r()));
+    }
+  }, 30_000);
 });

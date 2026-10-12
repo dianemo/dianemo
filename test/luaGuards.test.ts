@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { FREEZE_PROBE_TTL_SECONDS } from "../packages/core/src/backend/ttl.js";
 import { redisBackend } from "../packages/backend-redis/src/index.js";
 import { Redis } from "ioredis";
 import type {
@@ -309,8 +310,8 @@ describe.skipIf(!REDIS_URL)("lua numeric guards", () => {
       const now = await backend.now();
       await backend.armFreeze("g:normal", now + 120_000, 1);
       const ttl = await redis.ttl("g:normal");
-      expect(ttl).toBeGreaterThan(150);
-      expect(ttl).toBeLessThanOrEqual(181);
+      expect(ttl).toBeGreaterThan(115 + FREEZE_PROBE_TTL_SECONDS);
+      expect(ttl).toBeLessThanOrEqual(121 + FREEZE_PROBE_TTL_SECONDS);
     });
   });
 

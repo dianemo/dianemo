@@ -62,7 +62,12 @@ export interface StreamError {
   cost?: RequestCost;
 }
 
-/** Reads a stream observer's result as the error form, if it is one. */
+/**
+ * Reads a stream observer's result as the handler does: the error form when it
+ * carries a string `error`, otherwise `undefined`, for a cost. For an observer
+ * that wraps another and must tell the two apart, or a test of an observer.
+ * See docs/rate-limits/streaming.md.
+ */
 export function streamErrorOf(result: StreamResult): StreamError | undefined {
   if (typeof result !== "object" || result === null) return undefined;
   const error = (result as { error?: unknown }).error;
@@ -134,6 +139,9 @@ export interface RequestConfig<
    * vendor that meters usage known only afterwards, such as the tokens an AI
    * response generated. Runs once per attempt, on the replica that sent it. See
    * {@link SettleFunction} and docs/rate-limits/settlement.md.
+   *
+   * @throws {ConfigurationError} `backend_missing_settlement` when the backend
+   * does not implement `settleTokens`, before anything is spent.
    */
   settle?: SettleFunction;
   /**
@@ -141,6 +149,9 @@ export interface RequestConfig<
    * usage from the stream as it passes, and settles at what it reports when the
    * stream ends. Usually declared by a plugin's request definition, where the
    * vendor's event format is known. See docs/rate-limits/streaming.md.
+   *
+   * @throws {ConfigurationError} `backend_missing_settlement` when the backend
+   * does not implement `settleTokens`, before anything is spent.
    */
   settleStream?: () => StreamObserver;
   /**

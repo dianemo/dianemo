@@ -1185,11 +1185,12 @@ describe.each(harnesses(10))("requestLimit scenarios — $name", (harness) => {
           async () => (await ctx.frozenGrants()).length === 0
         );
         expect(released).toBe(true);
-        // And the successful probe consumed exactly one unit of thaw progress,
-        // which is what makes it the probe rather than an ordinary request that
-        // happened to go out. Read directly: thaw progress is written before the
-        // mark is cleared, so the wait above has already ordered it.
-        expect((await ctx.freeze("g1"))?.thawRequestCount).toBe(2);
+        // And both of the probe's answers counted as thaw progress — the 409
+        // too, since it would not freeze the client — which is what makes it
+        // the probe rather than an ordinary request that happened to go out.
+        // Read directly: thaw progress is written before the mark is cleared,
+        // so the wait above has already ordered it.
+        expect((await ctx.freeze("g1"))?.thawRequestCount).toBe(1);
       }
     );
   }, 30_000);

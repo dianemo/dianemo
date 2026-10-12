@@ -4,6 +4,7 @@ import Request from "../packages/core/src/request/index.js";
 import RequestHandler from "../packages/core/src/index.js";
 import { describe, expect, it } from "vitest";
 import { createServer } from "node:http";
+import crypto from "node:crypto";
 import {
   redactBody,
   redactUrl,
@@ -100,10 +101,33 @@ describe("derived key caching", () => {
     expect(() => decrypt(ciphertext, other)).toThrow();
   });
 
+  it("refuses a ciphertext whose auth tag was truncated", () => {
+    const secret = "0123456789abcdef0123456789abcdef";
+    const whole = Buffer.from(encrypt("", secret), "base64");
+    // Salt, IV and the first four bytes of the tag: for an empty plaintext,
+    // exactly the prefix a four-byte tag check would accept.
+    const torn = whole.subarray(0, 16 + 12 + 4).toString("base64");
+    expect(() => decrypt(torn, secret)).toThrow();
+  });
+
   it("produces different ciphertext for the same input", () => {
     const secret = "0123456789abcdef0123456789abcdef";
     // The IV is still per-operation even though the salt is now per-secret.
     expect(encrypt("same", secret)).not.toBe(encrypt("same", secret));
+  });
+
+  it("still decrypts a ciphertext written with a per-call salt", () => {
+    const secret = "0123456789abcdef0123456789abcdef";
+    const salt = crypto.randomBytes(16);
+    const iv = crypto.randomBytes(12);
+    const key = crypto.scryptSync(secret, salt, 32);
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    const body = Buffer.concat([
+      cipher.update("hello", "utf8"),
+      cipher.final(),
+    ]);
+    const blob = Buffer.concat([salt, iv, cipher.getAuthTag(), body]);
+    expect(decrypt(blob.toString("base64"), secret)).toBe("hello");
   });
 });
 
@@ -164,6 +188,12 @@ describe("per-request validation", () => {
    * back to the client's own credentials — the request went out under the wrong
    * identity with no error at all.
    */
+  it("refuses an empty requestName", () => {
+    expect(build({ requestName: "" })).toThrow(/requestName/);
+    expect(build({ requestName: "  " })).toThrow(/requestName/);
+    expect(build({ requestName: undefined })).toThrow(/requestName/);
+  });
+
   it("refuses an empty grantId rather than falling back to client credentials", () => {
     expect(build({ grantId: "" })).toThrow(/grantId/);
     expect(build({ grantId: "   " })).toThrow(/grantId/);

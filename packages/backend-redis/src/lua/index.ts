@@ -32,6 +32,7 @@ import {
 import {
   addRequest,
   cleanupOrphanedRequests,
+  confirmRequest,
   getAllRequests,
   getNextRequest,
   getQueueStats,
@@ -68,6 +69,7 @@ export const SCRIPTS = {
   dianemoTouchConcurrency: { keys: 1, lua: touchConcurrency },
   dianemoGetConcurrencyState: { keys: 1, lua: getConcurrencyState },
   dianemoGetNextRequest: { keys: 2, lua: getNextRequest },
+  dianemoConfirmRequest: { keys: 1, lua: confirmRequest },
   dianemoUpdateRequest: { keys: 2, lua: updateRequest },
   dianemoUpdateThawProgress: { keys: 2, lua: updateThawProgress },
   dianemoWriteFreezeState: { keys: 1, lua: writeFreezeState },

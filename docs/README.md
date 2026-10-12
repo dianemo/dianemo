@@ -48,12 +48,17 @@ library and it is not a performance knob.
 - [Choosing a backend](backends/README.md) — start here
 - [Memory backend](backends/memory.md) — single process **only**
 - [Redis backend](backends/redis.md) — anything larger, plus Valkey
+- [Implementing a backend](backends/README.md#implementing-a-backend) — the
+  contract, and the toolkit `@dianemo/core/backend` exports for it
 
 ## Integrations
 
 Ready-made plugins are published one package per vendor from
-[dianemo-plugins](https://github.com/vivo-us/dianemo-plugins). To write your
-own, see [writing a plugin](writing-plugins.md).
+[dianemo-plugins](https://github.com/vivo-us/dianemo-plugins). Every one
+released so far is a 1.x package that does not install beside core 2.0; until
+they are re-released, write the template yourself — see [getting
+started](getting-started.md) — and [writing a plugin](writing-plugins.md) when
+you want to package it.
 
 ## Project
 

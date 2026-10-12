@@ -19,24 +19,41 @@ export interface SettleInput {
   claimed: number;
   overflowNow: number;
   overflowAtClaim: number;
+  /**
+   * The total discarded refill that has paid down a debit on this bucket, and
+   * that total when the claim was made. Forgiveness since the claim comes off
+   * what the claim may be forgiven, so each stretch of refill forgives once,
+   * however many claims were outstanding across it.
+   */
+  forgivenNow: number;
+  forgivenAtClaim: number;
   fillsNow: number;
   fillsAtClaim: number;
   generationNow: number;
   generationAtClaim: number;
+  /** Which incarnation of the bucket this is, and which the claim was made on. */
+  epochNow: string;
+  epochAtClaim: string;
+}
+
+export interface SettleOutcome {
+  applied: number;
+  unapplied: number;
+  /** `SettleInput.forgivenNow` plus the discarded refill this used. */
+  forgiven: number;
 }
 
 /**
  * How much to take from the balance now: positive debits, negative credits.
  * `unapplied` is the part of a debit `maxDebt` would not let the balance absorb.
  */
-export function settleAmount(input: SettleInput): {
-  applied: number;
-  unapplied: number;
-} {
-  const none = { applied: 0, unapplied: 0 };
-  // Counters only grow, so one that went backwards means the bucket expired and
-  // was recreated since the claim — as gone as a reset.
+export function settleAmount(input: SettleInput): SettleOutcome {
+  const none = { applied: 0, unapplied: 0, forgiven: input.forgivenNow };
+  // A changed or missing epoch, or a counter gone backwards (they only grow),
+  // means the bucket was recreated since the claim — as gone as a reset.
   if (
+    input.epochAtClaim === "" ||
+    input.epochNow !== input.epochAtClaim ||
     input.generationNow !== input.generationAtClaim ||
     input.overflowNow < input.overflowAtClaim ||
     input.fillsNow < input.fillsAtClaim
@@ -46,22 +63,30 @@ export function settleAmount(input: SettleInput): {
 
   const delta = input.actual - input.claimed;
   if (delta > 0) {
-    const owed = Math.max(
+    const slack = Math.max(
       0,
-      delta - (input.overflowNow - input.overflowAtClaim)
+      input.overflowNow -
+        input.overflowAtClaim -
+        (input.forgivenNow - input.forgivenAtClaim)
     );
+    const used = Math.min(delta, slack);
+    const owed = delta - used;
     const maxDebt =
       Number.isFinite(input.maxDebt) && input.maxDebt > 0 ? input.maxDebt : 0;
     const room = Math.max(0, input.tokens + maxDebt);
     const applied = Math.min(owed, room);
-    return { applied, unapplied: owed - applied };
+    return {
+      applied,
+      unapplied: owed - applied,
+      forgiven: input.forgivenNow + used,
+    };
   }
   if (delta < 0 && input.fillsNow === input.fillsAtClaim) {
     const credit = Math.min(
       -delta,
       Math.max(0, input.maxTokens - input.tokens)
     );
-    return { applied: -credit, unapplied: 0 };
+    return { applied: -credit, unapplied: 0, forgiven: input.forgivenNow };
   }
   return none;
 }

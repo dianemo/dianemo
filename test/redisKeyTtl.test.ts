@@ -1,3 +1,4 @@
+import { FREEZE_PROBE_TTL_SECONDS } from "../packages/core/src/backend/ttl.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { DianemoBackend } from "../packages/core/src/backend/types.js";
 import { redisBackend } from "../packages/backend-redis/src/index.js";
@@ -161,5 +162,66 @@ describeIfRedis("redis key expiry", () => {
     });
 
     await expectWeekLongTtl("kt:trickle");
+  });
+
+  // ---- freezes
+
+  it("keeps a lapsed freeze in force while thaw probes are still owed", async () => {
+    const now = await backend.now();
+    await backend.armFreeze("kt:freeze", now + 1_000, 3);
+
+    expect(await redis.ttl("kt:freeze")).toBeGreaterThan(
+      FREEZE_PROBE_TTL_SECONDS
+    );
+  });
+
+  it("re-arms a freeze key's expiry each time a thaw probe succeeds", async () => {
+    const now = await backend.now();
+    await backend.armFreeze("kt:freeze", now + 1_000, 3);
+
+    await redis.expire("kt:freeze", 30);
+    await backend.updateThawProgress("kt:freeze", true);
+    expect(await redis.ttl("kt:freeze")).toBeGreaterThanOrEqual(
+      FREEZE_PROBE_TTL_SECONDS - 5
+    );
+  });
+
+  it("leaves a freeze key's expiry to the freeze a failed probe arms", async () => {
+    const now = await backend.now();
+    await backend.armFreeze("kt:freeze", now + 1_000, 3);
+
+    await redis.expire("kt:freeze", 30);
+    await backend.updateThawProgress("kt:freeze", false);
+    expect(await redis.ttl("kt:freeze")).toBeLessThanOrEqual(30);
+  });
+
+  it("remembers a probe completion for as long as the freeze it counts against", async () => {
+    const now = await backend.now();
+    await backend.armFreeze("kt:freeze", now + 1_000, 3);
+
+    await backend.updateThawProgress("kt:freeze", true, "c1");
+    expect(await redis.ttl("kt:freeze:thawCompletions")).toBeGreaterThanOrEqual(
+      FREEZE_PROBE_TTL_SECONDS - 5
+    );
+  });
+
+  it("expires a freeze that owes no probes a minute after its window", async () => {
+    const now = await backend.now();
+    await backend.armFreeze("kt:freeze", now + 10_000, 0);
+
+    const ttl = await redis.ttl("kt:freeze");
+    expect(ttl).toBeGreaterThan(60);
+    expect(ttl).toBeLessThanOrEqual(70);
+  });
+
+  it("gives an emptied bucket the default lifetime when its config cannot refill", async () => {
+    const config = { maxTokens: 10, tokensToAdd: 1, interval: 1000 };
+    await backend.acquireTokens("kt:emptied", 1, config);
+    await backend.emptyTokenBucket!("kt:emptied", {
+      ...config,
+      tokensToAdd: 0,
+    });
+
+    await expectDayLongTtl("kt:emptied");
   });
 });

@@ -1,11 +1,16 @@
-import { exactFn, finiteNumberFn } from "./fragments.js";
 import {
   MAX_QUEUE_PRIORITY as MAX_PRIORITY,
   MAX_QUEUE_RETRIES as MAX_RETRIES,
   QUEUE_PRIORITY_BAND as PRIORITY_BAND,
   QUEUE_RETRY_BAND as RETRY_BAND,
   QUEUE_SCORE_EPOCH_MS as SCORE_EPOCH_MS,
-} from "@dianemo/core";
+} from "@dianemo/core/backend";
+import {
+  exactFn,
+  redisNow,
+  claimLapsedFn,
+  finiteNumberFn,
+} from "./fragments.js";
 
 /**
  * Request-queue Lua. Order is the sorted-set score packed by
@@ -75,7 +80,10 @@ export const removeRequest = `
   return isThawRequest or 'false'
 `;
 
-/** Accepts an optional list of grantIds to skip (for frozen grants). */
+/**
+ * Accepts an optional list of grantIds to skip (for frozen grants). A claim is
+ * a lease: docs/design-notes.md#a-queue-claim-is-a-lease
+ */
 export const getNextRequest = `
   local queueKey = KEYS[1]
   local metadataKey = KEYS[2]
@@ -104,25 +112,61 @@ export const getNextRequest = `
     end
   end
 
-  -- Get all pending requests (status = pending)
+${redisNow()}
+${claimLapsedFn()}
   local allRequests = redis.call('ZRANGE', queueKey, 0, -1)
 
   for i, requestId in ipairs(allRequests) do
-    local status = redis.call('HGET', metadataKey .. ':' .. requestId, 'status')
-    if status == 'pending' and not skipRequestIds[requestId] then
-      -- Check if this request's grantId should be skipped
-      local grantId = redis.call('HGET', metadataKey .. ':' .. requestId, 'grantId') or ''
-      if grantId == '' or not skipGrantIds[grantId] then
-        -- Mark as in progress
-        redis.call('HSET', metadataKey .. ':' .. requestId, 'status', 'inProgress')
-        -- Get full metadata
-        local metadata = redis.call('HGETALL', metadataKey .. ':' .. requestId)
-        return cjson.encode(metadata)
+    local entryKey = metadataKey .. ':' .. requestId
+    -- The rest of the entry is read only once it proves claimable: most of a
+    -- deep queue is confirmed and in flight, and is passed over on these two.
+    local state = redis.call('HMGET', entryKey, 'status', 'claimedAt')
+    local status = state[1]
+    local claimable = status == 'pending'
+      or (status == 'inProgress' and claimLapsed(state[2]))
+    if claimable and not skipRequestIds[requestId] then
+      local fields = redis.call('HMGET', entryKey, 'grantId', 'requestId',
+        'clientName', 'requestName')
+      local grantId = fields[1] or ''
+      -- What decodeRequest requires. Claiming an entry it then reads as null
+      -- leaves the entry inProgress while the caller sees an empty queue. An
+      -- empty requestName is a label like any other; HMGET's false is absence.
+      local decodable = fields[2] and fields[2] ~= '' and fields[3]
+        and fields[3] ~= '' and fields[4] ~= false
+      if decodable and (grantId == '' or not skipGrantIds[grantId]) then
+        -- A lapsed claim's probe nomination lapses with it: left set, it holds
+        -- off every other probe for a request nobody is admitting.
+        if status ~= 'pending' then
+          redis.call('HSET', entryKey, 'isThawRequest', 'false')
+        end
+        redis.call('HSET', entryKey, 'status', 'inProgress',
+          'claimedAt', string.format('%.0f', now))
+        return cjson.encode(redis.call('HGETALL', entryKey))
       end
     end
   end
 
   return nil
+`;
+
+/** Twin of the memory backend's `confirmRequest`. */
+export const confirmRequest = `
+  local metadataKey = KEYS[1]
+  local claimedAt = ARGV[1]
+${redisNow()}
+${claimLapsedFn()}
+
+  local fields = redis.call('HMGET', metadataKey, 'status', 'claimedAt')
+  if fields[1] ~= 'inProgress' then return 0 end
+  -- The nil test because nil equals nil, where the memory twin's NaN equals
+  -- nothing: an absent stamp confirms no claim.
+  local stored = tonumber(fields[2])
+  if stored == nil or stored ~= tonumber(claimedAt) then return 0 end
+  -- A lapsed claim is refused even when nobody has taken it over: its probe
+  -- mark no longer counts, so confirming it could dispatch a second probe.
+  if claimLapsed(fields[2]) then return 0 end
+  redis.call('HDEL', metadataKey, 'claimedAt')
+  return 1
 `;
 
 /**
@@ -162,6 +206,7 @@ export const updateRequest = `
 
   if updates.status ~= nil then
     redis.call('HSET', metadataKey, 'status', updates.status)
+    redis.call('HDEL', metadataKey, 'claimedAt')
   end
   if type(updates.retries) == 'number' then
     redis.call('HSET', metadataKey, 'retries', tostring(updates.retries))

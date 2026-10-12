@@ -10,6 +10,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./backend": {
+      "types": "./dist/backend/index.d.ts",
+      "default": "./dist/backend/index.js"
+    },
     "./client/types": {
       "types": "./dist/client/types.d.ts",
       "default": "./dist/client/types.js"

@@ -38,11 +38,17 @@ backpressure, so the vendor's stream is read only as fast as the caller reads.
 
 The end is the first of:
 
-- the upstream finishing, reported as `"completed"`;
+- the upstream finishing and every chunk having passed into the caller's
+  stream, reported as `"completed"`. That stream buffers up to about 128 KiB,
+  so with backpressure this is when the caller has read all but the last
+  128 KiB, not when the vendor closed the connection, and a body that fits
+  completes even if the caller never reads it;
 - the caller destroying the stream, or the request's `signal` aborting,
   reported as `"closed"`. An abort destroys the caller's stream with
   `RequestAbortedError`;
-- the upstream connection failing, reported as `"error"`;
+- the upstream connection failing, reported as `"error"`. The caller's stream
+  is destroyed with the upstream's error, stripped of the request's
+  credentials;
 - `streamTimeout`, reported as `"timeout"`;
 - the handler stopping, reported as `"shutdown"`.
 
@@ -60,7 +66,9 @@ probe, so it announces only its end.
 
 Two ways, and the first to settle wins. Both go through the attempt's
 [claim mark](settlement.md#what-settle-returns), so the second applies
-nothing.
+nothing. Both need a backend implementing `settleTokens`; on one without it a
+request declaring `settleStream` is refused with `ConfigurationError`
+`backend_missing_settlement`.
 
 **An observer**, usually declared by a plugin's request definition, where the
 vendor's event format is known. It sees each chunk as it passes through,
@@ -111,6 +119,11 @@ settles at what was generated — which is what the vendor bills. It may return:
 `onChunk` and `result` must not throw. A throw is logged, the stream carries
 on, and the claim stands.
 
+`streamErrorOf(result)`, from `@dianemo/core/request/types`, reads a result the
+way dianemo does: the `{ error, cost? }` form when it carries a string `error`,
+`undefined` when it is a cost. Use it in an observer that wraps another, or in a
+test of your own observer, rather than repeating the check.
+
 **The caller**, when it parsed the usage itself:
 
 ```ts
@@ -131,14 +144,31 @@ that happens inside the stream retries it. An error reported inside the stream
 freezes the client for the rest of the fleet; without an observer, dianemo
 cannot see one and records a success.
 
+A request that fails at its headers is handed no response: the axios error
+carries the vendor's error body, unread, as a stream in `error.response.data`.
+That stream relays the body without reaching the connection or the request
+behind it, whose headers carried the credentials. Read it or destroy it, since
+until then it holds its connection open. A body the caller is not handed, such
+as a retried attempt's, is destroyed for you.
+
 ## Keeping a long stream alive
 
 A large generation streams for half an hour or more, far past
 `concurrencySlotTtl`. While a stream is open its replica refreshes the
-request's slots every third of `concurrencySlotTtl`, and its claim marks with
-them, so the reaper never takes a slot that is still in use. A crashed replica
-stops refreshing, so crash recovery is as quick as it has always been, and
+request's slots and claim marks every third of the shortest-lived of them, so
+the reaper never takes a slot that is still in use and a mark never lapses
+before the stream settles. A slot lives `concurrencySlotTtl`. A request that
+settles leaves a claim mark on each token bucket, living `settleWindow` or the
+bucket's refill from empty, whichever is longer, rounded up to whole seconds.
+The refresh never runs more often than every 250 ms, so a `concurrencySlotTtl`
+under 750 ms can lose its slot between refreshes, nor less often than every
+2^31-1 ms (about 24.8 days), the longest interval Node's timers honour. A crashed replica stops
+refreshing, so crash recovery is as quick as it has always been, and
 `concurrencySlotTtl` no longer has to exceed the longest generation.
+
+A slot can still be lost — reaped after a long pause in the process, say. The
+stream then carries on outside `maxConcurrency`, and a warning, once per
+stream, names the request.
 
 `requestOptions.streamTimeout`, default 60 minutes, closes a stream still open
 after that long and releases its slot, so a stream the caller forgot cannot hold

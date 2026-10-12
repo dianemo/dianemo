@@ -390,6 +390,21 @@ describe("a rebuild whose new config cannot be built", () => {
 // ---- sub-clients
 
 describe("a sub-client", () => {
+  it("refuses a name that would collide once keys normalize whitespace", async () => {
+    const handler = new RequestHandler({
+      key: KEY,
+      backend: memoryBackend(),
+      keyPrefix: "dscws",
+      defaultClientOptions: {
+        name: "default",
+        subClients: [{ name: "bulk feed" }],
+      },
+    });
+    await expect(handler.start()).rejects.toMatchObject({
+      code: "invalid_client_name_segment",
+    });
+  });
+
   it("is registered when declared on the default client", async () => {
     const handler = new RequestHandler({
       key: KEY,
@@ -550,6 +565,22 @@ describe("a sub-client", () => {
 // ---- handler API
 
 describe("the handler API", () => {
+  it("refuses a template name that would share keys with another", async () => {
+    const handler = new RequestHandler({
+      key: KEY,
+      backend: memoryBackend(),
+      keyPrefix: "tplws",
+    });
+    const builder = (() => []) as never;
+    for (const name of ["my tpl", "my\ttpl", "", "a:b"]) {
+      await expect(
+        handler.registerClientTemplate(name as never, builder)
+      ).rejects.toMatchObject({ code: "invalid_template_name" });
+    }
+    await handler.registerClientTemplate("my_tpl" as never, builder);
+    expect(handler.getRegisteredTemplates()).toEqual(["my_tpl"]);
+  });
+
   it("registers a plugin's template when use() is called after start()", async () => {
     const backend = memoryBackend();
     const handler = new RequestHandler({ key: KEY, backend, keyPrefix: "ha" });

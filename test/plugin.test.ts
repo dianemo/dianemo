@@ -133,7 +133,7 @@ describe("constructor", () => {
 
   it("namespaces keys by the configured prefix", () => {
     const prefixed = new RequestHandler({
-      key: "k",
+      key: "0".repeat(32),
       backend: stubBackend(),
       keyPrefix: "test",
     });

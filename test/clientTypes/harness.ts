@@ -159,7 +159,7 @@ export interface Harness {
  * `vitest.config.ts` is load-bearing, not a performance preference.
  *
  * All sixteen indices are taken, so a new suite shares one. db11 carries three
- * claimants; db3, db5, db6, db7, db8, db10, db12, db13 and db14 carry two.
+ * claimants; db3, db5, db6, db7, db8, db9, db10, db12, db13 and db14 carry two.
  *
  *    0  memoryAtomicity
  *    1  lifecycle.integration (direct)
@@ -170,7 +170,7 @@ export interface Harness {
  *    6  concurrencyLimit.test · luaGuards (direct)
  *    7  auditFixes · sharedLimit.test
  *    8  regressions · templatesApi
- *    9  auditRound2
+ *    9  auditRound2 · cancellation
  *   10  auditRound2 · requestLimit.scenarios
  *   11  auditRound2 · concurrencyLimit.scenarios · redisClock (direct)
  *   12  sharedLimit.scenarios · redisKeyTtl (direct)

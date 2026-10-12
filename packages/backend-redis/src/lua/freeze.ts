@@ -1,5 +1,7 @@
+import { FREEZE_PROBE_TTL_SECONDS } from "@dianemo/core/backend";
 import {
   exactFn,
+  claimLapsedFn,
   finiteNumberFn,
   freezeGate,
   queueEmptyGate,
@@ -13,6 +15,18 @@ import {
  *
  * Twin of the memory backend's freeze/thaw section.
  */
+
+/**
+ * Declares `freezeTtl(frozenUntil, thawRequestCount)`, the freeze key's
+ * lifetime in seconds. Requires `now`. Twin of core's `freezeTtlSeconds`.
+ */
+const freezeTtlFn = `
+  local function freezeTtl(frozenUntil, thawRequestCount)
+    local window = math.ceil((frozenUntil - now) / 1000)
+    if window < 0 then window = 0 end
+    if thawRequestCount > 0 then return window + ${FREEZE_PROBE_TTL_SECONDS} end
+    return window + 60
+  end`;
 
 /**
  * A `noLimit` client has no bucket and no slots, so its whole admission
@@ -85,19 +99,24 @@ ${redisNow()}
 
   -- Derived above the writes because EXPIRE is what rejects an out-of-range
   -- ttl, and it runs second.
-  local ttl = math.ceil((frozenUntil - now) / 1000) + 60
-  if ttl < 60 then ttl = 60 end
+${freezeTtlFn}
+  local ttl = freezeTtl(frozenUntil, thawRequestCount)
 
   -- '%d', not tostring: a millisecond epoch is 13 digits and Lua 5.1's
   -- default number formatting is %.14g — correct today, and silently lossy
   -- the moment either value grows a digit or gains a fraction.
+  local untilText = string.format('%d', frozenUntil)
+  local thawText = string.format('%d', thawRequestCount)
   redis.call('HSET', key,
-    'frozenUntil', string.format('%d', frozenUntil),
-    'thawRequestCount', string.format('%d', thawRequestCount),
+    'frozenUntil', untilText,
+    'thawRequestCount', thawText,
     'emptiesBucket', emptiesBucket and '1' or '0')
   redis.call('EXPIRE', key, ttl)
 
-  return { frozenUntil, thawRequestCount }
+  -- Strings, not an integer reply: ioredis 6's decoder sums digits in a double
+  -- as \`n * 10 + byte - 48\`, so an integer within 48 of 2^53 — the clamp
+  -- above produces one — reads back a unit off.
+  return { untilText, thawText }
 `;
 
 /**
@@ -154,7 +173,7 @@ ${finiteNumberFn()}
   end
   if completionId ~= '' then
     redis.call('SADD', completionKey, completionId)
-    redis.call('EXPIRE', completionKey, 86400)
+    redis.call('EXPIRE', completionKey, ${FREEZE_PROBE_TTL_SECONDS})
   end
 
   local state = redis.call('HMGET', key, 'frozenUntil', 'thawRequestCount')
@@ -170,9 +189,10 @@ ${redisNow()}
     return nil
   end
 
-  if not success then
-    return reply(frozenUntil, thawRequestCount)
-  end
+  -- No re-arm: a failed probe arms a freeze of its own, which sizes the key.
+  if not success then return reply(frozenUntil, thawRequestCount) end
+
+${freezeTtlFn}
 
   local newCount = math.max(0, thawRequestCount - 1)
   -- A window re-armed while this probe was in flight still stands.
@@ -182,6 +202,7 @@ ${redisNow()}
   end
 
   redis.call('HSET', key, 'thawRequestCount', newCount)
+  redis.call('EXPIRE', key, freezeTtl(frozenUntil, newCount))
   return reply(frozenUntil, newCount)
 `;
 
@@ -198,6 +219,8 @@ export const tryStartThawRequest = `
   local requestId = ARGV[2]
   -- '1' matches a probe of any grant: one probe client-wide.
   local anyGrant = ARGV[3] == '1'
+${redisNow()}
+${claimLapsedFn()}
 
   -- Step 1: Track the frozen grant. A client-level thaw (no grant) has no
   -- entry here — the frozen-grants set exists to let getNextRequest skip
@@ -218,15 +241,17 @@ export const tryStartThawRequest = `
     -- Skip checking our own request
     if reqId ~= requestId then
       local reqMetadataKey = metadataKeyPrefix .. ':' .. reqId
-      local fields = redis.call('HMGET', reqMetadataKey, 'status', 'grantId', 'isThawRequest')
+      local fields = redis.call('HMGET', reqMetadataKey, 'status', 'grantId',
+        'isThawRequest', 'claimedAt')
       local status = fields[1]
       -- HMGET yields false for an absent field; normalise so a
       -- client-level request ('' grant) matches its own kind.
       local reqGrantId = fields[2] or ''
       local isThawRequest = fields[3]
 
-      -- Check if this is an in-progress thaw request for the same grant
-      if status == 'inProgress' and (anyGrant or reqGrantId == grantId) and isThawRequest == 'true' then
+      -- A nomination under a lapsed claim is not a probe: nobody is admitting it.
+      if status == 'inProgress' and (anyGrant or reqGrantId == grantId)
+        and isThawRequest == 'true' and not claimLapsed(fields[4]) then
         return 'exists'
       end
     end
@@ -255,21 +280,24 @@ export const hasThawRequestInProgress = `
   local metadataKeyPrefix = KEYS[2]
   local targetGrantId = ARGV[1]
   local anyGrant = ARGV[2] == '1'
+${redisNow()}
+${claimLapsedFn()}
 
   -- Get all request IDs from the queue
   local requestIds = redis.call('ZRANGE', queueKey, 0, -1)
 
   for i, requestId in ipairs(requestIds) do
     local metadataKey = metadataKeyPrefix .. ':' .. requestId
-    -- Fetch all three fields in a single call
-    local fields = redis.call('HMGET', metadataKey, 'status', 'grantId', 'isThawRequest')
+    local fields = redis.call('HMGET', metadataKey, 'status', 'grantId',
+      'isThawRequest', 'claimedAt')
     local status = fields[1]
     -- Normalised exactly as tryStartThawRequest does: HMGET yields false for an
     -- absent field, which is not equal to the '' a client-level probe carries.
     local grantId = fields[2] or ''
     local isThawRequest = fields[3]
 
-    if status == 'inProgress' and (anyGrant or grantId == targetGrantId) and isThawRequest == 'true' then
+    if status == 'inProgress' and (anyGrant or grantId == targetGrantId)
+      and isThawRequest == 'true' and not claimLapsed(fields[4]) then
       return 1
     end
   end

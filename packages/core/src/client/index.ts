@@ -5,6 +5,7 @@ import { normalizeRateLimit } from "../utils/rateLimit.js";
 import processRequests from "./methods/processRequests.js";
 import type { QueuedRequest } from "../backend/types.js";
 import handleRequest from "./methods/handleRequest.js";
+import { clampDelay } from "../utils/retryAfter.js";
 import { encrypt } from "../utils/encryption.js";
 import type * as ClientTypes from "./types.js";
 import type { Logger } from "../logger.js";
@@ -462,7 +463,7 @@ abstract class BaseClient {
         .finally(() => {
           running = false;
         });
-    }, this.healthCheckIntervalMs);
+    }, clampDelay(this.healthCheckIntervalMs));
   }
 
   /**
@@ -944,16 +945,18 @@ abstract class BaseClient {
    * Keeps a streaming attempt's claims alive: its slots from the reaper, its
    * claim marks from expiry. Called every `streamKeepAliveMs` while the stream
    * is open; a crashed process stops calling, so crash recovery is unchanged.
+   *
+   * @returns The slot ledgers the attempt no longer holds a slot in.
    */
-  public async keepAttemptAlive(request: RequestMetadata): Promise<void> {
+  public async keepAttemptAlive(request: RequestMetadata): Promise<string[]> {
     const owner = this.getBudgetOwnerClient?.();
-    if (owner && owner !== this) await owner.keepAttemptAlive(request);
+    return owner && owner !== this ? owner.keepAttemptAlive(request) : [];
   }
 
   /** How often a streaming attempt's claims are kept alive. */
-  public streamKeepAliveMs(): number {
+  public streamKeepAliveMs(request: RequestMetadata): number {
     const owner = this.getBudgetOwnerClient?.();
-    return owner && owner !== this ? owner.streamKeepAliveMs() : 60_000;
+    return owner && owner !== this ? owner.streamKeepAliveMs(request) : 60_000;
   }
 
   /**
@@ -988,6 +991,23 @@ abstract class BaseClient {
       this.getMetadataKeyPrefix(),
       skipGrantIds,
       skipRequestIds
+    );
+  }
+
+  /**
+   * Records that a claim from {@link getNextRequest} led to admission. False
+   * when the entry is gone, or its claim lapsed and another pass holds it now.
+   * A backend that stamps no `claimedAt` grants no lease, so there is nothing
+   * to confirm.
+   */
+  protected async confirmRequestInQueue(
+    request: QueuedRequest
+  ): Promise<boolean> {
+    if (request.claimedAt === undefined) return true;
+    return this.backend.confirmRequest(
+      this.getMetadataKeyPrefix(),
+      request.requestId,
+      request.claimedAt
     );
   }
 
@@ -1292,7 +1312,7 @@ abstract class BaseClient {
       // to the entry by `tryStartThawRequest` on this side, and the owning
       // replica's `Request` keeps the `false` it was constructed with. Ordered
       // after the freeze test so it only costs a round trip when it can matter.
-      if (!data.freezeClient || !freezeDuration(data)) {
+      if (!freezesClient(data)) {
         const entry = await this.getRequestFromQueue(data.requestId);
         if (entry?.isThawRequest) await this.removeFrozenGrantId(data.grantId);
       }
@@ -1309,7 +1329,7 @@ abstract class BaseClient {
     // separate numbers and can disagree — a legal `retryBackoffBaseTime: 0` has a
     // zero wait while its freeze may run a whole refill interval.
     const freezeFor = freezeDuration(data);
-    if (!pending.freezeHandled && data.freezeClient && freezeFor) {
+    if (!pending.freezeHandled && freezesClient(data)) {
       // Wake against the freeze in force, not the one this completion asked for:
       // `armFreeze` keeps the longer of the two, and waking early declines without
       // re-booking. `extraMs` rides back on the write, costing no round trip.
@@ -1334,11 +1354,11 @@ abstract class BaseClient {
               `Client ${this.name} | post-freeze processing failed`
             );
           });
-        }, waitFor);
+        }, clampDelay(waitFor));
         this.freezeTimers.add(timer);
       }
       pending.freezeHandled = true;
-    } else if (!(data.freezeClient && freezeFor)) {
+    } else if (!freezesClient(data)) {
       pending.freezeHandled = true;
     }
 
@@ -1364,9 +1384,8 @@ abstract class BaseClient {
 
     // Nothing else wakes the drain loop for a retry that did not freeze the
     // client — a freeze schedules its own wake-up. Coalesces through
-    // `processingLock`. Uses the same freeze condition as the arming above, so
-    // the two cannot disagree about whether a freeze happened.
-    if (isRetry && !(data.freezeClient && freezeDuration(data))) {
+    // `processingLock`.
+    if (isRetry && !freezesClient(data)) {
       this.processRequests().catch((error) => {
         this.logger.error(
           { error },
@@ -1378,13 +1397,13 @@ abstract class BaseClient {
     if (isThawRequest && !pending.thawHandled) {
       await this.backend.updateThawProgress(
         this.getFreezeStateKey(data.grantId),
-        data.responseStatus === "success",
+        probeSucceeded(data),
         completionIdOf(data)
       );
 
-      // Clearing the frozen mark releases the single-probe claim, whether the
-      // probe succeeded or not. `processRequests` re-adds it when it nominates
-      // the next probe; a failed probe consumes no thaw progress.
+      // Clearing the frozen mark releases the single-probe claim, whatever the
+      // probe's outcome. `processRequests` re-adds it when it nominates the
+      // next probe; a probe that did not succeed consumes no thaw progress.
       if (data.grantId) await this.removeFrozenGrantId(data.grantId);
       pending.thawHandled = true;
 
@@ -1780,6 +1799,24 @@ function completionIdOf(data: RequestDoneData): string {
  */
 function freezeDuration(data: RequestDoneData): number {
   return data.freezeTime ?? data.waitTime;
+}
+
+/**
+ * Whether this completion arms a freeze. The one test for arming one and for
+ * failing a thaw probe that got an answer, so the two cannot disagree.
+ */
+function freezesClient(data: RequestDoneData): boolean {
+  return Boolean(data.freezeClient && freezeDuration(data));
+}
+
+/**
+ * Whether a thaw probe counts toward thawing: the upstream answered, and the
+ * answer would not itself freeze the client — a 404 included. An attempt with
+ * no response, abandoned or refused before the vendor said anything, has
+ * learned nothing and makes no progress. docs/concepts.md#freeze-and-thaw
+ */
+function probeSucceeded(data: RequestDoneData): boolean {
+  return data.httpStatus !== undefined && !freezesClient(data);
 }
 
 /**

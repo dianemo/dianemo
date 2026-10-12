@@ -1,3 +1,4 @@
+import { QUEUE_CLAIM_LEASE_MS } from "../../packages/core/src/backend/index.js";
 import { fireMany, harnesses, startUpstream, withHandler } from "./harness.js";
 import type { DianemoBackend } from "../../packages/core/src/backend/types.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -1531,6 +1532,467 @@ describe.each(harnesses(11))(
       );
     }, 30_000);
 
+    it("re-admits a queued request whose claim reply was lost", async () => {
+      await withClient(
+        harness,
+        spec(1, {
+          requestOptions: {
+            defaults: { baseURL: up.baseURL },
+            cleanupTimeout: QUEUE_CLAIM_LEASE_MS + 4_000,
+          },
+          healthCheckIntervalMs: 200,
+        }),
+        async (handler, backend, clientName) => {
+          const holder = settle(send(handler, clientName, "/hold"));
+          await sleep(100);
+
+          // The claim runs and its reply is lost: a dropped connection, or a
+          // command timeout after the server had executed it. Installed before
+          // the request is queued, so no pass can hold a claim made without it.
+          const original = backend.getNextRequest.bind(backend);
+          let dropped = false;
+          backend.getNextRequest = async (...args) => {
+            const result = await original(...args);
+            if (result && !dropped) {
+              dropped = true;
+              throw new Error("connection reset after execution");
+            }
+            return result;
+          };
+          const queued = settle(send(handler, clientName, "/ok"));
+          await sleep(100);
+          up.releaseHeld();
+
+          const held = await holder;
+          expect(held.ok).toBe(true);
+          expect(await waitUntil(async () => dropped)).toBe(true);
+          const outcome = await queued;
+          expect(outcome.ok).toBe(true);
+          expect(up.hits("/ok")).toBe(1);
+        }
+      );
+    }, 30_000);
+
+    it("re-admits a queued request whose confirmation reply was lost", async () => {
+      await withClient(
+        harness,
+        spec(1, {
+          requestOptions: {
+            defaults: { baseURL: up.baseURL },
+            cleanupTimeout: QUEUE_CLAIM_LEASE_MS + 4_000,
+          },
+          healthCheckIntervalMs: 200,
+        }),
+        async (handler, backend, clientName) => {
+          const holder = settle(send(handler, clientName, "/hold"));
+          await sleep(100);
+          const queued = settle(send(handler, clientName, "/ok"));
+          await sleep(100);
+
+          // The confirmation lands and its reply is lost, so the claim it ended
+          // is not this replica's to prove any more.
+          const original = backend.confirmRequest.bind(backend);
+          let dropped = false;
+          backend.confirmRequest = async (...args) => {
+            const result = await original(...args);
+            if (result && !dropped) {
+              dropped = true;
+              throw new Error("connection reset after execution");
+            }
+            return result;
+          };
+          up.releaseHeld();
+
+          const held = await holder;
+          expect(held.ok).toBe(true);
+          expect(await waitUntil(async () => dropped)).toBe(true);
+          const outcome = await queued;
+          expect(outcome.ok).toBe(true);
+          expect(up.hits("/ok")).toBe(1);
+        }
+      );
+    }, 30_000);
+
+    it("admits a request declined by a freeze after the reply to its confirmation was lost", async () => {
+      up.route("/503", reply(503));
+      await withClient(
+        harness,
+        spec(3, {
+          requestOptions: {
+            defaults: { baseURL: up.baseURL },
+            cleanupTimeout: 6_000,
+          },
+          retryOptions: { maxRetries: 0, retryBackoffBaseTime: 500 },
+        }),
+        async (handler, backend, clientName) => {
+          // A 5xx freeze: no probes, it simply lapses.
+          await settle(send(handler, clientName, "/503"));
+          expect(
+            await waitUntil(
+              async () => !!(await backend.getFreezeState(CLIENT_FREEZE))
+            )
+          ).toBe(true);
+
+          const original = backend.confirmRequest.bind(backend);
+          let dropped = false;
+          backend.confirmRequest = async (...args) => {
+            const result = await original(...args);
+            if (!dropped) {
+              dropped = true;
+              throw new Error("connection reset after execution");
+            }
+            return result;
+          };
+
+          // Queued during the freeze, declined for it, and the confirmation
+          // that write-back sends lands with its reply lost.
+          const started = Date.now();
+          const queued = settle(send(handler, clientName, "/ok"));
+          expect(await waitUntil(async () => dropped, 2_000)).toBe(true);
+          const outcome = await queued;
+          expect(outcome.ok).toBe(true);
+          // Admitted once the freeze lapsed, not at the admission timeout.
+          expect(Date.now() - started).toBeLessThan(3_000);
+        }
+      );
+    }, 30_000);
+
+    /**
+     * Each test plays a second controller from inside this one's pass, at the
+     * point where this pass's lease has lapsed: it takes the entry over and
+     * confirms it, the point after which it dispatches. This pass is then the
+     * stale claimer. docs/design-notes.md#a-queue-claim-is-a-lease
+     */
+    describe("a stale claimer", () => {
+      interface Controller {
+        getQueueKey(): string;
+        getMetadataKeyPrefix(): string;
+        instanceId: string;
+        processRequests(): Promise<void>;
+      }
+      const controllerOf = (handler: RequestHandler, clientName: string) =>
+        (
+          handler as unknown as { clients: Map<string, Controller> }
+        ).clients.get(clientName)!;
+
+      const enqueue = async (
+        backend: DianemoBackend,
+        client: Controller,
+        clientName: string,
+        requestId = "x",
+        priority = 1
+      ) => {
+        await backend.addRequest(
+          client.getQueueKey(),
+          client.getMetadataKeyPrefix(),
+          {
+            requestId,
+            clientName,
+            requestName: "t.stale",
+            status: "pending",
+            priority,
+            cost: 1,
+            retries: 0,
+            timestamp: Date.now(),
+            isThawRequest: false,
+            ownerId: client.instanceId,
+          },
+          3600
+        );
+      };
+
+      const takeOver = async (backend: DianemoBackend, client: Controller) => {
+        const prefix = client.getMetadataKeyPrefix();
+        const held = await backend.getRequest(prefix, "x");
+        await backend.hset(`${prefix}:x`, {
+          claimedAt: String(held!.claimedAt! - QUEUE_CLAIM_LEASE_MS),
+        });
+        const next = await backend.getNextRequest(client.getQueueKey(), prefix);
+        expect(next?.requestId).toBe("x");
+        const confirmed = await backend.confirmRequest(
+          prefix,
+          "x",
+          next!.claimedAt!
+        );
+        expect(confirmed).toBe(true);
+      };
+
+      /** The new holder's entry stays confirmed and is not handed out again. */
+      const expectStillHeld = async (
+        handler: RequestHandler,
+        backend: DianemoBackend,
+        client: Controller
+      ) => {
+        const prefix = client.getMetadataKeyPrefix();
+        const entry = await backend.getRequest(prefix, "x");
+        expect(entry?.status).toBe("inProgress");
+        const next = await backend.getNextRequest(client.getQueueKey(), prefix);
+        expect(next).toBeNull();
+        // Nothing here will ever complete x, so shutdown would wait out the
+        // whole drain for it.
+        handler.setDrainTimeout(100);
+      };
+
+      it("does not reset an entry another controller confirmed when its own stale claim is declined by a freeze", async () => {
+        await withClient(
+          harness,
+          spec(1),
+          async (handler, backend, clientName) => {
+            const client = controllerOf(handler, clientName);
+            await enqueue(backend, client, clientName);
+            const original = backend.canProcessRequest.bind(backend);
+            let tookOver = false;
+            backend.canProcessRequest = async (...args) => {
+              if (tookOver) return original(...args);
+              tookOver = true;
+              await takeOver(backend, client);
+              const now = await backend.now();
+              return {
+                canProcess: false,
+                isThawRequest: false,
+                frozenUntil: now + 60_000,
+              };
+            };
+
+            await client.processRequests();
+            expect(tookOver).toBe(true);
+            await expectStillHeld(handler, backend, client);
+          }
+        );
+      }, 30_000);
+
+      it("does not reset an entry another controller confirmed when its own stale claim finds a probe already running", async () => {
+        await withClient(
+          harness,
+          spec(1),
+          async (handler, backend, clientName) => {
+            const client = controllerOf(handler, clientName);
+            await enqueue(backend, client, clientName);
+            const original = backend.canProcessRequest.bind(backend);
+            let tookOver = false;
+            backend.canProcessRequest = async (...args) => {
+              if (tookOver) return original(...args);
+              tookOver = true;
+              await takeOver(backend, client);
+              return { canProcess: true, isThawRequest: true };
+            };
+            backend.tryStartThawRequest = async () => "exists";
+
+            await client.processRequests();
+            expect(tookOver).toBe(true);
+            await expectStillHeld(handler, backend, client);
+          }
+        );
+      }, 30_000);
+
+      it("leaves a confirmed entry alone when its stale claimer is declined by the budget", async () => {
+        await withClient(
+          harness,
+          spec(1),
+          async (handler, backend, clientName) => {
+            const client = controllerOf(handler, clientName);
+            await enqueue(backend, client, clientName);
+            const original = backend.acquireQueuedConcurrency!.bind(backend);
+            let tookOver = false;
+            backend.acquireQueuedConcurrency = async (...args) => {
+              if (tookOver) return original(...args);
+              tookOver = true;
+              await takeOver(backend, client);
+              return { acquired: false, currentConcurrency: 1 };
+            };
+
+            await client.processRequests();
+            expect(tookOver).toBe(true);
+            await expectStillHeld(handler, backend, client);
+          }
+        );
+      }, 30_000);
+
+      it("releases the slot it took when confirmation finds the entry gone", async () => {
+        await withClient(
+          harness,
+          spec(1),
+          async (handler, backend, clientName) => {
+            const client = controllerOf(handler, clientName);
+            const prefix = client.getMetadataKeyPrefix();
+            await enqueue(backend, client, clientName);
+            const confirm = backend.confirmRequest.bind(backend);
+            backend.confirmRequest = async (...args) => {
+              // The owner abandons x after the still-queued re-read and before
+              // the confirmation.
+              await backend.removeRequest(client.getQueueKey(), prefix, "x");
+              return confirm(...args);
+            };
+
+            await client.processRequests();
+            expect(await occupancy(backend)).toBe(0);
+          }
+        );
+      }, 30_000);
+
+      /**
+       * A stream's entry goes at its headers while its slot is held to the end,
+       * so a stale claimer re-reading it finds it gone with the stream still
+       * using the slot under the same request id. The second claimer is this
+       * client's own pass, run again with the stalled one still holding the
+       * lock, as a rebuilt client's would be.
+       */
+      const streamOutlivesItsEntry = async (
+        headerDelayMs: number,
+        slowRefusalMs: number
+      ) => {
+        const gates = new Map<string, () => void>();
+        const gate = (path: string) =>
+          new Promise<void>((resolve) => gates.set(path, resolve));
+        const open = (path: string) => {
+          gates.get(path)?.();
+          gates.delete(path);
+        };
+        for (const path of ["/h", "/y"]) {
+          up.route(path, async (res) => {
+            await gate(path);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end("{}");
+          });
+        }
+        up.route("/stream", async (res) => {
+          await sleep(headerDelayMs);
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write("data: 1\n\n");
+          await gate("/stream");
+          res.end();
+        });
+
+        await withClient(
+          harness,
+          {
+            rateLimit: [
+              { name: "slots", type: "concurrencyLimit", maxConcurrency: 1 },
+              {
+                name: "rate",
+                type: "requestLimit",
+                maxTokens: 1000,
+                tokensToAdd: 1000,
+                interval: 1000,
+              },
+            ],
+            requestOptions: {
+              defaults: { baseURL: up.baseURL },
+              cleanupTimeout: QUEUE_CLAIM_LEASE_MS * 4,
+            },
+            retryOptions: { maxRetries: 0 },
+          },
+          async (handler, backend, clientName) => {
+            const client = controllerOf(handler, clientName) as Controller & {
+              processingLock: boolean;
+            };
+
+            // H holds the one slot, so X queues behind it.
+            const h = settle(send(handler, clientName, "/h"));
+            expect(await waitUntil(async () => gates.has("/h"))).toBe(true);
+            const x = send(handler, clientName, "/stream", {
+              responseType: "stream",
+            });
+            await sleep(200);
+
+            // The pass that claims X once H is done stalls past the lease.
+            const canProcess = backend.canProcessRequest.bind(backend);
+            let stall = true;
+            let stalledDone = false;
+            backend.canProcessRequest = async (...args) => {
+              if (stall && new Error().stack?.includes("processRequests")) {
+                stall = false;
+                await sleep(QUEUE_CLAIM_LEASE_MS + 1_000);
+                const result = await canProcess(...args);
+                stalledDone = true;
+                return result;
+              }
+              return canProcess(...args);
+            };
+            const confirm = backend.confirmRequest.bind(backend);
+            backend.confirmRequest = async (...args) => {
+              const confirmed = await confirm(...args);
+              if (!confirmed) await sleep(slowRefusalMs);
+              return confirmed;
+            };
+            open("/h");
+            expect((await h).ok).toBe(true);
+            expect(await waitUntil(async () => !stall, 2_000)).toBe(true);
+
+            // A second pass finds the lapsed claim and dispatches X.
+            await sleep(QUEUE_CLAIM_LEASE_MS + 200);
+            client.processingLock = false;
+            void client.processRequests();
+            const stream = (await x) as { data: NodeJS.ReadableStream };
+            stream.data.on("error", () => undefined);
+            stream.data.resume();
+
+            // The stale pass resumes and finishes.
+            expect(await waitUntil(async () => stalledDone, 3_000)).toBe(true);
+            await sleep(300);
+
+            // X is still streaming, so Y waits for its slot.
+            const y = settle(send(handler, clientName, "/y"));
+            await sleep(1_000);
+            expect(up.peakInFlight()).toBeLessThanOrEqual(1);
+            open("/stream");
+            expect(await waitUntil(async () => gates.has("/y"))).toBe(true);
+            open("/y");
+            expect((await y).ok).toBe(true);
+          }
+        );
+      };
+
+      it(
+        "does not release the slot of a stream whose entry was removed at its headers",
+        async () => {
+          await streamOutlivesItsEntry(0, 0);
+        },
+        QUEUE_CLAIM_LEASE_MS * 6
+      );
+
+      it(
+        "does not release the slot of a stream whose headers land while a stale claimer's refused confirmation is in flight",
+        async () => {
+          await streamOutlivesItsEntry(1_500, 1_500);
+        },
+        QUEUE_CLAIM_LEASE_MS * 6
+      );
+    });
+
+    it("answers a request whose requestName is empty without stalling the queue behind it", async () => {
+      await withClient(
+        harness,
+        spec(1, {
+          requestOptions: {
+            defaults: { baseURL: up.baseURL },
+            cleanupTimeout: 3_000,
+          },
+        }),
+        async (handler, _backend, clientName) => {
+          const holder = settle(send(handler, clientName, "/hold"));
+          await sleep(100);
+          const started = Date.now();
+          // Admitted or refused at entry, either is an answer; waiting out the
+          // admission timeout is not.
+          const nameless = settle(
+            send(handler, clientName, "/ok", { requestName: "" })
+          );
+          await sleep(50);
+          const behind = settle(send(handler, clientName, "/ok"));
+          await sleep(100);
+          up.releaseHeld();
+
+          const held = await holder;
+          expect(held.ok).toBe(true);
+          const next = await behind;
+          expect(next.ok).toBe(true);
+          await nameless;
+          expect(Date.now() - started).toBeLessThan(2_000);
+        }
+      );
+    }, 30_000);
+
     /**
      * DELIBERATELY REPETITIVE — DO NOT CUT THE ITERATION COUNT.
      *
@@ -1661,5 +2123,190 @@ describe.each(harnesses(11))(
         }
       );
     }, 30_000);
+  }
+);
+
+// ------------------------------------------------- claim lease latency
+
+const LATENCY_KEY = "0123456789abcdef0123456789abcdef";
+const LATENCY_PREFIX = "fqp";
+const LATENCY_NAME = "fqp:_:a";
+
+async function startHoldingUpstream() {
+  const holds = new Map<string, () => void>();
+  const hits: string[] = [];
+  const server = createServer(async (req, res: ServerResponse) => {
+    const path = (req.url ?? "/").split("?")[0];
+    hits.push(path);
+    if (path.startsWith("/hold/")) {
+      await new Promise<void>((resolve) => holds.set(path, resolve));
+    }
+    res.writeHead(200).end("{}");
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const a = server.address();
+  const port = typeof a === "object" && a ? a.port : 0;
+  return {
+    baseURL: `http://127.0.0.1:${port}`,
+    hits,
+    held: (path: string) => holds.has(path),
+    release: (path: string) => {
+      holds.get(path)?.();
+      holds.delete(path);
+    },
+    close: async () => {
+      for (const r of holds.values()) r();
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
+    },
+  };
+}
+
+/**
+ * Every backend call's reply arrives `latency.ms` late, as under a Redis
+ * latency spike. The call itself executes at once, so a claim is stamped as
+ * early as it can be and a confirmation lands as early as it can be: this is
+ * the most favourable placement of the delay for the lease.
+ */
+function withLatency(backend: DianemoBackend) {
+  const latency = { ms: 0, confirms: [] as boolean[], claims: 0 };
+  const proxy = new Proxy(backend, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        const result = value.apply(target, args);
+        if (prop === "getNextRequest" && latency.ms > 0) latency.claims++;
+        if (prop === "confirmRequest" && latency.ms > 0) {
+          void (result as Promise<boolean>).then((ok) =>
+            latency.confirms.push(ok)
+          );
+        }
+        if (latency.ms > 0 && result && typeof result.then === "function") {
+          const ms = latency.ms;
+          return (result as Promise<unknown>).then(async (v) => {
+            await sleep(ms);
+            return v;
+          });
+        }
+        return result;
+      };
+    },
+  });
+  return { backend: proxy as DianemoBackend, latency };
+}
+
+async function withLatencyClient(
+  harness: Harness,
+  client: Record<string, unknown>,
+  fn: (
+    handler: RequestHandler,
+    latency: { ms: number; confirms: boolean[]; claims: number },
+    backend: DianemoBackend
+  ) => Promise<void>
+) {
+  const created = await harness.create();
+  const { backend, latency } = withLatency(created.backend);
+  const handler = new RequestHandler({
+    key: LATENCY_KEY,
+    backend,
+    keyPrefix: LATENCY_PREFIX,
+  });
+  await handler.registerClientTemplate(
+    "fqp" as never,
+    (() => [{ ...client, name: LATENCY_NAME }]) as never
+  );
+  await handler.start();
+  await handler.addTemplateClient("fqp" as never, { instanceId: "a" } as never);
+  try {
+    await fn(handler, latency, created.backend);
+  } finally {
+    latency.ms = 0;
+    await handler.stop().catch(() => undefined);
+    await created.cleanup().catch(() => undefined);
+  }
+}
+
+const waitUntilSync = async (check: () => boolean, ms = 5000) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (check()) return true;
+    await sleep(20);
+  }
+  return false;
+};
+
+describe.each(harnesses(11))(
+  "queue claim lease under latency — $name",
+  (harness) => {
+    it.each([1_000, 600])(
+      "dispatches a queued request when every backend round trip takes %i ms",
+      async (spikeMs) => {
+        const upstream = await startHoldingUpstream();
+        try {
+          await withLatencyClient(
+            harness,
+            {
+              rateLimit: [{ type: "concurrencyLimit", maxConcurrency: 1 }],
+              requestOptions: {
+                defaults: { baseURL: upstream.baseURL },
+                cleanupTimeout: 25_000,
+              },
+              retryOptions: { maxRetries: 0 },
+            },
+            async (handler, latency) => {
+              const send = (url: string) =>
+                handler.handleRequest({
+                  clientName: LATENCY_NAME,
+                  requestName: "t",
+                  method: "GET",
+                  url,
+                } as never);
+
+              // A holds the only slot, so B has to queue.
+              const a = send("/hold/a");
+              expect(await waitUntilSync(() => upstream.held("/hold/a"))).toBe(
+                true
+              );
+              const b = send("/b").then(
+                () => "dispatched",
+                (error: Error) => `failed: ${error.name}`
+              );
+              await sleep(300);
+
+              // A latency spike: every reply now takes a second. Then A finishes,
+              // freeing the slot for B.
+              latency.ms = spikeMs;
+              upstream.release("/hold/a");
+              await a;
+
+              // A legitimate, merely slow pass has 20 s to send B on its way.
+              const sent = await waitUntilSync(
+                () => upstream.hits.includes("/b"),
+                20_000
+              );
+              // The cause when it is not: every confirmation of B's claim refused.
+              expect({
+                sent,
+                claims: latency.claims,
+                confirms: latency.confirms,
+              }).toEqual({
+                sent: true,
+                claims: latency.claims,
+                confirms: expect.arrayContaining([true]),
+              });
+              expect(
+                await waitUntilSync(() => upstream.hits.includes("/b"), 20_000)
+              ).toBe(true);
+              latency.ms = 0;
+              expect(await b).toBe("dispatched");
+            }
+          );
+        } finally {
+          await upstream.close();
+        }
+      },
+      60_000
+    );
   }
 );

@@ -1,4 +1,5 @@
 import { ClientFrozenError, ConfigurationError } from "../../errors.js";
+import { clampDelay } from "../../utils/retryAfter.js";
 import BaseClient from "../index.js";
 import {
   assertUsableRateLimits,
@@ -405,17 +406,19 @@ class MeteredClient extends BaseClient {
     config: TokenBucketConfig
   ): ClaimMark | undefined {
     if (!request.settles) return undefined;
-    const window = this.requestOptions.settleWindow;
-    const windowMs =
-      window !== undefined && Number.isFinite(window) && window > 0
-        ? window
-        : DEFAULT_SETTLE_WINDOW_MS;
     const refillMs =
       Math.ceil(config.maxTokens / config.tokensToAdd) * config.interval;
     return {
       id: this.getSlotId(request),
-      ttlSeconds: Math.ceil(Math.max(windowMs, refillMs) / 1000),
+      ttlSeconds: Math.ceil(Math.max(this.settleWindowMs, refillMs) / 1000),
     };
+  }
+
+  private get settleWindowMs(): number {
+    const window = this.requestOptions.settleWindow;
+    return window !== undefined && Number.isFinite(window) && window > 0
+      ? window
+      : DEFAULT_SETTLE_WINDOW_MS;
   }
 
   private withMarks(
@@ -486,18 +489,17 @@ class MeteredClient extends BaseClient {
     }
   }
 
-  public async keepAttemptAlive(request: RequestMetadata): Promise<void> {
+  public async keepAttemptAlive(request: RequestMetadata): Promise<string[]> {
     const slotId = this.getSlotId(request);
-    const specs = this.getLimitSpecs(
-      request.grantId,
-      slotId,
-      request.cost,
-      true
-    );
-    for (const spec of specs) {
-      if (!wasClaimed(request, spec.key)) continue;
+    const lost: string[] = [];
+    for (const spec of this.heldSpecs(request)) {
       if (spec.kind === "concurrency") {
-        await this.backend.touchConcurrency?.(spec.key, slotId, 86400);
+        const held = await this.backend.touchConcurrency?.(
+          spec.key,
+          slotId,
+          86400
+        );
+        if (held === false) lost.push(spec.key);
         continue;
       }
       const mark = this.markFor(request, spec.config);
@@ -505,14 +507,32 @@ class MeteredClient extends BaseClient {
         await this.backend.touchClaimMark?.(spec.key, mark.id, mark.ttlSeconds);
       }
     }
+    return lost;
   }
 
   /**
-   * A third of the slot TTL, so two ticks can be lost before the reaper takes
-   * the slot.
+   * A third of the shortest lifetime among what the attempt holds — the slot
+   * TTL, and each claim mark's whole-second TTL — so two ticks can be lost
+   * before the reaper takes the slot or a mark expires.
    */
-  public streamKeepAliveMs(): number {
-    return this.requestTtl / 3;
+  public streamKeepAliveMs(request: RequestMetadata): number {
+    let shortestMs = this.requestTtl;
+    for (const spec of this.heldSpecs(request)) {
+      if (spec.kind === "concurrency") continue;
+      const mark = this.markFor(request, spec.config);
+      if (mark) shortestMs = Math.min(shortestMs, mark.ttlSeconds * 1000);
+    }
+    return clampDelay(Math.max(shortestMs / 3, MIN_STREAM_KEEP_ALIVE_MS));
+  }
+
+  private heldSpecs(request: RequestMetadata): MultiLimitSpec[] {
+    const specs = this.getLimitSpecs(
+      request.grantId,
+      this.getSlotId(request),
+      request.cost,
+      true
+    );
+    return specs.filter((spec) => wasClaimed(request, spec.key));
   }
 
   /**
@@ -748,10 +768,18 @@ class MeteredClient extends BaseClient {
   protected handleDestroy(): void {}
 }
 
-/** True unless the attempt recorded its claims and this key is not among them. */
 /** See `RequestOptions.settleWindow`. */
 const DEFAULT_SETTLE_WINDOW_MS = 900_000;
 
+/**
+ * Each tick is a backend round trip per held limit, and this caps them at four
+ * a second per stream however short `concurrencySlotTtl` is. It stays under a
+ * third of a mark's shortest TTL, one second, so it only ever slows a slot's
+ * refresh.
+ */
+const MIN_STREAM_KEEP_ALIVE_MS = 250;
+
+/** True unless the attempt recorded its claims and this key is not among them. */
 function wasClaimed(request: RequestMetadata, key: string): boolean {
   return request.claimedKeys?.includes(key) ?? true;
 }

@@ -4,8 +4,8 @@ A plugin packages one integration: how its client is shaped and authenticated,
 plus the request functions that use it.
 
 ```ts
-export const requests = handler.use(fedexPlugin, upsPlugin);
-await requests.fedex.cancelShipment("fedex:_:production", { ... });
+export const requests = handler.use(acmePlugin);
+await requests.acme.cancelShipment("acme:_:production", "SHIP-1234");
 ```
 
 ## The two halves
@@ -66,8 +66,9 @@ npm install @dianemo/plugin-kit
 `plugin-kit` ships from the plugins repo rather than this one, so its releases
 trail core's. `@dianemo/plugin-kit@1.0.0` declares a peer range of
 `@dianemo/core ^1.0.0`, so it will not install beside core 2.0 until a
-plugin-kit release widens that range. The `definePlugin`
-form above is in `@dianemo/core` and always available, so reach for it if the
+plugin-kit release widens that range, and the vendor plugins built on it are
+1.x as well, none of them working with core 2.0 yet. The `definePlugin` form
+above is in `@dianemo/core` and always available, so reach for it if the
 install fails — the two differ only in how `tryHandleRequest` arrives.
 
 This is what the published

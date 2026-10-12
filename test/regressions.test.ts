@@ -627,6 +627,19 @@ describe("handler key validation", () => {
         } as unknown as ConstructorParameters<typeof RequestHandler>[0])
     ).toThrow(/non-empty `key`/);
   });
+
+  it("refuses a key shorter than 32 characters with key_too_short", async () => {
+    const { memoryBackend } =
+      await import("../packages/core/src/backend/memory.js");
+    expect(
+      () =>
+        new RequestHandler({ key: "a".repeat(31), backend: memoryBackend() })
+    ).toThrow(expect.objectContaining({ code: "key_too_short" }));
+    expect(
+      () =>
+        new RequestHandler({ key: "a".repeat(32), backend: memoryBackend() })
+    ).not.toThrow();
+  });
 });
 
 /**

@@ -408,7 +408,10 @@ export interface RetryOptions {
   /** Retried without freezing the fleet, unlike a 429 or 5xx. */
   retryStatusCodes: number[];
   /**
-   * The number of requests in a row must come back with a 2xx status to start sending requests at full speed again after a rate limit has been breached
+   * How many thaw probes must succeed, after a 429's freeze has lapsed, before
+   * the client sends at full rate again. A probe succeeds on any response that
+   * would not itself freeze the client — a 404 included — and fails on a 429,
+   * a 5xx, a dropped connection, or a failure `classifyError` freezes on.
    *
    * **Default value: 3**
    */

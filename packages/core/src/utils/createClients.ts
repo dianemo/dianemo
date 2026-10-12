@@ -2,6 +2,7 @@ import SharedLimitClient from "../client/clientTypes/sharedLimitClient.js";
 import { inheritCredentialLine } from "../client/methods/authenticate.js";
 import { ClientConflictError, ConfigurationError } from "../errors.js";
 import MeteredClient from "../client/clientTypes/meteredClient.js";
+import { assertNameSegment } from "./clientName.js";
 import type BaseClient from "../client/index.js";
 import type RequestHandler from "../index.js";
 import type {
@@ -71,6 +72,7 @@ export function prepareClients(
   const replacements: BaseClient[] = [];
   const walk = (list: CreateClientData[], parent?: CreateClientData) => {
     for (const declared of list) {
+      if (parent) assertNameSegment(declared.name, "A sub-client's name");
       const client = parent
         ? mergeChildParentClients(declared, parent)
         : declared;

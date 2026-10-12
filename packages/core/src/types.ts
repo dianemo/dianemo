@@ -182,7 +182,11 @@ export interface ClientTemplates {}
 export type StartupHook = (handler: RequestHandler) => Promise<void> | void;
 
 export interface RequestHandlerConstructorOptions {
-  /** Encrypts every stored credential. Changing it orphans what is already stored. */
+  /**
+   * Encrypts every stored credential. At least 32 characters: use a
+   * high-entropy secret from your secret store, not a literal. Changing it
+   * orphans what is already stored.
+   */
   key: string;
   /**
    * Where the shared state lives. Pick by how many processes will run this handler:

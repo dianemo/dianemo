@@ -194,16 +194,17 @@ help — the coercion happens before the quotes matter.
 ### Tests read source, not the build
 
 `vitest.config.ts` aliases `@dianemo/core` and `@dianemo/backend-redis` to their `src/index.ts`,
-matching the `paths` the root `tsconfig.json` already gives tsc. Both resolvers therefore agree,
-and `npm test` runs on a fresh clone before anything has been built.
+and `@dianemo/core/backend` to `src/backend/index.ts`, matching the `paths` the root
+`tsconfig.json` already gives tsc. Both resolvers therefore agree, and `npm test` runs on a fresh
+clone before anything has been built. A new subpath export needs an entry in both.
 
 The alias is load-bearing rather than a convenience. The Redis backend imports runtime values from
-`@dianemo/core` by name, not only types — the TTL normalisers, the stored-number parsers, the
-queue-score constants — in `ops/`, `lua/` and `requestCodec.ts`. Without it those resolve through
-the `node_modules/@dianemo/core` symlink onto `packages/core/dist`, which a fresh clone has not built —
-so every suite fails to collect — and a *stale* `dist` is worse, because the Redis half of a run
-then reads compiled core while the memory half reads the source you just edited. The two disagree
-and it reads as a parity bug in the backend you did not touch.
+`@dianemo/core/backend` by name, not only types — the TTL normalisers, the stored-number parsers,
+the queue-score constants — in `ops/`, `lua/` and `requestCodec.ts`. Without it those resolve
+through the `node_modules/@dianemo/core` symlink onto `packages/core/dist`, which a fresh clone has
+not built — so every suite fails to collect — and a *stale* `dist` is worse, because the Redis half
+of a run then reads compiled core while the memory half reads the source you just edited. The two
+disagree and it reads as a parity bug in the backend you did not touch.
 
 `npm run build` is still required before packing or publishing, since `main` and `exports` name
 `dist`. It is not required to run the tests.

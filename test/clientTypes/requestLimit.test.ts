@@ -112,6 +112,45 @@ describe.each(harnesses(5))("requestLimit — $name", (harness) => {
     );
   }, 30_000);
 
+  it("steps over a queued request whose cost cannot be spent", async () => {
+    await run(
+      { interval: 60_000, tokensToAdd: 10, maxTokens: 10 },
+      async (handler) => {
+        // What a replica on older code, or anything else with write access to
+        // the keyspace, can leave at the head of the queue.
+        const clients = (
+          handler as unknown as {
+            clients: Map<
+              string,
+              { addRequestToQueue(entry: unknown): Promise<boolean> }
+            >;
+          }
+        ).clients;
+        const client = clients.get(CLIENT)!;
+        await client.addRequestToQueue({
+          requestId: "unspendable",
+          clientName: CLIENT,
+          requestName: "t.unspendable",
+          status: "pending",
+          priority: 10,
+          cost: -5,
+          retries: 0,
+          timestamp: Date.now(),
+          ownerId: handler.getInstanceId(),
+        });
+        const started = Date.now();
+        const res = await handler.handleRequest({
+          clientName: CLIENT,
+          requestName: "t.behind",
+          method: "GET",
+          url: "/",
+        });
+        expect(res.status).toBe(200);
+        expect(Date.now() - started).toBeLessThan(5_000);
+      }
+    );
+  }, 30_000);
+
   it("absorbs a burst up to maxTokens and then paces", async () => {
     // maxTokens above tokensToAdd is the documented burst allowance: a full
     // bucket at t=0 covers all twenty with no refill wait.

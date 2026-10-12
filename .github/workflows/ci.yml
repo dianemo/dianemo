@@ -36,7 +36,12 @@ jobs:
         run: npm run build
 
   test:
-    name: Tests (both backends)
+    # The lockfile's ioredis, and the lowest one the peer range admits.
+    name: Tests (both backends)${{ matrix.ioredis && format(' - ioredis {0}', matrix.ioredis) || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ioredis: ["", "5.4.0"]
     runs-on: ubuntu-latest
     services:
       redis:
@@ -54,6 +59,15 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Swap in ioredis ${{ matrix.ioredis }}
+        if: matrix.ioredis
+        # Both manifests, not `npm install --no-save`: that leaves the backend
+        # package's own devDependency resolving a nested copy of the newer one.
+        run: |
+          npm pkg set devDependencies.ioredis=${{ matrix.ioredis }}
+          npm pkg set devDependencies.ioredis=${{ matrix.ioredis }} -w @dianemo/backend-redis
+          npm install
+          npm ls ioredis
       # The conformance suite runs against every backend, so this is the run
       # that proves the two agree rather than merely both working.
       - name: Test with Redis available

@@ -37,6 +37,13 @@ parseClientName("fedex:acme-co:production:rest");
 `parseClientName` returns `null` for anything with fewer than three segments —
 `default`, the handler's no-template client, is the usual case.
 
+Every segment — the template name, `organizationId`, `instanceId` and each
+sub-client's `name` — must be non-empty and free of `:` and whitespace. A colon
+would shift the segments after it, and backend keys normalize whitespace to
+`_`, so two names differing only by a space would share one budget and one
+credential entry. A template name is refused with `invalid_template_name`, the
+others with `invalid_client_name_segment`.
+
 Use `parseClientName` in anything that receives a client name from elsewhere: a
 metrics listener, a dynamic rate-limit controller, an admin UI. Splitting on `:`
 by hand works right up until a sub-client path appears.
@@ -230,7 +237,10 @@ that client's queue; the rest enqueue and await a `requestReady` broadcast.
 
 This is why recovery is not a thundering herd, and why adding replicas does not
 multiply the work done on the shared queue. When an instance stops or stops
-heartbeating, its requests are reclaimed and roles are recomputed.
+heartbeating, its requests are reclaimed and roles are recomputed. A queued
+request a controller picked up but never admitted — its reply lost, or the
+controller gone mid-pass — is handed out again after `QUEUE_CLAIM_LEASE_MS`
+(2s); one that was admitted never is.
 
 Under the [memory backend](backends/memory.md) there is exactly one instance by
 definition, and it is always the controller.
@@ -266,9 +276,22 @@ on a client with exactly one `requestLimit` does.
 
 Recovery from a 429 is not "everyone retries at once". Once the deadline
 passes, one request at a time across the whole fleet is nominated as the **thaw
-probe**. Each probe that succeeds counts toward `thawRequestCount` (default 3),
-and the freeze clears when that many have. A failed probe does not consume thaw
-progress, and the next request becomes the next probe.
+probe**. A probe asks one question — has the upstream stopped limiting or
+failing? — and only an answer from the upstream settles it:
+
+- **Success:** the upstream returned a response that would not itself freeze
+  the client, a 404 or 400 included.
+- **Failure:** the upstream returned a response that freezes the client — a
+  429, a 5xx, or a status `classifyError` freezes on.
+- **No progress:** the probe got no response at all. It was aborted or timed
+  out before an answer, abandoned before dispatch, refused at connect, or its
+  connection was reset or timed out. A reset or timeout still arms a freeze as
+  any request's would, but the probe counts for nothing either way.
+
+Each probe that succeeds counts toward `thawRequestCount` (default 3), and the
+freeze clears when that many have. A failure or a probe that made no progress
+consumes no thaw progress, and the next request becomes the next probe; a
+failure also arms a freeze of its own first.
 
 With isolated grants, probing is per grant: one probe per grant rather than one
 per client, so recovering tenants do not wait behind each other. Without
@@ -287,8 +310,10 @@ arming concurrently cannot cut each other short. The same rule keeps a deadline
 computed from a skewed clock or from an extreme `retryBackoffBaseTime`. Such a
 deadline is bounded — both backends clamp it to 2^53-1 — but bounded far past
 any horizon you care about. Waiting the key out is not an escape either: the
-freeze key's TTL is sized from the deadline plus a minute, so it outlives the
-freeze rather than expiring under it.
+freeze key's TTL is sized from the deadline plus a minute, or plus a week while
+thaw probes are still owed, re-armed by each probe that succeeds and by the
+freeze each failed probe arms. It outlives the freeze rather than expiring
+under it; only a freeze nobody has probed for a week is dropped by its TTL.
 
 The escape hatch is the backend, not the client. Three methods on
 `DianemoBackend` exist for this, and nothing in the library calls them:

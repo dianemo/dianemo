@@ -1,9 +1,10 @@
-import type { QueuedRequest } from "@dianemo/core";
+import type { QueuedRequest } from "@dianemo/core/backend";
 import {
   formatStoredCost,
   parsePriority,
   parseStoredCost,
-} from "@dianemo/core";
+  parseStoredNumber,
+} from "@dianemo/core/backend";
 
 /**
  * The one place a queue entry crosses between a `QueuedRequest` and the Redis
@@ -33,9 +34,11 @@ export function decodeFlatHash(arr: unknown): Record<string, string> | null {
 }
 
 /**
- * Null unless all four of `requestId`, `clientName`, `requestName` and `status`
- * are present, which is how a caller tells a live entry from a remnant whose
- * metadata has partly expired under it.
+ * Null unless `requestId`, `clientName` and `status` are non-empty and
+ * `requestName` is present, which is how a caller tells a live entry from a
+ * remnant whose metadata has partly expired under it. An empty `requestName` is
+ * only an empty label. `getNextRequest`'s script checks the same fields before
+ * it claims, so it never claims an entry this would drop.
  */
 export function decodeRequest(
   metadata: Record<string, string> | null
@@ -44,11 +47,12 @@ export function decodeRequest(
     !metadata ||
     !metadata.requestId ||
     !metadata.clientName ||
-    !metadata.requestName ||
+    metadata.requestName === undefined ||
     !metadata.status
   ) {
     return null;
   }
+  const claimedAt = parseStoredNumber(metadata.claimedAt, NaN);
 
   return {
     requestId: metadata.requestId,
@@ -63,6 +67,7 @@ export function decodeRequest(
     isThawRequest: metadata.isThawRequest === "true",
     ...(metadata.settles === "true" ? { settles: true } : {}),
     ownerId: metadata.ownerId || "",
+    ...(Number.isFinite(claimedAt) ? { claimedAt } : {}),
   };
 }
 

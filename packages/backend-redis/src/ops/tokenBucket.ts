@@ -7,25 +7,38 @@ import type {
   SettleResult,
   SettleSpec,
   TokenBucketConfig,
-} from "@dianemo/core";
+} from "@dianemo/core/backend";
 import {
   claimMarkKey,
-  normalizeTtlSeconds,
+  normalizeStateTtlSeconds,
   parseFiniteStored,
-} from "@dianemo/core";
+} from "@dianemo/core/backend";
 
 /**
- * A mark's key and lifetime as the scripts take them: an empty key and no
- * lifetime when the claim asked for none. Normalised before the script runs,
- * which spends before it writes the mark — a TTL Redis rejects would raise with
- * the budget already gone.
+ * A mark's key, lifetime and presence flag as the scripts take them. With no
+ * mark the key slot carries the bucket's own key and the flag says `"0"`: a
+ * script's key count is fixed, and ioredis prefixes every `KEYS` entry, so an
+ * empty one would arrive naming the key the bare `keyPrefix` spells. Normalised
+ * before the script runs, which spends before it writes the mark — a TTL Redis
+ * rejects would raise with the budget already gone.
  */
-function markArgs(bucketKey: string, mark?: ClaimMark): [string, number] {
-  if (!mark) return ["", 0];
+function markArgs(bucketKey: string, mark?: ClaimMark): MarkArgs {
+  if (!mark) return [bucketKey, 0, "0"];
   return [
     claimMarkKey(bucketKey, mark.id),
-    normalizeTtlSeconds(mark.ttlSeconds),
+    normalizeStateTtlSeconds(mark.ttlSeconds),
+    "1",
   ];
+}
+
+/** `[markKey, markTtl, hasMark]`, in the order the scripts read them. */
+type MarkArgs = [string, number, "0" | "1"];
+
+/** One entry of the `settleTokens` reply: amounts as `exact` strings. */
+interface SettledReply {
+  settled: boolean;
+  applied: string;
+  unapplied: string;
 }
 
 /** Token-bucket operations. Twin of the memory backend's token-bucket section. */
@@ -47,8 +60,8 @@ export function tokenBucketOps(ctx: Ctx) {
       // Normalised here rather than left to the script, which spends the tokens
       // before its EXPIRE: a TTL Redis rejects would raise with the budget
       // already gone and nothing on this path to refund it.
-      const ttlSeconds = normalizeTtlSeconds(ttl);
-      const [markKey, markTtl] = markArgs(bucketKey, mark);
+      const ttlSeconds = normalizeStateTtlSeconds(ttl);
+      const [markKey, markTtl, hasMark] = markArgs(bucketKey, mark);
       const result = await ctx.run(
         "dianemoTryAdmitImmediately",
         queueKey,
@@ -60,7 +73,8 @@ export function tokenBucketOps(ctx: Ctx) {
         config.tokensToAdd,
         config.interval,
         ttlSeconds,
-        markTtl
+        markTtl,
+        hasMark
       );
       return result === 1;
     },
@@ -71,7 +85,7 @@ export function tokenBucketOps(ctx: Ctx) {
       config: TokenBucketConfig,
       mark?: ClaimMark
     ): Promise<AcquireTokensResult> {
-      const [markKey, markTtl] = markArgs(key, mark);
+      const [markKey, markTtl, hasMark] = markArgs(key, mark);
       const result = await ctx.run(
         "dianemoTokenBucket",
         key,
@@ -81,7 +95,8 @@ export function tokenBucketOps(ctx: Ctx) {
         config.tokensToAdd,
         config.interval,
         86400, // TTL for the key
-        markTtl
+        markTtl,
+        hasMark
       );
 
       const parsed = JSON.parse(result as string) as AcquireTokensResult;
@@ -192,11 +207,13 @@ export function tokenBucketOps(ctx: Ctx) {
         JSON.stringify(entries),
         86400
       );
-      const parsed = JSON.parse(result as string) as Omit<
-        SettleResult,
-        "key"
-      >[];
-      return specs.map((spec, i) => ({ key: spec.key, ...parsed[i] }));
+      const parsed = JSON.parse(result as string) as SettledReply[];
+      return specs.map((spec, i) => ({
+        key: spec.key,
+        settled: parsed[i].settled,
+        applied: parseLuaNumber(parsed[i].applied),
+        unapplied: parseLuaNumber(parsed[i].unapplied),
+      }));
     },
 
     async touchClaimMark(
@@ -204,7 +221,7 @@ export function tokenBucketOps(ctx: Ctx) {
       markId: string,
       ttlSeconds: number
     ): Promise<boolean> {
-      const ttl = normalizeTtlSeconds(ttlSeconds);
+      const ttl = normalizeStateTtlSeconds(ttlSeconds);
       return (
         (await ctx.redis.expire(claimMarkKey(bucketKey, markId), ttl)) === 1
       );
@@ -214,8 +231,8 @@ export function tokenBucketOps(ctx: Ctx) {
      * Returns budget claimed for a request that was never dispatched.
      *
      * `freezeKey` is optional to the caller but not to the script: a custom command
-     * is registered with a fixed key count, so an absent one is passed as an empty
-     * string and the script skips the freeze check.
+     * is registered with a fixed key count, so an absent one is passed as the
+     * bucket's own key with a `"0"` flag, for the reason `markArgs` gives.
      */
     async refundTokens(
       key: string,
@@ -226,9 +243,10 @@ export function tokenBucketOps(ctx: Ctx) {
       await ctx.run(
         "dianemoRefundTokens",
         key,
-        freezeKey ?? "",
+        freezeKey || key,
         cost,
-        maxTokens
+        maxTokens,
+        freezeKey ? "1" : "0"
       );
     },
   };

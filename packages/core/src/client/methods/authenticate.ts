@@ -1,12 +1,13 @@
 import { credentialTtlSeconds } from "../../utils/credentialTtl.js";
+import type { AxiosRequestConfig, GenericAbortSignal } from "axios";
 import { encrypt, decrypt } from "../../utils/encryption.js";
 import { sanitizeError } from "../../utils/redact.js";
 import type Request from "../../request/index.js";
-import type { AxiosRequestConfig } from "axios";
 import type Client from "../index.js";
 import {
   ConfigurationError,
   GrantRefreshTokenMissingError,
+  RequestAbortedError,
 } from "../../errors.js";
 import type {
   AuthDataBasic,
@@ -26,11 +27,7 @@ async function authenticate(this: Client, request: Request) {
   let value;
   if (type === "token") value = handleToken(this.authData);
   else if (type === "basic") value = handleBasic(this.authData);
-  else
-    value = await handleOAuth2.bind(this)(
-      this.authData,
-      request.config.grantId
-    );
+  else value = await handleOAuth2.bind(this)(this.authData, request);
   return { [headerName]: `${excludePrefix ? "" : `${prefix} `}${value}` };
 }
 
@@ -120,8 +117,9 @@ const MAX_TOKEN_LIFETIME_SECONDS = 60 * 60 * 24 * 365 * 10;
 async function handleOAuth2(
   this: Client,
   authData: AuthDataOAuth2,
-  grantId?: string
+  request: Request
 ) {
+  const { grantId, signal } = request.config;
   const existingToken = await getExistingToken.bind(this)(grantId);
   if (existingToken) return existingToken;
 
@@ -137,11 +135,17 @@ async function handleOAuth2(
       .finally(() => {
         inFlightRefreshes.delete(coalesceKey);
       });
+    // Every waiter may abort and leave, and a rejection nobody awaits would
+    // terminate the host under Node's default `--unhandled-rejections=throw`.
+    void refresh.catch(() => undefined);
     inFlightRefreshes.set(coalesceKey, refresh);
   }
   try {
-    return await refresh;
+    // An abort ends this caller's wait only; the refresh carries on for the
+    // others coalesced onto it.
+    return await unlessAborted(refresh, signal, request.id);
   } catch (error) {
+    if (error instanceof RequestAbortedError) throw error;
     const unexpired = await getUnexpiredToken.bind(this)(grantId);
     if (unexpired === undefined) throw error;
     this.logger.warn(
@@ -149,6 +153,28 @@ async function handleOAuth2(
       `Client ${this.name} | token renewal failed; using the cached token until it expires`
     );
     return unexpired;
+  }
+}
+
+/**
+ * Rejects with `RequestAbortedError` if `signal` aborts before `work` settles.
+ */
+async function unlessAborted<T>(
+  work: Promise<T>,
+  signal: GenericAbortSignal | undefined,
+  requestId: string
+): Promise<T> {
+  if (!signal?.addEventListener) return work;
+  if (signal.aborted) throw new RequestAbortedError(requestId);
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new RequestAbortedError(requestId));
+    signal.addEventListener?.("abort", onAbort);
+  });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    signal.removeEventListener?.("abort", onAbort);
   }
 }
 
@@ -359,7 +385,13 @@ async function handleRefreshMethod(
   // construction, and the call sits outside the request path's error handling.
   let res;
   try {
-    res = await this.http(config);
+    // Capped at the lock's TTL even when the client-wide timeout is longer or
+    // unset: past it a peer refreshes anyway, and a token endpoint that never
+    // answers would otherwise hold every request coalesced onto this refresh.
+    res = await this.http({
+      ...config,
+      timeout: refreshTimeout(this.http.defaults.timeout),
+    });
   } catch (error) {
     throw sanitizeError(error);
   }
@@ -368,6 +400,12 @@ async function handleRefreshMethod(
     return await refreshConfig.responseInterceptor(res);
   }
   return res.data as OAuthResponse | OAuthGrantTypeResponse;
+}
+
+function refreshTimeout(configured: number | undefined): number {
+  return configured && configured > 0 && configured < REFRESH_LOCK_TTL_MS
+    ? configured
+    : REFRESH_LOCK_TTL_MS;
 }
 
 async function generateConfig(

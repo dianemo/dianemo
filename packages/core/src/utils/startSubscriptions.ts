@@ -112,24 +112,27 @@ const PEER_TIMEOUT_MS = 12000;
 
 async function handleInstanceStarted(this: RequestHandler, message: string) {
   if (this.id === message) return;
-  this.heartbeatTimeouts.set(
-    message,
-    setTimeout(() => {
-      // A new async context, outside the `.catch` guarding pub/sub dispatch —
-      // and it fires exactly when the backend is most likely to be failing.
-      void (async () => {
-        this.logger.warn(
-          `Instance ${message} has not sent a heartbeat in ${PEER_TIMEOUT_MS}ms`
-        );
-        await handleInstanceStopped.bind(this)(message);
-      })().catch((error) => {
-        this.logger.error(
-          { error },
-          `Failed to handle presumed loss of instance ${message}`
-        );
-      });
-    }, PEER_TIMEOUT_MS)
-  );
+  // `stop()` clears these timers before its last wait, with the subscription
+  // still open, so one armed now would outlive it.
+  if (this.status === "stopping" || this.status === "stopped") return;
+  const timeout = setTimeout(() => {
+    // A new async context, outside the `.catch` guarding pub/sub dispatch —
+    // and it fires exactly when the backend is most likely to be failing.
+    void (async () => {
+      this.logger.warn(
+        `Instance ${message} has not sent a heartbeat in ${PEER_TIMEOUT_MS}ms`
+      );
+      await handleInstanceStopped.bind(this)(message);
+    })().catch((error) => {
+      this.logger.error(
+        { error },
+        `Failed to handle presumed loss of instance ${message}`
+      );
+    });
+  }, PEER_TIMEOUT_MS);
+  // Watching a peer is no reason to keep this process alive.
+  timeout.unref();
+  this.heartbeatTimeouts.set(message, timeout);
   await this.scheduleClientRoles();
 }
 

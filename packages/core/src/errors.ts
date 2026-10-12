@@ -127,8 +127,9 @@ export class NoResponseError extends RequestHandlerError {
  * - `shutdown_aborted` — the `signal` passed to `awaitClient` aborted.
  * - `handler_stopping` — a request or template mutation arrived during
  *   `stop()`.
- * - `handler_stopped` — a queued request was failed because the handler
- *   stopped or its client was removed.
+ * - `handler_stopped` — the handler was stopped and `start()` has not been
+ *   called since, or a queued or retrying request was failed because the
+ *   handler stopped or its client was removed.
  * - `client_removed` — grant tokens were stored for a client that was removed
  *   before or during the write; nothing is left stored.
  * - `shared_limit_parent_missing` — a `sharedLimit` client's budget owner is
@@ -224,8 +225,9 @@ function quoteList(names: readonly string[]): string {
 
 /**
  * The caller's `AbortSignal` fired before the request was dispatched: while it
- * was queued, or after admission while the `requestInterceptor` or a token
- * refresh ran. Whatever it had claimed is handed back.
+ * was queued, while it waited out a retry's back-off, or after admission while
+ * the `requestInterceptor` or a token refresh ran. Whatever it had claimed is
+ * handed back, and a token refresh other requests are waiting on carries on.
  *
  * Raised instead of letting the request wait for capacity it will never use,
  * or spend a token or a concurrency slot on a request axios would then refuse.

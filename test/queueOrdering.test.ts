@@ -4,7 +4,7 @@ import {
   MAX_QUEUE_PRIORITY as MAX_PRIORITY,
   MAX_QUEUE_RETRIES as MAX_RETRIES,
   QUEUE_SCORE_EPOCH_MS as SCORE_EPOCH_MS,
-} from "../packages/core/src/index.js";
+} from "../packages/core/src/backend/index.js";
 
 // A plausible "now" well after the score epoch.
 const NOW = SCORE_EPOCH_MS + 200 * 24 * 60 * 60 * 1000;

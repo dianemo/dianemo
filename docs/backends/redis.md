@@ -61,6 +61,26 @@ pub/sub duplicate, and `close()` quits it — so sharing one backend between two
 handlers means either handler's `stop()` leaves the other receiving no
 coordination messages at all. Give each handler its own `redisBackend()`.
 
+## An ioredis `keyPrefix`
+
+A connection built with ioredis's own `keyPrefix` option is supported, and it
+isolates fleets: two fleets on one Redis whose connections differ only in that
+prefix share no keys and receive none of each other's pub/sub messages.
+
+ioredis prepends the prefix to keys it can see as keys, but not to script
+arguments or channel names. The backend reads the connection's
+`options.keyPrefix` and applies it to those itself, on the pub/sub duplicate as
+well. Handlers still receive the channel name without the prefix.
+
+It stacks with the handler's own `keyPrefix` option rather than replacing it.
+The handler's prefix goes inside the key names
+[listed under Clearing a freeze by hand](../concepts.md#clearing-a-freeze-by-hand),
+and the connection's goes in front of those, so with both set a freeze key is
+stored as `<ioredis keyPrefix><keyPrefix>:requestHandler:<clientName>:freezeState`.
+Either one keeps two fleets apart. The backend's methods take keys without the
+connection's prefix, so pass the handler-level form to `clearFreezeState` and
+the other manual calls.
+
 ## How atomicity is achieved
 
 Every operation that spends from a shared budget has to be atomic against every
@@ -122,6 +142,14 @@ atomic script, taking a request from nine round-trips down to two, or one for a
 - **Failover.** ioredis handles reconnection. Coordination state is rebuilt from
   what remains; a lost queue means in-flight requests are re-driven by their
   callers rather than silently dropped.
+- **A restart that loses state is briefly permissive.** A Redis that comes back
+  without dianemo's keys — restarted without persistence, or failed over to a
+  replica that had not caught up — reads absent state the way it reads evicted
+  state: as permissive. Token buckets read as full, so the fleet can spend a
+  whole interval's budget at once, and the concurrency slots held by requests
+  still upstream are gone, so new requests are admitted beside them and
+  `maxConcurrency` is briefly exceeded until those finish. Run Redis with
+  persistence if a burst like that would cost you with the vendor.
 - **Replica clock skew does not affect coordination.** Every script that decides
   fleet-wide state reads Redis's own clock with `TIME`, so a freeze deadline, a
   token bucket's `lastUpdate` and a concurrency slot's age are all written and

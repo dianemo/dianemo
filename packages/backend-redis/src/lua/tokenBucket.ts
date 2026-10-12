@@ -1,3 +1,4 @@
+import { BALANCE_TOLERANCE } from "@dianemo/core/backend";
 import {
   bucketTtlFn,
   exactFn,
@@ -20,7 +21,8 @@ import {
 
 export const tokenBucket = `
   local key = KEYS[1]
-  -- '' when the claim asks for no mark.
+  -- The bucket's own key when the claim asks for no mark; see markArgs in
+  -- ops/tokenBucket.ts.
   local markKey = KEYS[2]
   local cost = tonumber(ARGV[1])
   local maxTokens = tonumber(ARGV[2])
@@ -29,6 +31,7 @@ export const tokenBucket = `
   -- ARGV is positional; see ttlArgvWarning in fragments.ts for the trap.
   local ttl = tonumber(ARGV[5]) or 86400
   local markTtl = tonumber(ARGV[6]) or 0
+  local hasMark = ARGV[7] == '1'
 
 ${redisNow()}
 
@@ -73,11 +76,12 @@ ${bucketTtlFn()}
 
 ${lazyRefill()}
 
-  if tokens >= cost then
+  -- Twin of coversCost in the core package's backend/balance.ts.
+  if tokens >= cost - math.min(maxTokens, cost) * ${BALANCE_TOLERANCE} then
     tokens = tokens - cost
     redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
     redis.call('EXPIRE', key, ttl)
-    if markKey ~= '' then writeMark(markKey, markTtl, cost, overflow, fills, key) end
+    if hasMark then writeMark(markKey, markTtl, cost, overflow, fills, key) end
     return cjson.encode({ acquired = true, remainingTokens = exact(tokens) })
   else
     -- lastUpdate only advances in whole intervals, so (now - lastUpdate) is
@@ -108,9 +112,12 @@ ${lazyRefill()}
  */
 export const refundTokens = `
   local key = KEYS[1]
+  -- The bucket's own key when the caller names no freeze; see refundTokens in
+  -- ops/tokenBucket.ts.
   local freezeKey = KEYS[2]
   local cost = tonumber(ARGV[1])
   local maxTokens = tonumber(ARGV[2])
+  local hasFreeze = ARGV[3] == '1'
 ${finiteNumberFn()}
 ${usableCostFn()}
 
@@ -120,7 +127,7 @@ ${usableCostFn()}
   -- emptiesBucket is a freeze from before the field existed, and those all did.
   -- finiteNumber, as the memory twin's parseFiniteStored: an unusable deadline
   -- is no freeze, as every freeze gate reads it.
-  if freezeKey ~= '' then
+  if hasFreeze then
     local freeze = redis.call('HMGET', freezeKey, 'frozenUntil', 'emptiesBucket')
 ${redisNow("    ")}
     if finiteNumber(freeze[1], 0) > now and freeze[2] ~= '0' then return 0 end
@@ -163,7 +170,8 @@ export const tryAdmitImmediately = `
   local queueKey = KEYS[1]
   local bucketKey = KEYS[2]
   local freezeKey = KEYS[3]
-  -- '' when the claim asks for no mark.
+  -- The bucket's own key when the claim asks for no mark; see markArgs in
+  -- ops/tokenBucket.ts.
   local markKey = KEYS[4]
   local cost = tonumber(ARGV[1])
   local maxTokens = tonumber(ARGV[2])
@@ -172,6 +180,7 @@ export const tryAdmitImmediately = `
   -- ARGV is positional; see ttlArgvWarning in fragments.ts for the trap.
   local ttl = tonumber(ARGV[5]) or 86400
   local markTtl = tonumber(ARGV[6]) or 0
+  local hasMark = ARGV[7] == '1'
 
 ${redisNow()}
 
@@ -200,7 +209,7 @@ ${freezeGate()}
 
 ${lazyRefill()}
 
-  if tokens < cost then
+  if not (tokens >= cost - math.min(maxTokens, cost) * ${BALANCE_TOLERANCE}) then
     redis.call('HSET', bucketKey, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
     redis.call('EXPIRE', bucketKey, ttl)
     return 0
@@ -209,7 +218,7 @@ ${lazyRefill()}
   tokens = tokens - cost
   redis.call('HSET', bucketKey, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
   redis.call('EXPIRE', bucketKey, ttl)
-  if markKey ~= '' then writeMark(markKey, markTtl, cost, overflow, fills, bucketKey) end
+  if hasMark then writeMark(markKey, markTtl, cost, overflow, fills, bucketKey) end
   return 1
 `;
 
@@ -262,6 +271,8 @@ ${finiteNumberFn()}
 
 ${bucketTtlFn()}
 
+${exactFn()}
+
   local results = {}
   for i, entry in ipairs(entries) do
     local key = KEYS[entry.k]
@@ -271,9 +282,9 @@ ${bucketTtlFn()}
     local tokensToAdd = tonumber(entry.tokensToAdd)
     local interval = tonumber(entry.interval)
     local maxDebt = tonumber(entry.maxDebt)
-    local result = { settled = false, applied = 0, unapplied = 0 }
+    local result = { settled = false, applied = exact(0), unapplied = exact(0) }
 
-    local mark = redis.call('HMGET', markKey, 'claimed', 'overflow', 'fills', 'generation')
+    local mark = redis.call('HMGET', markKey, 'claimed', 'overflow', 'fills', 'generation', 'epoch', 'forgiven')
     -- Checked before the mark is consumed, so a settlement this script cannot
     -- act on leaves it for one that can.
     local usable = mark[1] ~= false
@@ -294,19 +305,28 @@ ${bucketTtlFn()}
 
 ${lazyRefill("        ")}
 
-        local generation = finiteNumber(redis.call('HGET', key, 'generation'), 0)
+        local bucket = redis.call('HMGET', key, 'generation', 'epoch', 'forgiven')
+        local generation = finiteNumber(bucket[1], 0)
+        local epoch = bucket[2] or ''
+        local forgiven = finiteNumber(bucket[3], 0)
         local claimed = finiteNumber(mark[1], 0)
         local overflowAtClaim = finiteNumber(mark[2], 0)
         local fillsAtClaim = finiteNumber(mark[3], 0)
         local generationAtClaim = finiteNumber(mark[4], 0)
+        local epochAtClaim = mark[5] or ''
+        local forgivenAtClaim = finiteNumber(mark[6], 0)
 
         local applied = 0
         local unapplied = 0
-        if generation == generationAtClaim and overflow >= overflowAtClaim and fills >= fillsAtClaim then
+        if epochAtClaim ~= '' and epoch == epochAtClaim and generation == generationAtClaim
+          and overflow >= overflowAtClaim and fills >= fillsAtClaim then
           local delta = actual - claimed
           if delta > 0 then
-            local owed = delta - (overflow - overflowAtClaim)
-            if owed < 0 then owed = 0 end
+            local slack = overflow - overflowAtClaim - (forgiven - forgivenAtClaim)
+            if slack < 0 then slack = 0 end
+            local used = math.min(delta, slack)
+            local owed = delta - used
+            forgiven = forgiven + used
             local debt = 0
             if maxDebt ~= nil and maxDebt == maxDebt and maxDebt ~= math.huge and maxDebt > 0 then
               debt = maxDebt
@@ -323,10 +343,11 @@ ${lazyRefill("        ")}
         end
 
         tokens = tokens - applied
-        redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills)
+        redis.call('HSET', key, 'tokens', tokens, 'lastUpdate', lastUpdate, 'overflow', overflow, 'fills', fills,
+          'forgiven', forgiven)
         redis.call('EXPIRE', key, bucketTtl(baseTtl, maxTokens, tokensToAdd, interval))
-        result.applied = applied
-        result.unapplied = unapplied
+        result.applied = exact(applied)
+        result.unapplied = exact(unapplied)
       end
     end
     results[i] = result

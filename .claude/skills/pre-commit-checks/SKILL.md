@@ -60,8 +60,9 @@ Two passes. The first covers `packages/*/src/**` and `test/**`; the second cover
 command.
 
 The root `tsconfig.json` maps `@dianemo/core` and `@dianemo/backend-redis` to their
-`src/index.ts` via `paths`, so a core change is typechecked against the Redis backend here
-rather than after a publish. No build is needed first.
+`src/index.ts` via `paths`, and `@dianemo/core/backend` to `src/backend/index.ts`, so a core
+change is typechecked against the Redis backend here rather than after a publish. No build
+is needed first.
 
 ## 3. Lint
 
@@ -126,11 +127,12 @@ the machine rather than the code. A slow run is not a hung one.
 
 ### Tests read source, not `dist`
 
-`vitest.config.ts` aliases both packages to their `src/index.ts`, matching the `paths` the
-root `tsconfig.json` gives tsc. So `npm test` works on a fresh clone before anything is
-built, and — more importantly — a **stale `dist` cannot poison a run**. Without the alias
-the Redis half of a run reads compiled core while the memory half reads your edits, the two
-disagree, and it reads as a parity bug in the backend you did not touch.
+`vitest.config.ts` aliases both packages to their `src/index.ts`, and the
+`@dianemo/core/backend` subpath to its entry, matching the `paths` the root `tsconfig.json`
+gives tsc. So `npm test` works on a fresh clone before anything is built, and — more
+importantly — a **stale `dist` cannot poison a run**. Without the alias the Redis half of a
+run reads compiled core while the memory half reads your edits, the two disagree, and it
+reads as a parity bug in the backend you did not touch.
 
 ## 6. A version plan, if a published package changed
 

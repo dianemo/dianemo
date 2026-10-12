@@ -1,8 +1,8 @@
+import { normalizeTtlSeconds } from "@dianemo/core/backend";
 import { createContext, type Ctx } from "./context.js";
 import { concurrencyOps } from "./ops/concurrency.js";
 import { tokenBucketOps } from "./ops/tokenBucket.js";
 import { multiLimitOps } from "./ops/multiLimit.js";
-import { normalizeTtlSeconds } from "@dianemo/core";
 import { instanceOps } from "./ops/instances.js";
 import { freezeOps } from "./ops/freeze.js";
 import { queueOps } from "./ops/queue.js";
@@ -12,7 +12,10 @@ import type {
   BatchOptions,
   DianemoBackend,
   MessageHandler,
-} from "@dianemo/core";
+} from "@dianemo/core/backend";
+
+/** How long `close()` waits for the pub/sub duplicate to answer QUIT. */
+const LISTENER_QUIT_TIMEOUT_MS = 500;
 
 /**
  * Whole milliseconds for `SET ... PX`, which rejects a fractional argument.
@@ -196,7 +199,7 @@ class RedisBackend implements DianemoBackend {
           if (ttl !== undefined) chain.expire(op.key, ttl);
           break;
         case "publish":
-          chain.publish(op.channel, op.message);
+          chain.publish(this.ctx.keyPrefix + op.channel, op.message);
           break;
       }
     }
@@ -238,11 +241,17 @@ class RedisBackend implements DianemoBackend {
 
   // --------------------------------------------------------------- pub/sub
 
+  // Channels carry the connection's ioredis `keyPrefix`, which ioredis does not
+  // apply to them itself, so fleets kept apart by that prefix stay apart here.
+  // Handlers see the unprefixed name, as on the memory twin.
   async publish(channel: string, message: string): Promise<void> {
-    await this.redis.publish(channel, message);
+    await this.redis.publish(this.ctx.keyPrefix + channel, message);
   }
 
   async subscribe(channels: string[], handler: MessageHandler): Promise<void> {
+    // `SUBSCRIBE` with no channel is an arity error, not a no-op.
+    if (!channels.length) return;
+    const prefix = this.ctx.keyPrefix;
     if (!this.listener) {
       // A subscribed connection cannot run ordinary commands, so pub/sub needs
       // its own. This duplicate is the only connection the backend owns.
@@ -252,7 +261,8 @@ class RedisBackend implements DianemoBackend {
       // listener on it, so a listener per call would both re-deliver another
       // call's channels and grow the emitter without bound. Twin of the memory
       // backend's `subscribed` map.
-      this.listener.on("message", (channel: string, message: string) => {
+      this.listener.on("message", (wireChannel: string, message: string) => {
+        const channel = wireChannel.slice(prefix.length);
         // Copied, so a handler that subscribes while dispatching cannot mutate
         // the set being iterated.
         for (const h of [...(this.subscribed.get(channel) ?? [])]) {
@@ -268,7 +278,7 @@ class RedisBackend implements DianemoBackend {
       }
       handlers.add(handler);
     }
-    await this.listener.subscribe(...channels);
+    await this.listener.subscribe(...channels.map((c) => prefix + c));
   }
 
   // ---------------------------------------------------------------- clock
@@ -368,6 +378,9 @@ class RedisBackend implements DianemoBackend {
   getNextRequest(...a: Parameters<DianemoBackend["getNextRequest"]>) {
     return this.ops.queue.getNextRequest(...a);
   }
+  confirmRequest(...a: Parameters<DianemoBackend["confirmRequest"]>) {
+    return this.ops.queue.confirmRequest(...a);
+  }
   getRequest(...a: Parameters<DianemoBackend["getRequest"]>) {
     return this.ops.queue.getRequest(...a);
   }
@@ -447,11 +460,23 @@ class RedisBackend implements DianemoBackend {
     // Cleared first, so a second close cannot quit the same connection twice.
     const listener = this.listener;
     this.listener = null;
-    // `quit()` sends QUIT and waits for a reply that never arrives on a
-    // connection that never reached the server. `disconnect()` tears down
-    // without a round trip.
+    // `quit()` waits for a reply to QUIT, which never comes on a connection
+    // that never reached the server, nor, since ioredis has no command timeout
+    // by default, from one that stopped answering with the socket open.
+    // `disconnect()` needs no round trip. The bound sits below the handler's
+    // 1 s grace for `close()`, so this fallback runs first.
     if (listener.status === "ready") {
-      await listener.quit().catch(() => listener.disconnect());
+      const quit = listener.quit().then(
+        () => true,
+        () => false
+      );
+      let timer: NodeJS.Timeout | undefined;
+      const expired = new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), LISTENER_QUIT_TIMEOUT_MS);
+      });
+      const quitCleanly = await Promise.race([quit, expired]);
+      clearTimeout(timer);
+      if (!quitCleanly) listener.disconnect();
       return;
     }
     listener.disconnect();
@@ -471,7 +496,7 @@ class RedisBackend implements DianemoBackend {
  *
  * ```ts
  * import { Redis } from "ioredis";
- * import RequestHandler from "@dianemo/core";
+ * import RequestHandler from "@dianemo/core/backend";
  * import { redisBackend } from "@dianemo/backend-redis";
  *
  * const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");

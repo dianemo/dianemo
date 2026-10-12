@@ -1,3 +1,4 @@
+import { PassThrough, pipeline, type Readable } from "node:stream";
 import type { AxiosError } from "axios";
 
 /**
@@ -96,11 +97,34 @@ export function redactHeaders(
   return out;
 }
 
+const USERINFO_WITH_PASSWORD =
+  /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#@:]*:)([^/?#]*)@/i;
+
+/**
+ * A password holding a raw `?` or `#`, which an unescaped one from a config
+ * file can. Tried only when the strict form above found no userinfo. It also
+ * matches a port followed by a query holding `@`, which reads the same.
+ * Anchored, and only its last run backtracks, so a match stays linear in the
+ * URL's length.
+ */
+const USERINFO_WITH_RAW_PASSWORD =
+  /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#@:]*:)([^/]*)@/i;
+
+function redactPassword(url: string): string {
+  const match =
+    USERINFO_WITH_PASSWORD.exec(url) ?? USERINFO_WITH_RAW_PASSWORD.exec(url);
+  if (!match) return url;
+  const [whole, scheme, user] = match;
+  return `${scheme}${user}${REDACTED}@${url.slice(whole.length)}`;
+}
+
 /**
  * Strips credentials from a URL's query string and userinfo.
  *
  * Redacting `params` is not enough on its own: an OAuth refresh built with
  * `dataLocation: "urlQuery"` puts `client_secret` inline in `url` instead.
+ *
+ * Where userinfo and a port-then-query cannot be told apart, it redacts.
  */
 export function redactUrl(url: string | undefined): string | undefined {
   if (!url) return url;
@@ -109,18 +133,10 @@ export function redactUrl(url: string | undefined): string | undefined {
   // as the username (`https://ghp_xxx@host/…`) is the whole credential and has no
   // password component to strip, so userinfo without a colon is replaced wholesale.
   // Scheme-relative `//user@host` is covered as well.
-  const out = url
-    .replace(
-      /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/@]*:)([^/@]*)@/i,
-      (_m, scheme: string, user: string) => `${scheme}${user}${REDACTED}@`
-    )
-    // No colon means the userinfo IS the credential — a PAT or bearer used as
-    // the username — so there is no password half to strip and the whole
-    // component goes.
-    .replace(
-      /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/@:]+)@/i,
-      (_m, scheme: string) => `${scheme}${REDACTED}@`
-    );
+  const out = redactPassword(url).replace(
+    /^([a-z][a-z0-9+.-]*:\/\/|\/\/)([^/?#:]+)@/i,
+    (_m, scheme: string) => `${scheme}${REDACTED}@`
+  );
 
   const queryStart = out.indexOf("?");
   if (queryStart === -1) return out;
@@ -210,6 +226,16 @@ function safeDecode(value: string): string {
   }
 }
 
+/** A Node readable, such as the body of a `responseType: "stream"` response. */
+export function isReadableStream(value: unknown): value is Readable {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as Readable).pipe === "function" &&
+    typeof (value as Readable).destroy === "function"
+  );
+}
+
 /**
  * Redacts a body by key name and by value shape. Tracks visited objects, since
  * a cyclic `config.data` would otherwise throw from inside a catch block.
@@ -233,6 +259,9 @@ export function redactBody(
   seen.add(value);
 
   if (Array.isArray(value)) return value.map((v) => redactBody(v, seen));
+  // A copy of a stream's fields is not its body, and replacing the stream with
+  // one leaves its owner nothing to read or destroy.
+  if (isReadableStream(value)) return "[stream]";
 
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
@@ -261,6 +290,17 @@ export function redactConfig(
     ),
     data: redactBody(config.data),
   };
+}
+
+/**
+ * A relay of a streamed error body. The body itself is an `IncomingMessage`,
+ * which reaches the socket and through it the `ClientRequest` whose `_header`
+ * holds what was sent. `pipeline` destroys the body when the relay is.
+ */
+function detachedBody(body: Readable): Readable {
+  const relay = new PassThrough();
+  pipeline(body, relay, () => undefined);
+  return relay;
 }
 
 /**
@@ -310,7 +350,9 @@ export function sanitizeError(
         extraHeaderNames
       );
     }
-    if (err.response.data !== undefined) {
+    if (isReadableStream(err.response.data)) {
+      err.response.data = detachedBody(err.response.data);
+    } else if (err.response.data !== undefined) {
       err.response.data = redactBody(err.response.data);
     }
     // Some upstreams echo the offending value into the reason phrase.

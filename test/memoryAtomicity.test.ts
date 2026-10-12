@@ -430,6 +430,30 @@ describe("memory backend: a bucket slower than a day", () => {
   });
 });
 
+describe("memory backend: an emptied bucket's lifetime", () => {
+  const ttlSeconds = (backend: DianemoBackend, key: string) => {
+    const { store } = backend as unknown as {
+      store: Map<string, { expiresAt?: number }>;
+    };
+    const expiresAt = store.get(key)?.expiresAt;
+    return expiresAt === undefined
+      ? Infinity
+      : Math.round((expiresAt - Date.now()) / 1000);
+  };
+
+  it("gives an emptied bucket the default lifetime when its config cannot refill", async () => {
+    const backend = memoryBackend();
+    const config = { maxTokens: 10, tokensToAdd: 1, interval: 1000 };
+    await backend.acquireTokens("mk:emptied", 1, config);
+    await backend.emptyTokenBucket!("mk:emptied", {
+      ...config,
+      tokensToAdd: 0,
+    });
+    expect(ttlSeconds(backend, "mk:emptied")).toBeLessThanOrEqual(86_400);
+    await backend.close();
+  });
+});
+
 // ------------------------------------------------------------ backend parity
 
 describe.each(harnesses(0))(
@@ -606,6 +630,87 @@ describe("memory backend: the frozen-grants set", () => {
 
     vi.setSystemTime(Date.now() + 86_401_000);
     expect(await backend.smembers("fg:set")).toEqual([]);
+    await backend.close();
+  });
+});
+
+describe("memory backend: a freeze still owed probes", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const DAY_MS = 86_400_000;
+
+  it("keeps a lapsed freeze in force while thaw probes are still owed", async () => {
+    const backend = memoryBackend();
+    const frozenUntil = Date.now() + 1_000;
+    await backend.armFreeze("fp:freeze", frozenUntil, 3);
+
+    vi.setSystemTime(Date.now() + 62_000);
+
+    expect(await backend.getFreezeState("fp:freeze")).toEqual({
+      frozenUntil,
+      thawRequestCount: 3,
+    });
+    await backend.close();
+  });
+
+  it("re-arms a lapsed freeze's lifetime each time a thaw probe succeeds", async () => {
+    const backend = memoryBackend();
+    const frozenUntil = Date.now() + 1_000;
+    await backend.armFreeze("fp:freeze", frozenUntil, 3);
+
+    vi.setSystemTime(Date.now() + 6 * DAY_MS);
+    await backend.updateThawProgress("fp:freeze", true);
+    vi.setSystemTime(Date.now() + 6 * DAY_MS);
+    await backend.updateThawProgress("fp:freeze", true);
+    vi.setSystemTime(Date.now() + 6 * DAY_MS);
+
+    expect(await backend.getFreezeState("fp:freeze")).toEqual({
+      frozenUntil,
+      thawRequestCount: 1,
+    });
+    await backend.close();
+  });
+
+  it("leaves a lapsed freeze's lifetime to the freeze a failed probe arms", async () => {
+    const backend = memoryBackend();
+    await backend.armFreeze("fp:freeze", Date.now() + 1_000, 3);
+
+    vi.setSystemTime(Date.now() + 6 * DAY_MS);
+    await backend.updateThawProgress("fp:freeze", false);
+    vi.setSystemTime(Date.now() + DAY_MS + 2_000);
+
+    expect(await backend.getFreezeState("fp:freeze")).toBeNull();
+    await backend.close();
+  });
+
+  it("remembers a probe completion for as long as the freeze it counts against", async () => {
+    const backend = memoryBackend();
+    const frozenUntil = Date.now() - 1;
+    await backend.armFreeze("fp:freeze", frozenUntil, 3);
+    await backend.updateThawProgress("fp:freeze", true, "c1");
+
+    vi.setSystemTime(Date.now() + 6 * DAY_MS);
+    await backend.updateThawProgress("fp:freeze", true, "c1");
+
+    expect(await backend.getFreezeState("fp:freeze")).toEqual({
+      frozenUntil,
+      thawRequestCount: 2,
+    });
+    await backend.close();
+  });
+
+  it("drops a freeze nobody has probed for over a week", async () => {
+    const backend = memoryBackend();
+    await backend.armFreeze("fp:freeze", Date.now() + 1_000, 3);
+
+    vi.setSystemTime(Date.now() + 7 * DAY_MS + 2_000);
+
+    expect(await backend.getFreezeState("fp:freeze")).toBeNull();
     await backend.close();
   });
 });

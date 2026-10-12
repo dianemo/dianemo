@@ -8,17 +8,27 @@ import crypto from "node:crypto";
 const MAX_PRIORITY = 10;
 
 /**
- * Rejects a per-request `priority`, `cost`, `grantId` or `signal` that cannot be
- * honoured, where it enters — so it cannot surface later as a different and wrong
- * diagnosis. A negative cost is the dangerous one: the ceiling guard is a `>` test,
- * so it sails through, and `tokens - cost` then *adds* tokens.
+ * Rejects a per-request `requestName`, `priority`, `cost`, `grantId` or
+ * `signal` that cannot be honoured, where it enters — so it cannot surface
+ * later as a different and wrong diagnosis. A negative cost is the dangerous
+ * one: the ceiling guard is a `>` test, so it sails through, and
+ * `tokens - cost` then *adds* tokens.
  */
 function assertUsableRequest(
+  requestName: unknown,
   priority: number,
   cost: unknown,
   grantId?: string,
   signal?: unknown
 ): void {
+  if (typeof requestName !== "string" || !requestName.trim()) {
+    throw new ConfigurationError(
+      "invalid_request_name",
+      `requestName must be a non-empty string — it names the operation in spans, logs and the queue. Received ${JSON.stringify(
+        requestName
+      )}.`
+    );
+  }
   // An empty string is falsy everywhere `grantId` is tested, so it quietly fell
   // back to the client's own credentials — the request went out under the wrong
   // identity with no error and no log line. `grantId: row.externalId ?? ""` is
@@ -111,6 +121,7 @@ export default class Request {
     this.cost = config.cost ?? 1;
     this.explicitCost = config.cost;
     assertUsableRequest(
+      config.requestName,
       this.priority,
       this.cost,
       config.grantId,

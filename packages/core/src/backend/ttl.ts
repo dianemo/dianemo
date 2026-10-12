@@ -42,8 +42,13 @@ export const REQUEST_TOMBSTONE_TTL_SECONDS = 60;
  * the caller computed something it did not intend and the alternative is a key whose
  * lifetime nobody chose. Callers that legitimately have no bound should pass no TTL.
  *
- * A value at or below zero is returned unchanged and means "expire immediately" —
- * Redis `EXPIRE` semantics, which the memory backend matches.
+ * A value at or below zero returns `0`, which means "expire immediately" —
+ * Redis `EXPIRE` semantics, which the memory backend matches. Zero rather than
+ * the value itself: `EXPIRE` refuses a fraction such as `-0.5` as "not an
+ * integer", and it runs after the write it was meant to expire.
+ *
+ * This is the store's reading. A key holding rate-limit state takes
+ * {@link normalizeStateTtlSeconds} instead.
  */
 export function normalizeTtlSeconds(ttlSeconds: number): number {
   if (!Number.isFinite(ttlSeconds)) {
@@ -56,8 +61,54 @@ export function normalizeTtlSeconds(ttlSeconds: number): number {
       `ttlSeconds ${ttlSeconds} exceeds the maximum a backend can store (${REDIS_MAX_TTL_SECONDS})`
     );
   }
-  if (ttlSeconds <= 0) return ttlSeconds;
+  if (ttlSeconds <= 0) return 0;
   return Math.ceil(ttlSeconds);
+}
+
+/**
+ * Normalises the lifetime of a key holding rate-limit state — a token bucket,
+ * a slot ledger, a request queue, a claim mark — into whole seconds, or throws.
+ *
+ * Read as {@link normalizeTtlSeconds} reads a TTL, except that zero or below
+ * throws a `RangeError` instead of meaning "expire immediately". These keys
+ * are shared by every caller of a client, and refreshing one with a lifetime
+ * of zero would delete what its peers hold along with the caller's own claim.
+ *
+ * Every operation that takes one calls this before it reads or writes
+ * anything, on both backends, so a refused TTL leaves no partial write.
+ */
+export function normalizeStateTtlSeconds(ttlSeconds: number): number {
+  const ttl = normalizeTtlSeconds(ttlSeconds);
+  if (ttl <= 0) {
+    throw new RangeError(
+      `ttlSeconds must be greater than 0 for a key holding rate-limit state, received ${String(ttlSeconds)}`
+    );
+  }
+  return ttl;
+}
+
+/**
+ * How long a freeze key lives past its window while it still owes thaw
+ * probes. A successful probe re-arms it and a failed one arms a freeze of its
+ * own, so only a freeze nobody has probed for this long is dropped by its TTL.
+ * The probe-completion ids kept to deduplicate redeliveries live as long.
+ */
+export const FREEZE_PROBE_TTL_SECONDS = 7 * 86400;
+
+/**
+ * The lifetime of a freeze key, in whole seconds, measured from `now` on the
+ * clock `frozenUntil` was written against: the rest of the window plus a
+ * minute, or plus {@link FREEZE_PROBE_TTL_SECONDS} while probes are owed,
+ * since the freeze stays in force after its window until they complete. The
+ * Redis backend's `lua/freeze.ts` inlines the same arithmetic.
+ */
+export function freezeTtlSeconds(
+  frozenUntil: number,
+  thawRequestCount: number,
+  now: number
+): number {
+  const window = Math.max(Math.ceil((frozenUntil - now) / 1000), 0);
+  return window + (thawRequestCount > 0 ? FREEZE_PROBE_TTL_SECONDS : 60);
 }
 
 /**

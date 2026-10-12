@@ -86,10 +86,13 @@ all of the claim has already aged out, and settlement accounts for it:
 
 - **A debit** is reduced by the refill the bucket has discarded at its ceiling
   since the claim. Had the extra been charged at the start, that refill would
-  have paid it off.
+  have paid it off. Discarded refill pays off one debit only: several claims
+  outstanding across the same refill share it rather than each being forgiven
+  in full.
 - **A credit** is dropped once the bucket has reached its ceiling since the
   claim, because it would have been discarded there.
-- **Neither applies** across a freeze that emptied the bucket, or a reset.
+- **Neither applies** across a freeze that emptied the bucket, a reset, or the
+  bucket expiring and being created again.
 
 The arithmetic is in the
 [proposal](../proposals/usage-based-limits.md#settling-late-against-a-bucket-that-has-moved-on).
@@ -105,7 +108,9 @@ arriving after the window applies nothing.
 ## Requirements and limits
 
 - The backend must implement `settleTokens`. Both built-in backends do; a
-  request with `settle` on one that does not is refused when it is made.
+  request with `settle` or `settleStream` on one that does not is refused when
+  it is made, with `ConfigurationError` `backend_missing_settlement`, before
+  anything is spent.
 - A `sharedLimit` client settles against its owner's limits, by their names.
 - A streamed response settles when the stream ends, from an observer that
   reads the usage as it passes or from the caller; see

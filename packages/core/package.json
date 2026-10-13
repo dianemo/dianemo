@@ -64,12 +64,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vivo-us/dianemo.git",
+    "url": "git+https://github.com/dianemo/dianemo.git",
     "directory": "packages/core"
   },
-  "homepage": "https://github.com/vivo-us/dianemo#readme",
+  "homepage": "https://github.com/dianemo/dianemo#readme",
   "bugs": {
-    "url": "https://github.com/vivo-us/dianemo/issues"
+    "url": "https://github.com/dianemo/dianemo/issues"
   },
   "publishConfig": {
     "access": "public"

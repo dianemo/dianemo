@@ -54,7 +54,7 @@ that lives in your own codebase, and a handful of request functions defined in
 one file.
 
 **From a process-wide binding**, using
-[`@dianemo/plugin-kit`](https://github.com/vivo-us/dianemo-plugins/tree/master/packages/plugin-kit).
+[`@dianemo/plugin-kit`](https://github.com/dianemo/dianemo-plugins/tree/master/packages/plugin-kit).
 Request functions import `tryHandleRequest` directly rather than receiving it,
 which is what lets them live in separate files without threading a context
 through every one:
@@ -72,7 +72,7 @@ above is in `@dianemo/core` and always available, so reach for it if the
 install fails — the two differ only in how `tryHandleRequest` arrives.
 
 This is what the published
-[dianemo-plugins](https://github.com/vivo-us/dianemo-plugins) catalogue uses,
+[dianemo-plugins](https://github.com/dianemo/dianemo-plugins) catalogue uses,
 because a vendor integration is routinely a few hundred request functions across
 many files. It costs one handler per process — see
 [the binding](#the-binding-and-its-one-rule) below.

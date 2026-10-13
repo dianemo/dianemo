@@ -103,7 +103,7 @@ That client sends at most ten requests a second however many replicas run it. [G
 started](docs/getting-started.md) explains what each piece above is for.
 
 > **Plugins and 2.0.** The vendor plugins published from
-> [dianemo-plugins](https://github.com/vivo-us/dianemo-plugins) are all 1.x: they declare a peer of
+> [dianemo-plugins](https://github.com/dianemo/dianemo-plugins) are all 1.x: they declare a peer of
 > `@dianemo/core ^1.0.0` and a rate-limit shape 2.0 refuses, so none of them works with core 2.0
 > yet. Until they are re-released, write the template yourself as above.
 
@@ -171,7 +171,7 @@ The manual lives in [`docs/`](docs/README.md).
 | [`@dianemo/backend-redis`](packages/backend-redis) | Redis backend. Also covers Valkey, which is wire-compatible.                                   |
 
 Integrations are published separately, one package per vendor, from
-[dianemo-plugins](https://github.com/vivo-us/dianemo-plugins) — FedEx, UPS, Shopify, Stripe, Amazon
+[dianemo-plugins](https://github.com/dianemo/dianemo-plugins) — FedEx, UPS, Shopify, Stripe, Amazon
 SP-API and others, each carrying that vendor's rate-limit calibration and auth flow. They release on
 their own schedule, and every one released so far targets core 1.x: none installs beside core 2.0
 until it is re-released. Nothing waits on them — the quick start above needs only `@dianemo/core`.

@@ -215,7 +215,7 @@ module augmentation to write, and a plugin you didn't pass doesn't appear on the
 result. [Writing a plugin](writing-plugins.md) builds the one above.
 
 Ready-made plugins are published one package per vendor from
-[dianemo-plugins](https://github.com/vivo-us/dianemo-plugins), on their own
+[dianemo-plugins](https://github.com/dianemo/dianemo-plugins), on their own
 release schedule. **Every one released so far is 1.x and does not work with core
 2.0:** each declares a peer of `@dianemo/core ^1.0.0` and a rate limit written
 as a bare object, which 2.0 refuses. Until they are re-released, write the

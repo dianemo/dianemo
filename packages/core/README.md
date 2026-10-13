@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/vivo-us/dianemo/master/assets/dianemo-banner.webp" alt="dianemo — distributed API rate limiter" width="720">
+  <img src="https://raw.githubusercontent.com/dianemo/dianemo/master/assets/dianemo-banner.webp" alt="dianemo — distributed API rate limiter" width="720">
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@ Most rate limiters assume one process. Run four replicas behind a load balancer 
 independently believes it owns the vendor's full budget, so you exhaust the limit at 4× the rate you
 configured. Dianemo coordinates through a shared backend, so N replicas draw from one budget.
 
-**Full documentation:** [github.com/vivo-us/dianemo](https://github.com/vivo-us/dianemo#documentation)
+**Full documentation:** [github.com/dianemo/dianemo](https://github.com/dianemo/dianemo#documentation)
 
 ## What it does that a per-process limiter doesn't
 
@@ -82,9 +82,9 @@ costs one connection, and being wrong in the other direction costs your API acce
 
 **Valkey** works unchanged, since it speaks the same protocol: `redisBackend()` takes its connection
 as-is. **DragonflyDB** refuses some of the backend's scripts by default; see
-[the Redis backend page](https://github.com/vivo-us/dianemo/blob/master/docs/backends/redis.md#valkey-and-dragonflydb).
+[the Redis backend page](https://github.com/dianemo/dianemo/blob/master/docs/backends/redis.md#valkey-and-dragonflydb).
 
-[Full comparison](https://github.com/vivo-us/dianemo/blob/master/docs/backends/README.md)
+[Full comparison](https://github.com/dianemo/dianemo/blob/master/docs/backends/README.md)
 
 ## Quick start
 
@@ -153,11 +153,11 @@ const handler = new RequestHandler({
 ```
 
 > **Plugins and 2.0.** Integrations are published one package per vendor from
-> [dianemo-plugins](https://github.com/vivo-us/dianemo-plugins), but every one released so far is
+> [dianemo-plugins](https://github.com/dianemo/dianemo-plugins), but every one released so far is
 > 1.x: it declares a peer of `@dianemo/core ^1.0.0` and a rate-limit shape 2.0 refuses, so none of
 > them works with core 2.0 yet. Nothing waits on them: `registerClientTemplate` plus `handleRequest`,
 > as above, covers any vendor, and
-> [writing your own plugin](https://github.com/vivo-us/dianemo/blob/master/docs/writing-plugins.md)
+> [writing your own plugin](https://github.com/dianemo/dianemo/blob/master/docs/writing-plugins.md)
 > needs only `@dianemo/core`.
 
 ## Concepts
@@ -174,7 +174,7 @@ data that arrives at runtime, encrypted into the backend and broadcast to every 
 separation is why a plugin never has to know whether its credentials came from a vault, a database,
 or an environment variable.
 
-[Sub-clients, grants, overrides, leader election and freeze/thaw](https://github.com/vivo-us/dianemo/blob/master/docs/concepts.md)
+[Sub-clients, grants, overrides, leader election and freeze/thaw](https://github.com/dianemo/dianemo/blob/master/docs/concepts.md)
 
 ## Errors
 
@@ -199,7 +199,7 @@ Retries with backoff are automatic; what surfaces is what remained after them. `
 and `getOriginalResponseData(err)` read the underlying vendor response off a `RequestError`, for
 callers that want to turn a 404 into `null`.
 
-[The full error reference](https://github.com/vivo-us/dianemo/blob/master/docs/concepts.md#errors)
+[The full error reference](https://github.com/dianemo/dianemo/blob/master/docs/concepts.md#errors)
 
 ## Logging
 
@@ -213,7 +213,7 @@ Roughly **6–8% overhead** over the same HTTP client at the same concurrency, m
 loopback upstream so the figure reflects coordination cost rather than vendor latency. Uncontended
 requests skip the queue entirely, deciding admission in one atomic backend operation.
 
-[Methodology, scenarios and the full results](https://github.com/vivo-us/dianemo/blob/master/docs/benchmarks.md)
+[Methodology, scenarios and the full results](https://github.com/dianemo/dianemo/blob/master/docs/benchmarks.md)
 
 ## License
 

@@ -173,6 +173,16 @@ await handler.handleRequest({
 });
 ```
 
+### Purging a token an upstream rejected
+
+A stored access token is trusted until its expiry, so one the vendor revoked
+early keeps being sent and keeps failing with a 401. Call
+`handler.purgeClientCredentials("acme:_:production")` on that response: it
+deletes the client's stored OAuth2 tokens, every grant's included, and the next
+request on any replica sharing the backend fetches new ones. A grant's stored
+refresh token goes too. It throws `ClientNotFoundError` for an unknown client
+and `ClientUnavailableError` (`handler_stopped`) after `stop()`.
+
 ## Rate-limit overrides
 
 Templates ship in code; the right limit is sometimes discovered in production.

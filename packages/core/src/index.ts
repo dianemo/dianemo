@@ -1496,4 +1496,21 @@ export default class RequestHandler {
     const client = this.getClient(clientName);
     await client.setGrantTokens(grantId, data);
   }
+
+  /**
+   * Deletes a client's stored OAuth2 tokens, every grant's included, so the
+   * next request on any replica sharing the backend fetches new ones. For an
+   * upstream that rejected a token the handler still holds as valid, such as a
+   * 401 on a token revoked before it expired. A grant's stored refresh token is
+   * deleted too.
+   *
+   * @throws {ClientNotFoundError} when no client of that name is registered.
+   * @throws {ClientUnavailableError} `handler_stopped` after `stop()` until
+   * `start()` is called again.
+   */
+  public async purgeClientCredentials(clientName: string): Promise<void> {
+    this.assertNotStopped("purge client credentials");
+    const client = this.getClient(clientName);
+    await client.purgeCredentials();
+  }
 }

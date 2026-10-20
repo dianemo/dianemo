@@ -1,6 +1,6 @@
 {
   "name": "@dianemo/core",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Distribute one API rate limit across every process that spends it — cost-weighted priority queues, freeze/thaw recovery and pluggable backends",
   "type": "module",
   "main": "./dist/index.js",

@@ -1,3 +1,14 @@
+## 2.1.0 (2026-10-20)
+
+### 🚀 Features
+
+- `RequestHandler.purgeClientCredentials(clientName)` deletes a client's stored OAuth2 tokens, every grant's included, so the next request on any replica fetches new ones — for an upstream that refuses a token the handler still holds as valid. ([#9](https://github.com/dianemo/dianemo/pull/9))
+
+### ❤️ Thank You
+
+- Aaron Leman
+- Claude Sonnet 5.5
+
 # 2.0.0 (2026-10-12)
 
 ### ⚠️  Breaking Changes

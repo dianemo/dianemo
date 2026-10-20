@@ -1,6 +1,6 @@
 {
   "name": "@dianemo/backend-redis",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Redis backend for dianemo — one shared API budget across every process, for any deployment larger than one",
   "type": "module",
   "main": "./dist/index.js",
@@ -39,11 +39,11 @@
   "author": "Aaron Leman",
   "license": "Apache-2.0",
   "peerDependencies": {
-    "@dianemo/core": "^2.0.0",
+    "@dianemo/core": "^2.1.0",
     "ioredis": "^5.4.0 || ^6.0.0"
   },
   "devDependencies": {
-    "@dianemo/core": "^2.0.0",
+    "@dianemo/core": "^2.1.0",
     "@types/node": "^25.9.2",
     "ioredis": "^6.0.0",
     "typescript": "^6.0.3"

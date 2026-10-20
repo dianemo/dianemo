@@ -1,3 +1,9 @@
+## 2.0.1 (2026-10-20)
+
+### 🧱 Updated Dependencies
+
+- Updated @dianemo/core to 2.1.0
+
 # 2.0.0 (2026-10-12)
 
 ### ⚠️  Breaking Changes

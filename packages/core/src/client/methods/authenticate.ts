@@ -1,5 +1,6 @@
 import { credentialTtlSeconds } from "../../utils/credentialTtl.js";
 import type { AxiosRequestConfig, GenericAbortSignal } from "axios";
+import { deepCloneWithFunctions } from "../../utils/deepClone.js";
 import { encrypt, decrypt } from "../../utils/encryption.js";
 import { sanitizeError } from "../../utils/redact.js";
 import type Request from "../../request/index.js";
@@ -370,9 +371,10 @@ async function handleRefreshMethod(
   const baseConfig = getRefreshConfig(authData, grantId);
   // A deep copy, not the live object: `refreshConfig` is shared by every grant
   // on this client, so an interceptor writing into `config.data` would corrupt
-  // the `{{...}}` placeholders for all of them.
+  // the `{{...}}` placeholders for all of them. Not `structuredClone`, which
+  // throws on the interceptor functions the config itself carries.
   const refreshConfig = baseConfig.requestInterceptor
-    ? await baseConfig.requestInterceptor(structuredClone(baseConfig))
+    ? await baseConfig.requestInterceptor(deepCloneWithFunctions(baseConfig))
     : baseConfig;
 
   const config = await generateConfig.bind(this)(

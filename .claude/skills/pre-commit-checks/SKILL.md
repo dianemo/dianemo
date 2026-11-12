@@ -229,8 +229,9 @@ have, through npm trusted publishing, and tags it `<package>@<version>`. There i
 and no OTP. A release that failed part-way is retried by running `Publish` from the Actions
 tab; it skips what already went out.
 
-Do not push to `chore/release-next` or bump a version by hand — the next run overwrites the
-branch, and **any version on `master` that npm lacks is published**, whoever put it there.
+**Only the merge of a PR from a `chore/release-` branch of this repository publishes.** A
+version bumped in any other PR is never published, so do not bump one by hand. Do not push
+to `chore/release-next` either — the next run overwrites the branch.
 
 The by-hand fallback, for when the workflows are unavailable, is in
 CONTRIBUTING.md#publishing:

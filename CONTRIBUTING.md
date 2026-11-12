@@ -193,19 +193,22 @@ writes each package's `CHANGELOG.md` and deletes the plans — and opens one PR 
 it by hand. The `Version Plan Check` workflow skips the `chore/release-` prefix, because a release
 consumes the plans the check looks for.
 
-Merging that PR is the release. `publish.yml` also runs on every push to master, publishes each
-version master names that npm does not have, and tags the commit `<package>@<version>`. It
-authenticates through npm trusted publishing, so there is no token and no one-time password. To
-retry a release that failed part-way, run it from the Actions tab: it skips what already went out.
+Merging that PR is the release. `publish.yml` runs on every push to master but publishes only when
+the push merged a PR from a `chore/release-` branch of this repository: it publishes each version
+master names that npm does not have, and tags the commit `<package>@<version>`. A version bumped
+in any other PR is not published. It authenticates through npm trusted publishing, so there is no
+token and no one-time password. To retry a release that failed part-way, run it from the Actions
+tab: it skips what already went out.
 
 The release workflow does two things `npm run release` does not. It syncs the lockfile with
 `npm install --package-lock-only`, since `nx.json` skips it, and it runs
 `scripts/join-changelog-entries.mjs`: Nx appends the PR link to the first line of a plan's body,
 which for a plan wrapped at 80 columns is the middle of its opening sentence.
 
-**By hand**, should the workflows be unavailable: make the same PR from a branch named
-`chore/release-<version>`, running those three commands yourself. Once it is merged, tag the merge
-commit `<package>@<version>` for each package and publish from it with
+**By hand**, should `create-release-pr.yml` be unavailable: make the same PR from a branch named
+`chore/release-<version>`, running those three commands yourself. Merging it publishes like any
+other release PR. Should `publish.yml` be unavailable too, tag the merge commit
+`<package>@<version>` for each package and publish from it with
 `NPM_CONFIG_OTP=<code> npm run release:publish`. The one-time password has to arrive by
 environment: nx parses `--otp` with yargs, which reads the value as a number and drops a leading
 zero, so roughly one code in ten reaches npm a digit short and is refused. Quoting does not help —

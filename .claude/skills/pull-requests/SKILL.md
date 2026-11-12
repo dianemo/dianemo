@@ -109,7 +109,7 @@ and the newline before each `-` bullet, are real. Inside a paragraph or a bullet
 break the line at all. To check a body already posted:
 
 ```bash
-gh api /repos/vivo-us/dianemo/pulls/<number> \
+gh api /repos/dianemo/dianemo/pulls/<number> \
   -H "Accept: application/vnd.github.html+json" --jq '.body_html' | grep -c '<br>'
 ```
 

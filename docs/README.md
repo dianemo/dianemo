@@ -54,7 +54,7 @@ library and it is not a performance knob.
 ## Integrations
 
 Ready-made plugins are published one package per vendor from
-[dianemo-plugins](https://github.com/vivo-us/dianemo-plugins). Every one
+[dianemo-plugins](https://github.com/dianemo/dianemo-plugins). Every one
 released so far is a 1.x package that does not install beside core 2.0; until
 they are re-released, write the template yourself — see [getting
 started](getting-started.md) — and [writing a plugin](writing-plugins.md) when

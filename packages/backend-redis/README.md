@@ -1,6 +1,6 @@
 # @dianemo/backend-redis
 
-Redis backend for [dianemo](https://github.com/vivo-us/dianemo) — the one to use whenever more than
+Redis backend for [dianemo](https://github.com/dianemo/dianemo) — the one to use whenever more than
 one process shares an API budget.
 
 ```bash
@@ -39,7 +39,7 @@ connection; being wrong in the other direction costs your API access.
 Valkey is wire-compatible with Redis, so no separate adapter exists or is needed — construct its
 connection with `ioredis` and pass it to `redisBackend()` unchanged. DragonflyDB is not a drop-in:
 some scripts touch keys they do not declare, which it refuses by default. See
-[the backend page](https://github.com/vivo-us/dianemo/blob/master/docs/backends/redis.md#valkey-and-dragonflydb).
+[the backend page](https://github.com/dianemo/dianemo/blob/master/docs/backends/redis.md#valkey-and-dragonflydb).
 
 ## You own the connection
 
@@ -61,7 +61,7 @@ reports it.
 
 TTLs are not protection: nearly every key dianemo writes carries one, which makes them candidates
 under `volatile-lru` and its siblings rather than exempt. See the
-[operational notes](https://github.com/vivo-us/dianemo/blob/master/docs/backends/redis.md#operational-notes).
+[operational notes](https://github.com/dianemo/dianemo/blob/master/docs/backends/redis.md#operational-notes).
 
 ## How atomicity is achieved
 
@@ -77,14 +77,14 @@ script body, falling back to `EVAL` once if Redis reports `NOSCRIPT` after a res
 
 This backend is verified by the same suite as every other backend, in `test/conformance.test.ts` at
 the repository root. Adding a backend means making that suite pass, and
-[implementing a backend](https://github.com/vivo-us/dianemo/blob/master/docs/backends/README.md#implementing-a-backend)
+[implementing a backend](https://github.com/dianemo/dianemo/blob/master/docs/backends/README.md#implementing-a-backend)
 lists the toolkit `@dianemo/core/backend` exports for it — the one this backend is built on.
 
 ## Documentation
 
-[Redis backend reference](https://github.com/vivo-us/dianemo/blob/master/docs/backends/redis.md) —
+[Redis backend reference](https://github.com/dianemo/dianemo/blob/master/docs/backends/redis.md) —
 operational notes, clock-skew behaviour and what the coordination costs.
-[Full documentation](https://github.com/vivo-us/dianemo#documentation).
+[Full documentation](https://github.com/dianemo/dianemo#documentation).
 
 ## License
 

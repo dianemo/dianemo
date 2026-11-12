@@ -1,3 +1,18 @@
+## 2.0.2 (2026-11-12)
+
+### 🩹 Fixes
+
+- The repository moved to the `dianemo` GitHub organisation, at https://github.com/dianemo/dianemo. Each package's `repository`, `bugs` and `homepage` fields, its README and its NOTICE point there. ([#8](https://github.com/dianemo/dianemo/pull/8))
+
+### 🧱 Updated Dependencies
+
+- Updated @dianemo/core to 2.1.1
+
+### ❤️ Thank You
+
+- Aaron Leman
+- Claude Opus 5.5
+
 ## 2.0.1 (2026-10-20)
 
 ### 🧱 Updated Dependencies

@@ -1,3 +1,17 @@
+## 2.1.1 (2026-11-12)
+
+### 🩹 Fixes
+
+- A `requestInterceptor` on an OAuth2 `refreshConfig` or `grantRefreshConfig` now runs. Every refresh on a client that set one failed with a `DataCloneError` before any token request was made, because the config handed to the interceptor was copied with `structuredClone`, which refuses the interceptor functions the config itself carries. The interceptor still receives a copy, so writing into its argument does not reach the next refresh. ([#11](https://github.com/dianemo/dianemo/pull/11))
+
+- The repository moved to the `dianemo` GitHub organisation, at https://github.com/dianemo/dianemo. Each package's `repository`, `bugs` and `homepage` fields, its README and its NOTICE point there. ([#8](https://github.com/dianemo/dianemo/pull/8))
+
+### ❤️ Thank You
+
+- Aaron Leman
+- Claude Fable 5.2
+- Claude Opus 5.5
+
 ## 2.1.0 (2026-10-20)
 
 ### 🚀 Features

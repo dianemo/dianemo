@@ -221,6 +221,20 @@ fixed for you.
 
 ## Publishing
 
+**CI publishes; you do not.** Once a version plan is on `master`,
+`.github/workflows/create-release-pr.yml` opens a release PR from `chore/release-next` and
+rebuilds it whenever `master` gains another plan. Merging that PR is the release:
+`.github/workflows/publish.yml` publishes each version `master` names that npm does not
+have, through npm trusted publishing, and tags it `<package>@<version>`. There is no token
+and no OTP. A release that failed part-way is retried by running `Publish` from the Actions
+tab; it skips what already went out.
+
+Do not push to `chore/release-next` or bump a version by hand — the next run overwrites the
+branch, and **any version on `master` that npm lacks is published**, whoever put it there.
+
+The by-hand fallback, for when the workflows are unavailable, is in
+CONTRIBUTING.md#publishing:
+
 ```bash
 NPM_CONFIG_OTP=<code> npm run release:publish
 ```

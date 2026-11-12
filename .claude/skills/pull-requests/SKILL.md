@@ -14,8 +14,10 @@ was skipped, not that CI found something clever.
 
 **If your change touches either published package outside Markdown, write the version plan
 before you open the PR.** `Version Plan Check` fails the PR otherwise. The exception is a
-release PR, on a `chore/release-<version>` branch, which consumes the plans and skips the check
-— see CONTRIBUTING.md#publishing.
+release PR, on a `chore/release-` branch, which consumes the plans and skips the check. CI
+opens that PR itself, from `chore/release-next`, once a plan reaches `master` — see
+CONTRIBUTING.md#publishing. **Never name another branch `chore/release-…`**: the prefix is
+what switches the check off.
 
 ## Branch and base
 

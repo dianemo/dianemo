@@ -1,0 +1,132 @@
+name: Create Release PR
+
+on:
+  push:
+    branches: [master]
+
+# One at a time, and never cancelled part-way: a run force-pushes the release
+# branch, and a later run rebuilds it from the newer master.
+concurrency:
+  group: create-release-pr
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  create-pr:
+    name: Open or update the release PR
+    runs-on: ubuntu-latest
+    permissions:
+      # Pushes the release branch.
+      contents: write
+      pull-requests: write
+      # Starts CI on the release branch.
+      actions: write
+    env:
+      # The `chore/release-` prefix is the one version-plan-check.yml skips.
+      RELEASE_BRANCH: chore/release-next
+    steps:
+      # The token is kept out of .git/config, so only the push and the gh steps
+      # hold it. `ref: master` rather than the pushed commit, so a run that
+      # waited behind another still releases the newest master.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The merge of a release PR lands here with no plans left, which is what
+      # stops this workflow answering its own PR with another.
+      - name: Check for version plans
+        id: plans
+        run: |
+          if ls .nx/version-plans/*.md >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            ls .nx/version-plans/*.md
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No version plans on master, so there is nothing to release."
+          fi
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        if: steps.plans.outputs.found == 'true'
+        with:
+          node-version: 22
+          cache: npm
+
+      # `nx release` needs no install scripts, and skipping them keeps
+      # dependency code from running in a job that holds a write token.
+      - name: Install dependencies
+        if: steps.plans.outputs.found == 'true'
+        run: npm ci --ignore-scripts
+
+      - name: Apply the version plans
+        if: steps.plans.outputs.found == 'true'
+        run: |
+          git checkout -B "$RELEASE_BRANCH"
+          npx nx release --skip-publish
+          node scripts/join-changelog-entries.mjs packages/*/CHANGELOG.md
+          # nx.json sets skipLockFileUpdate, so the lockfile is synced here.
+          npm install --package-lock-only --ignore-scripts
+
+      - name: Commit and push the release branch
+        if: steps.plans.outputs.found == 'true'
+        id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git add -A .nx/version-plans packages/*/package.json packages/*/CHANGELOG.md package-lock.json
+          if git diff --staged --quiet; then
+            echo "The version plans changed nothing."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          released=$(node scripts/release-versions.mjs --changed-since origin/master \
+            | paste -sd '|' - | sed 's/|/ and /g')
+          title="chore: release $released"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "$title"
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
+            push --force origin "$RELEASE_BRANCH"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the PR
+        if: steps.commit.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ steps.commit.outputs.title }}
+        run: |
+          {
+            echo "## Description"
+            echo
+            echo "Applies the version plans pending on \`master\`: bumps each released package, writes its \`CHANGELOG.md\`, deletes the plans and syncs the lockfile. Opened by \`create-release-pr.yml\`, which rebuilds this branch whenever \`master\` gains a plan, so do not push to it by hand."
+            echo
+            echo "## Version plan"
+            echo
+            echo "None to add — this PR consumes the plans."
+            echo
+            echo "## Additional notes"
+            echo
+            echo "- **Merging publishes.** \`publish.yml\` publishes every version \`master\` names that is not on npm yet, and tags it."
+          } > "$RUNNER_TEMP/body.md"
+
+          number=$(gh pr list --base master --head "$RELEASE_BRANCH" --state open --json number --jq '.[0].number')
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "$TITLE" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh pr create --base master --head "$RELEASE_BRANCH" --title "$TITLE" --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+      # A push made with the built-in token starts no workflows, so the PR's
+      # checks are started here, on every new head of the branch.
+      - name: Start CI on the release branch
+        if: steps.commit.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --ref "$RELEASE_BRANCH"

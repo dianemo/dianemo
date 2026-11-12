@@ -214,9 +214,10 @@ package:
 
 ```bash
 npm run version-plan          # writes .nx/version-plans/<name>.md
-npm run release               # applies plans, bumps versions, writes CHANGELOGs
-npm run release:publish       # publishes to npm
 ```
+
+Once a plan reaches master, CI opens a release PR that applies it, and merging that PR publishes to
+npm. [CONTRIBUTING.md](CONTRIBUTING.md#publishing) has the detail and the by-hand fallback.
 
 ### Tests
 

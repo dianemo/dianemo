@@ -1,14 +1,11 @@
 import type { CreateClientData, DeclaredRateLimit } from "../client/types.js";
 import { retireCredentialWrites } from "../client/methods/authenticate.js";
+import { collectClientNames, prepareClients } from "./createClients.js";
+import { deepCloneWithFunctions } from "./deepClone.js";
 import { noopLogger, type Logger } from "../logger.js";
 import { encrypt, decrypt } from "./encryption.js";
 import { ConfigurationError } from "../errors.js";
 import type RequestHandler from "../index.js";
-import {
-  collectClientNames,
-  deepCloneWithFunctions,
-  prepareClients,
-} from "./createClients.js";
 import {
   assertUsableRateLimits,
   isSharedLimitOnly,
